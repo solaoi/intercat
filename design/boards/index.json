@@ -1,0 +1,492 @@
+{
+ "order": [
+  "Onboarding.html",
+  "Character.html",
+  "NewProject.html",
+  "FolderStart.html",
+  "Main.html",
+  "AgentSelected.html",
+  "WorkerDone.html",
+  "ModelPick.html",
+  "SkillGroup.html",
+  "StopHover.html",
+  "StopMenu.html",
+  "ReviewOutdated.html",
+  "CenterFocus.html",
+  "BoundDraft.html",
+  "ReplyState.html",
+  "SendMenu.html",
+  "Blocked.html",
+  "BlockedMore.html",
+  "SecretAsk.html",
+  "Notification.html",
+  "RenderCheck.html",
+  "CommitEffects.html",
+  "CommitSecret.html",
+  "IntegrationFailed.html",
+  "Branch.html",
+  "StageMode.html",
+  "StageNeedsYou.html",
+  "AfterCommit.html",
+  "DocumentSession.html",
+  "ImageTrack.html",
+  "PreviewOpen.html",
+  "Settings.html",
+  "SettingsAgents.html",
+  "SettingsEditor.html",
+  "SettingsSkills.html",
+  "SettingsVoice.html",
+  "SettingsShortcuts.html",
+  "SettingsUsage.html",
+  "Planned.html",
+  "PlanLimit.html",
+  "CommitConflict.html",
+  "Reconnect.html",
+  "ConfirmMode.html",
+  "Listening.html",
+  "Dropping.html",
+  "PlanHeld.html",
+  "DependencyHeld.html",
+  "Masked.html",
+  "BackAfterHours.html",
+  "QuitAsk.html",
+  "QuitLeftover.html",
+  "Home.html",
+  "SmallWindow.html",
+  "SheetSmallWindow.html"
+ ],
+ "boards": {
+  "Onboarding.html": {
+   "x": 0,
+   "y": -1020,
+   "w": 1440,
+   "h": 900,
+   "title": "0 · 初回：Editor が自己紹介する。準備は二段で、To start with text（Muse Code・Sign in・ローカルの Editor の Download Glimmer）と Optional（声と画像）。タイムラインはまだ無い",
+   "expand": "fill"
+  },
+  "Character.html": {
+   "x": 1520,
+   "y": -1020,
+   "w": 1440,
+   "h": 1480,
+   "title": "Intercat · キャラクターシート：箱が猫。Duo の四要素に倣った構造（一つの形の胴、伸縮するピルの目、固有のシルエット、離れた足）、8 状態、3 サイズ、何がいつ動くか",
+   "expand": "fill"
+  },
+  "NewProject.html": {
+   "x": 1520,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "0b · New project：名前と、このコンピューターのフォルダ（0〜n）。フォルダごとにワーカーのホストが立つ。Codex のプロジェクト作成と同じ型",
+   "expand": "fill"
+  },
+  "Main.html": {
+   "x": 0,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "1 · 何も選んでいない：ログは出ない（タイムラインが語る）。ログの場所には、各トラックの最新の報告の一行と、未統合の変更の数の一覧（押すとそのトラックを選ぶ）。机にはカード・帯・入力欄。未来の列はレーンの右端に固定（2 枚分）で、再生ヘッドの右に目盛は無い。見出しは仕事の名前（「[A] login retry」など）で、再生ヘッドは時間の領域の 80% にある。何も選ばずに走っているので、状態の行の左に「■ Stop all turns · 2 sessions」",
+   "expand": "fill"
+  },
+  "AgentSelected.html": {
+   "x": 0,
+   "y": 1020,
+   "w": 1440,
+   "h": 900,
+   "title": "2 · Worker A を選んだ：台本は A だけ。選ぶのは閲覧なので、入力欄の文脈チップは「Editor decides」（A は判定の手がかり）",
+   "expand": "fill"
+  },
+  "WorkerDone.html": {
+   "x": 1520,
+   "y": 1020,
+   "w": 1440,
+   "h": 900,
+   "title": "2b · Worker A が完了：レーンの末尾に ✓、見出しが done、台本に done の行、Editor が commit を提案するカード。Can’t place もカードで出し、A の仮定は「+1 more」に畳む。B は続行中",
+   "expand": "fill"
+  },
+  "ModelPick.html": {
+   "x": 3040,
+   "y": 1020,
+   "w": 1440,
+   "h": 900,
+   "title": "2c · 「Worker A · Spark 1.3 · high ▾」を押した：このトラックだけのモデル（Meta の版）と effort（6 段）の上書き。Editor の選択を既定として示し、「Reset to the Editor’s pick」で戻す",
+   "expand": "fill"
+  },
+  "SkillGroup.html": {
+   "x": 4560,
+   "y": 1020,
+   "w": 1440,
+   "h": 900,
+   "title": "2d · スキルのグループクリップを開いた：release-notes の 3 手順が親バーの下に細い行で並ぶ。閉じれば一本のバー",
+   "expand": "fill"
+  },
+  "CenterFocus.html": {
+   "x": 0,
+   "y": 2040,
+   "w": 1440,
+   "h": 900,
+   "title": "3 · 途中の言葉を選んだ：解釈を直す、入力欄はその言葉について",
+   "expand": "fill"
+  },
+  "ReplyState.html": {
+   "x": 0,
+   "y": 3060,
+   "w": 1440,
+   "h": 900,
+   "title": "4 · 質問に Reply：入力欄が返答になる",
+   "expand": "fill"
+  },
+  "Blocked.html": {
+   "x": 0,
+   "y": 4080,
+   "w": 1440,
+   "h": 900,
+   "title": "5 · 止まる：A だけ不可逆な一手で stopped になる。他は進む。吹き出しに「more ›」",
+   "expand": "fill"
+  },
+  "BlockedMore.html": {
+   "x": 1520,
+   "y": 4080,
+   "w": 1440,
+   "h": 900,
+   "title": "5b · 「more ›」を押した：吹き出しの上に理由の全文、more › は less ‹ に変わる。Esc で閉じる。理由はログにも残る（Kept in Worker A’s log）",
+   "expand": "fill"
+  },
+  "RenderCheck.html": {
+   "x": 0,
+   "y": 5100,
+   "w": 1440,
+   "h": 900,
+   "title": "6 · 回収する（14:08:00）：Commit の手前でだけ、仮定を一覧にして決める。トラックの行は二段で、入る分（Included · up to A:3）と走っている分（Not included · running now）。Check はフォルダごとに一行。シートは舞台と台本だけを覆い、机は生きたまま",
+   "expand": "fill"
+  },
+  "Branch.html": {
+   "x": 0,
+   "y": 6120,
+   "w": 1440,
+   "h": 900,
+   "title": "7 · 過去の点を選ぶ：ここから分岐。元のトラックは止めない（止めるのは選択）",
+   "expand": "fill"
+  },
+  "StageMode.html": {
+   "x": 1520,
+   "y": 6120,
+   "w": 1440,
+   "h": 900,
+   "title": "7b · 舞台モード：仕切りを下げ切ると台本とカードが一行に畳まれ、舞台が机の上段まで広がる。帯・Editor の行・入力欄は残る。6 トラック",
+   "expand": "fill"
+  },
+  "StageNeedsYou.html": {
+   "x": 3040,
+   "y": 6120,
+   "w": 1440,
+   "h": 900,
+   "title": "7c · 舞台モードで Needs you を押した：バッジの上にカードがそのまま重なって出る。舞台の配置は変えない。Esc で閉じる",
+   "expand": "fill"
+  },
+  "AfterCommit.html": {
+   "x": 0,
+   "y": 7140,
+   "w": 1440,
+   "h": 900,
+   "title": "8 · Commit の後（14:09:20）：ヘッダーの一枠が Push に変わり、▾ のメニューにフォルダ別の Push と Open 2 PRs。板 7 の続きで、人がシートで A を選んだ場面（A′ は幽霊レーンに退避、Restore で戻る）。Editor は PR を提案するだけ",
+   "expand": "fill"
+  },
+  "DocumentSession.html": {
+   "x": 0,
+   "y": 8160,
+   "w": 1440,
+   "h": 900,
+   "title": "9 · 文書のセッション：同じタイムライン、仕上げが Export、結果はプレビュー",
+   "expand": "fill"
+  },
+  "ImageTrack.html": {
+   "x": 1520,
+   "y": 8160,
+   "w": 1440,
+   "h": 900,
+   "title": "9b · 文書セッションに Image トラック：Muse Image が表紙を作り、A が頁に置く。版は全部残る",
+   "expand": "fill"
+  },
+  "PreviewOpen.html": {
+   "x": 3040,
+   "y": 8160,
+   "w": 1440,
+   "h": 900,
+   "title": "9c · Preview を開いた：Commit シートと同じシートが舞台と台本を覆い、頁を見開きで読む（vs v1）。机（カード・帯・入力欄・状態の行）は生きたまま。Esc で閉じる",
+   "expand": "fill"
+  },
+  "Settings.html": {
+   "x": 0,
+   "y": 9180,
+   "w": 1440,
+   "h": 900,
+   "title": "10a · 設定 Account：Meta のサインイン、Model API キー、アーカイブ、既定フォルダ、クラッシュ報告（既定オフ）、Mac の外へ出るもの（声の原音は Meta へ）。シートの上の適用先は App で、プロジェクトの行の Contributor mode は灰で「choose a project」。真偽の行は、今の値を示すスイッチ",
+   "expand": "fill"
+  },
+  "SettingsAgents.html": {
+   "x": 1520,
+   "y": 9180,
+   "w": 1440,
+   "h": 900,
+   "title": "10b · 設定 Agents：適用先は App。Muse Code、worktree、Stops、Reviewer、Image の行は、今の値・影響・変える操作だけ。Checks（フォルダごと）はプロジェクトの行なので灰で「choose a project」。真偽の行は、今の値を示すスイッチ（Subagents は Not available · capacity 1）",
+   "expand": "fill"
+  },
+  "SettingsEditor.html": {
+   "x": 3040,
+   "y": 9180,
+   "w": 1440,
+   "h": 900,
+   "title": "10c · 設定 Editor：Reflex（Glimmer。Local（MLX）/ Hosted（Modal））/ Planning（Wonder）/ Plans start / Privacy gate / 確認モード / キャラクター。真偽の行は、今の値を示すスイッチ",
+   "expand": "fill"
+  },
+  "SettingsSkills.html": {
+   "x": 4560,
+   "y": 9180,
+   "w": 1440,
+   "h": 900,
+   "title": "10d · 設定 Skills：組み込みの intercat-report（View だけ）と、リポジトリ・個人・Muse Code のスキル一覧、使用時刻、オン/オフ、Add。適用先は App なので、リポジトリの行（スキルと AGENTS.md）は灰で「choose a project」",
+   "expand": "fill"
+  },
+  "SettingsVoice.html": {
+   "x": 6080,
+   "y": 9180,
+   "w": 1440,
+   "h": 900,
+   "title": "10e · 設定 Voice：マイク、Push to talk（窓の中は長押しかトグル、ほかのアプリからはトグル）、言語（既定は UI の言語）、キーワード",
+   "expand": "fill"
+  },
+  "SettingsShortcuts.html": {
+   "x": 7600,
+   "y": 9180,
+   "w": 1440,
+   "h": 900,
+   "title": "10f · 設定 Shortcuts：セッションとタイムラインの操作（⌘Z は編集の Undo、⇧⌘Z は Redo）",
+   "expand": "fill"
+  },
+  "SettingsUsage.html": {
+   "x": 9120,
+   "y": 9180,
+   "w": 1440,
+   "h": 900,
+   "title": "10g · 設定 Usage：Muse Code のプラン（5 時間・週間）と Model API の従量（音声・画像）、セッション別の内訳。ポップオーバーの Show all → の行き先",
+   "expand": "fill"
+  },
+  "Planned.html": {
+   "x": 0,
+   "y": 10200,
+   "w": 1440,
+   "h": 900,
+   "title": "1c · 大きな依頼を置いた（熟慮の道）：Planner が 3 トラックに分解。計画のクリップは点線のタイルで、まだどれも走っていない。タイルは、レーンの右端に固定した未来の列（2 枚分）に同じ幅で並ぶ。A の changelog の後に走る C も先頭の列に置き、「after A」の札を付ける（連結線は選んだときだけ）。C の link it は二枚目に入る。Start は帯の計画のチップの白い「Start plan · 3 tracks」にだけあり、その左に文字のボタン「Review plan」がある。カードは 2 枚までで、入力欄に近い方から Can’t place と衝突のカード（A と C がどちらも lycoris-next の docs/index.md に触る）。docs の場所の仮定は「+1 more」に畳む。吹き出し「Split it three ways. Nothing has run yet.」。見出しは仕事の名前（「[A] login retry」など）で、再生ヘッドは時間の領域の 80% にある。A が走っているので、状態の行の左に「■ Stop all turns · 2 sessions」",
+   "expand": "fill"
+  },
+  "PlanLimit.html": {
+   "x": 1520,
+   "y": 10200,
+   "w": 1440,
+   "h": 900,
+   "title": "1d · プランの上限：新しい仕事が一斉に止まる。見出しは実際の状態のままで、帯に「New work paused · plan limit until 16:20」。リングは琥珀で満杯。カード「Plan limit until 16:20. New work waits.」に「Wait / Use your API key」（上限はプロンプト数なので Lower effort は出さない）。帯の言葉は waiting for the plan",
+   "expand": "fill"
+  },
+  "CommitConflict.html": {
+   "x": 3040,
+   "y": 10200,
+   "w": 1440,
+   "h": 900,
+   "title": "6b · Commit 時の衝突（14:08:00・1 フォルダの例）：後のトラック（B）の固定したチェックポイントを一時 ref の先頭に当てた merge worktree で、merge が解けなかった後で、統合の仕事は failed、担当は B（B の状態は変えない）。「merge could not resolve 2 hunks」、Let me resolve / Let B try again / Leave B out。三つは対等で既定は無く、Leave B out は薄い文字。統合 worktree での Check が緑になるまで Commit は押せない",
+   "expand": "fill"
+  },
+  "Reconnect.html": {
+   "x": 4560,
+   "y": 10200,
+   "w": 1440,
+   "h": 900,
+   "title": "5c · 再接続と喪失：A は reconnecting · attempt 2（言葉は帯で待つ）、B はセッション喪失（見出しは lost）のカード「Pick up where it was?」",
+   "expand": "fill"
+  },
+  "ConfirmMode.html": {
+   "x": 6080,
+   "y": 10200,
+   "w": 1440,
+   "h": 900,
+   "title": "3b · 確認モード：訂正率が上がり、各判定を「waiting for OK · OK / Change」で見せて、OK まで置かない",
+   "expand": "fill"
+  },
+  "Listening.html": {
+   "x": 7600,
+   "y": 10200,
+   "w": 1440,
+   "h": 900,
+   "title": "1e · 聞いている最中：マイクが白く灯り、部分的な文字起こしが入力欄に薄く流れ込む。入力欄のマイクの横に Cancel（esc）。Editor の行は「listening」",
+   "expand": "fill"
+  },
+  "Masked.html": {
+   "x": 9120,
+   "y": 10200,
+   "w": 1440,
+   "h": 900,
+   "title": "1f · Privacy gate がマスクした：帯のチップに <redacted:api-key#1>（値ごとの番号）、原文はローカルのログにだけ。吹き出し「I kept an API key here before it left.」",
+   "expand": "fill"
+  },
+  "BackAfterHours.html": {
+   "x": 10640,
+   "y": 10200,
+   "w": 1440,
+   "h": 900,
+   "title": "1g · 数時間後に戻った：舞台は離席区間が入るズームに一度だけ合い、全トラックが何も走らせていない区間だけが ⟋⟋ に畳まれる（目盛は両側で進む。札は「⟋⟋ 2 h 20 m · A waited on you」）。A は 14:35 から stopped、B は離席中に 6 本を終えて done。Editor の行に一言「While you were away: B finished · A waits for you · 2 tracks uncommitted」と more ›。止まったカードだけを開き、提案と Can’t place は「+2 more」",
+   "expand": "fill"
+  },
+  "Dropping.html": {
+   "x": 7600,
+   "y": 11220,
+   "w": 1440,
+   "h": 900,
+   "title": "1h · ファイルをドロップしている：落とせる場所（レーン・カード・入力欄）だけが薄く光る。レーン A の上では「Drop to attach · to Worker A」で、A だけに添付する",
+   "expand": "fill"
+  },
+  "FolderStart.html": {
+   "x": 3040,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "0c · フォルダで始まる：既存のリポジトリに未コミットの変更があれば一度だけ聞く（Include / Leave out。50 MB を超えるファイルは除いて並べる）。カードの二行目は、変更の行き先（the first commit on the session branch, and any PR）。Git の無いフォルダは git を始め、作った .gitignore を仮定のカードにする。吹き出し「Started git here.」",
+   "expand": "fill"
+  },
+  "StopHover.html": {
+   "x": 6080,
+   "y": 1020,
+   "w": 1440,
+   "h": 900,
+   "title": "2e · 走っているバーの右端にホバー：■ が出る（押すと ⌘. と同じ。「Stop now · ⌘.」）。レーンには、ターンの終わりの目盛（1px の薄い縦線）",
+   "expand": "fill"
+  },
+  "StopMenu.html": {
+   "x": 7600,
+   "y": 1020,
+   "w": 1440,
+   "h": 900,
+   "title": "2f · トラック見出しの ⋯：Say to A（錠の入口）、Stop now（⌘.）と Stop after this turn（⇧⌘.）。B は人が止めて done（灰の ■ stopped）、境目待ちの言葉は「held · Start」で帯に残る",
+   "expand": "fill"
+  },
+  "ReviewOutdated.html": {
+   "x": 9120,
+   "y": 1020,
+   "w": 1440,
+   "h": 900,
+   "title": "2h · Reviewer の古い指摘：見た木の SHA の後に行が変わったので「may be outdated」。台本に残すだけで、fix の点線にはしない",
+   "expand": "fill"
+  },
+  "BoundDraft.html": {
+   "x": 1520,
+   "y": 2040,
+   "w": 1440,
+   "h": 900,
+   "title": "3c · 下書きの宛先：B の ⋯ の「Say to B」で錠にした下書きは、A を見ても「Only B」のまま。文脈チップのメニューは「Only A instead / Editor decides / Clear」。帯の trim は「sent · stopping」",
+   "expand": "fill"
+  },
+  "SendMenu.html": {
+   "x": 1520,
+   "y": 3060,
+   "w": 1440,
+   "h": 900,
+   "title": "4b · 入力欄に文字がある：右端のマイクが送信（↑）に替わり、▾ に New track（⌘⇧↵）と Plan only（⌘⇧P）",
+   "expand": "fill"
+  },
+  "SecretAsk.html": {
+   "x": 3040,
+   "y": 4080,
+   "w": 1440,
+   "h": 900,
+   "title": "5d · secret の入力：B が npm install のトークンを求める。変数の名前と伏せた値の欄、保存の選択肢（既定は Save for this project で、範囲を文で示す / This time only）。値は環境変数でホストに渡し、Intercat のログには残さない。A のカードは別の窓で答えられ、その場で「answered elsewhere」になってから片付く",
+   "expand": "fill"
+  },
+  "Notification.html": {
+   "x": 4560,
+   "y": 4080,
+   "w": 1440,
+   "h": 900,
+   "title": "5e · 窓が非アクティブ：止まったトラックの macOS の通知。文はカードと同じ実行状態から作る",
+   "expand": "fill"
+  },
+  "CommitEffects.html": {
+   "x": 1520,
+   "y": 5100,
+   "w": 1440,
+   "h": 900,
+   "title": "6c · Commit シートの「Effects outside git · 1 · pushed origin 14:05 · not undone by branch or restore」（ボタンなし）と、「1 turn finished since you opened this · Refresh」",
+   "expand": "fill"
+  },
+  "CommitSecret.html": {
+   "x": 3040,
+   "y": 5100,
+   "w": 1440,
+   "h": 900,
+   "title": "6d · 統合の差分に Check environment の値：「Secret found in the diff」の行に Remove / Keep。答えるまで Commit は灰",
+   "expand": "fill"
+  },
+  "IntegrationFailed.html": {
+   "x": 4560,
+   "y": 5100,
+   "w": 1440,
+   "h": 900,
+   "title": "6e · シートを閉じた後の統合の失敗：B のレーンに仕事の印「integration failed · needs you」、カードは統合の仕事のもの。B は走り続ける",
+   "expand": "fill"
+  },
+  "PlanHeld.html": {
+   "x": 0,
+   "y": 11220,
+   "w": 1440,
+   "h": 900,
+   "title": "1i · 計画の Hold（設定で自動の開始にしたとき）：計画の点線の札が「held」になる（依存のある C は「after A · held」）。Start は帯のチップ「held · nothing has run」の白い「Start plan · 3 tracks」にだけあり、押すまで走らない。その左に「Review plan」",
+   "expand": "fill"
+  },
+  "DependencyHeld.html": {
+   "x": 1520,
+   "y": 11220,
+   "w": 1440,
+   "h": 900,
+   "title": "1j · 依存先が succeeded で終わらない：A の changelog を切ったので、それに依存する C の docs page は「held · A’s changelog was cut」。依存先が無いので、未来の列の先頭に並ぶ。帯の計画のチップには「Review plan」と「Start plan · 3 tracks」。札を押すとポップオーバーが開き、Restore A’s changelog（⌘Z と同じ）・Change dependency…・Start anyway を出す",
+   "expand": "fill"
+  },
+  "QuitAsk.html": {
+   "x": 0,
+   "y": 12240,
+   "w": 1440,
+   "h": 900,
+   "title": "12 · ⌘Q の問い：Keep working in the background（既定）/ Stop everything と Remember",
+   "expand": "fill"
+  },
+  "QuitLeftover.html": {
+   "x": 1520,
+   "y": 12240,
+   "w": 1440,
+   "h": 900,
+   "title": "12b · Stop everything の後に止まらない組が残った：「1 group is still running · npm run dev · PID 4312」（PID は選んでコピーできる）、Try again / Quit anyway",
+   "expand": "fill"
+  },
+  "Home.html": {
+   "x": 4560,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "11 · Home：全セッションを最後に動いた順に一行ずつ（プロジェクトのタグ・状態・一行要約・時刻）。机には全セッションのカードがセッション名のタグ付きで集まる。走っているセッションがあるので、状態の行の左に「■ Stop all turns · 2 sessions」",
+   "expand": "fill"
+  },
+  "SmallWindow.html": {
+   "x": 6080,
+   "y": 0,
+   "w": 1040,
+   "h": 760,
+   "title": "13 · 最小の窓（1040×760）：承認の対象が長く、カードの中で 4 行を超えてスクロールし、末尾を見るまで Allow once は灰。台本は一行（「▸ Worker A」）に畳み、余った高さは舞台に回す。カードは 1 枚、帯は 1 行で入らないチップは「+2」。状態の行の左の端に「■ Stop all turns · 2 sessions」、その右に「■ Stop A」。未来の列は 1 枚分で、入らないタイルは「+1」。見出しは仕事の名前（「[A] login retry」など）で、再生ヘッドは時間の領域の 80% にある",
+   "expand": "fill"
+  },
+  "SheetSmallWindow.html": {
+   "x": 7200,
+   "y": 0,
+   "w": 1040,
+   "h": 760,
+   "title": "14 · 最小の窓（1040×760）で Commit シートを開いたまま、A の承認に答える：シートはモーダルではない領域で、舞台と台本だけを覆う。本文はフォルダを切り替える一列で（「lycoris-next · A」と「hitoiro-api · B · 1 assumption」）、差分は Expand で広げる。Check は「Merged checks passed · log」。確定のボタンの列（Discard と Commit）は下に固定し、右上の閉じるボタンはこの窓のシートを閉じるだけ。フォーカスは ⌃Tab で机の承認のカードに移っている（輪郭）。状態の行の左の端に「■ Stop all turns · 2 sessions」、その右に「■ Stop A」。見出しは仕事の名前（「[A] login retry」など）で、再生ヘッドは時間の領域の 80% にある",
+   "expand": "fill"
+  }
+ }
+}

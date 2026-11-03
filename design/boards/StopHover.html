@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Intercat — 2e · hovering the right end of a running bar shows ■ (Stop now · ⌘.)</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+a{color:#9A9DA6}a:hover{color:#EDEDEF}
+</style>
+</head>
+<body>
+
+
+
+<div style="width: 100%; min-height: 900px; box-sizing: border-box; background: #0C0D10; color: #EDEDEF; font-family: Inter, system-ui, sans-serif; font-size: 13px; line-height: 1.45; letter-spacing: -0.01em; display: flex; flex-wrap: wrap; font-feature-settings: 'tnum' 1">
+
+  <!-- Sidebar -->
+  <div style="width: 220px; flex: none; box-sizing: border-box; background: #0C0D10; display: flex; flex-direction: column; padding: 12px 12px 12px 12px; gap: 22px">
+    <!-- macOS window chrome: traffic lights, then sidebar toggle, search, back, forward -->
+    <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 2px; margin-bottom: -6px">
+      <span style="width: 12px; height: 12px; border-radius: 50%; background: #FF5F57"></span><span style="width: 12px; height: 12px; border-radius: 50%; background: #FEBC2E"></span><span style="width: 12px; height: 12px; border-radius: 50%; background: #28C840"></span>
+      <span style="width: 10px"></span>
+      <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9A9DA6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M9 4v16"></path></svg>
+      <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9A9DA6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
+      <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9A9DA6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M11 18l-6-6 6-6"></path></svg>
+      <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#4A4E57" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg>
+    </div>
+
+    <!-- One fixed action on top; below it a plain table of contents: repository headings, sessions under them. No chevrons, nothing collapsible -->
+    <div style="display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 8px; color: #EDEDEF; font-size: 12.5px"><span style="display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; background: #2A2D35; flex: none"><svg aria-hidden="true" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#EDEDEF" stroke-width="2.6" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg></span><span style="flex: 1">New session</span></div>
+    <div style="display: flex; flex-direction: column; gap: 1px; margin-top: -8px">
+      <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px; color: #9A9DA6"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#9A9DA6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex: none; margin: 0 -3px"><path d="M3 11l9-7 9 7"></path><path d="M5 10v10h14V10"></path></svg><span style="flex: 1">Home</span><span style="font-size: 11px; color: #9A9DA6; font-family: 'JetBrains Mono', monospace">⌘0</span></div>
+      <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px; color: #9A9DA6"><span style="width: 6px; height: 6px; border-radius: 50%; background: #2A2D35; flex: none"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Flaky CI on macOS</span></div>
+      <div style="height: 24px; display: flex; align-items: center; padding: 0 8px; margin-top: 14px; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #9A9DA6">Projects</div>
+      <div style="height: 24px; display: flex; align-items: center; padding: 0 8px; margin-top: 2px; font-size: 11.5px; color: #9A9DA6">Lycoris<span style="margin-left: auto; color: #9A9DA6; font-size: 13px">+</span></div>
+      <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px; background: #15161B; color: #EDEDEF"><span style="width: 6px; height: 6px; border-radius: 50%; background: #C9CBD1; flex: none"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Login hardening</span><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#858992" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5M9 3h6l-1 7 3 3H7l3-3z"></path></svg></div>
+      <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px; color: #9A9DA6"><span style="width: 6px; height: 6px; border-radius: 50%; background: #C9CBD1; flex: none"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Rate limits</span><span style="font-size: 11px; color: #D9A24A">1</span></div>
+      <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px; color: #9A9DA6"><span style="width: 6px; height: 6px; border-radius: 50%; background: #2A2D35; flex: none"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Webhook retries</span><span style="font-size: 11px; color: #4CC38A">✓</span></div>
+      <div style="height: 24px; display: flex; align-items: center; padding: 0 8px; margin-top: 10px; font-size: 11.5px; color: #9A9DA6">Board & investors</div>
+      <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px; color: #9A9DA6"><span style="width: 6px; height: 6px; border-radius: 50%; background: #2A2D35; flex: none"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Q3 investor report</span></div>
+      <div style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: 6px; color: #9A9DA6"><span style="width: 6px; height: 6px; border-radius: 50%; background: #2A2D35; flex: none"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Board deck outline</span></div>
+    </div>
+    <div style="margin-top: auto; display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 8px; color: #9A9DA6; font-size: 12.5px"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#858992" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg><span>Settings</span></div>
+  </div>
+
+  <!-- Main column -->
+  <div style="flex: 999 1 640px; min-width: 0; display: flex; flex-direction: column">
+
+    <!-- Header -->
+    <div style="height: 48px; box-sizing: border-box; padding: 0 24px; display: flex; align-items: center; justify-content: space-between">
+      <div style="display: flex; align-items: center; gap: 8px; min-width: 0">
+        <span style="color: #EDEDEF; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">Login hardening</span><span style="display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 7px; border-radius: 5px; background: #15161B; color: #9A9DA6; font-size: 11px; font-family: 'JetBrains Mono', monospace"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#858992" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>lycoris-next</span><span style="display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 7px; border-radius: 5px; background: #15161B; color: #9A9DA6; font-size: 11px; font-family: 'JetBrains Mono', monospace"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#858992" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>hitoiro-api</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 4px">
+        <span style="display: inline-flex; border-radius: 6px; background: #15161B; overflow: hidden"><button style="height: 28px; padding: 0 12px; border: none; background: transparent; color: #EDEDEF; font: inherit; font-size: 12.5px; font-weight: 500; cursor: pointer">Commit <span style="font-weight: 400; color: #9A9DA6">· 2 folders</span></button><button aria-label="More actions" style="height: 28px; padding: 0 6px 0 4px; border: none; border-left: 1px solid #0C0D10; background: transparent; color: #9A9DA6; font: inherit; cursor: pointer; display: inline-flex; align-items: center"><svg aria-hidden="true" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="margin-left: 2px"><path d="M6 9l6 6 6-6"></path></svg></button></span>
+      </div>
+    </div>
+
+    <!-- Workspace -->
+    <div style="flex: 1 1 auto; display: flex; flex-direction: column; box-sizing: border-box; padding: 4px 0 0 0">
+
+      <div style="padding: 0 24px">
+      <!-- Ruler -->
+      <div style="display: flex; height: 20px; align-items: center">
+        <div style="width: 140px; flex: none"></div>
+        <div style="flex: 1 1 auto; position: relative; margin-right: 360px; height: 20px; font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: #9A9DA6">
+          <span style="position: absolute; left: 16%">14:00</span>
+          <span style="position: absolute; left: 36%">14:02</span>
+          <span style="position: absolute; left: 56%">14:04</span>
+          <span style="position: absolute; left: 76%">14:06</span>
+          <span style="position: absolute; left: calc(80% + 5px); top: 1px; padding: 0 5px; border-radius: 3px; background: #EDEDEF; color: #0C0D10">14:06:24</span>
+        </div>
+      </div>
+
+      <!-- Lanes -->
+      <div style="position: relative; display: flex; flex-direction: column; margin-top: 4px">
+        <div aria-hidden="true" style="position: absolute; top: 0; bottom: 0; left: calc(140px + (100% - 140px - 360px) * 0.8); right: 0; background: rgba(255,255,255,0.018); pointer-events: none"></div>
+        <!-- the future column: fixed at the lane’s right end; the playhead’s 80% and 92% count in the area to its left -->
+        <div aria-hidden="true" style="position: absolute; top: 0; bottom: 0; right: 360px; width: 1px; background: #1A1C22; pointer-events: none"></div>
+
+        <!-- You · the spine: each word, and under it what the Editor made of it -->
+        <div style="display: flex; height: 76px">
+          <div style="width: 140px; flex: none; display: flex; align-items: center; gap: 8px"><span style="width: 7px; height: 7px; border-radius: 2px; background: #D9A24A; transform: rotate(45deg)"></span><span style="font-weight: 500">You</span></div>
+          <div style="flex: 1 1 auto; position: relative; margin-right: 360px">
+            <div aria-hidden="true" style="position: absolute; left: 0; right: 0; top: 36px; height: 1px; background: #1A1C22"></div>
+
+            <div style="position: absolute; left: 22%; top: 36px; width: 7px; height: 7px; border-radius: 2px; background: #D9A24A; transform: translate(-50%,-50%) rotate(45deg)"></div>
+            <div style="position: absolute; left: 22%; top: 2px; transform: translateX(-50%); white-space: nowrap; font-size: 11px; color: #9A9DA6">Add retry to the login call</div>
+            <div style="position: absolute; left: 22%; top: 48px; transform: translateX(-50%); font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #9A9DA6">to A</div>
+
+            <div style="position: absolute; left: 39%; top: 36px; width: 7px; height: 7px; border-radius: 2px; background: #D9A24A; transform: translate(-50%,-50%) rotate(45deg)"></div>
+            <div style="position: absolute; left: 39%; top: 18px; transform: translateX(-50%); white-space: nowrap; font-size: 11px; color: #9A9DA6">Also log failed attempts</div>
+            <div style="position: absolute; left: 39%; top: 48px; transform: translateX(-50%); font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #9A9DA6">to A</div>
+
+            <div style="position: absolute; left: 49%; top: 36px; width: 6px; height: 6px; border-radius: 2px; background: #3A3D45; transform: translate(-50%,-50%) rotate(45deg)"></div>
+            <div style="position: absolute; left: 49%; top: 2px; transform: translateX(-50%); white-space: nowrap; font-size: 11px; color: #9A9DA6">hmm, maybe…</div>
+            <div style="position: absolute; left: 49%; top: 48px; transform: translateX(-50%); font-family: 'JetBrains Mono', monospace; font-size: 10px; font-style: italic; color: #9A9DA6">parked</div>
+
+            <div style="position: absolute; left: 57%; top: 36px; width: 7px; height: 7px; border-radius: 2px; background: #D9A24A; transform: translate(-50%,-50%) rotate(45deg)"></div>
+            <!-- the later of two overlapping labels shows its diamond only (as on board 13) -->
+
+            <div style="position: absolute; left: 68%; top: 36px; width: 7px; height: 7px; border-radius: 2px; background: #D9A24A; transform: translate(-50%,-50%) rotate(45deg); box-shadow: 0 0 0 5px rgba(217,162,74,0.16)"></div>
+            <div style="position: absolute; left: 68%; top: 2px; transform: translateX(-50%); white-space: nowrap; font-size: 11px; color: #D9A24A">Make it faster</div>
+            <div style="position: absolute; left: 68%; top: 48px; transform: translateX(-50%); font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #D9A24A">asked</div>
+
+            <div style="position: absolute; left: 78%; top: 36px; width: 8px; height: 8px; border-radius: 2px; background: #F2C572; transform: translate(-50%,-50%) rotate(45deg); box-shadow: 0 0 12px rgba(242,197,114,0.5)"></div>
+            <div style="position: absolute; left: 78%; top: 18px; transform: translateX(-50%); white-space: nowrap; font-size: 11px; color: #EDEDEF">And rate-limit it, separately</div>
+            <div style="position: absolute; left: 78%; top: 46px; transform: translateX(-50%); font-family: 'JetBrains Mono', monospace; font-size: 10px; padding: 1px 6px; border-radius: 3px; background: #F2C572; color: #0C0D10; font-weight: 500">new track</div>
+          </div>
+        </div>
+
+        <!-- Worker A -->
+        <div style="display: flex; height: 44px; background: rgba(255,255,255,0.035); margin: 0 -24px; padding: 0 24px; border-top: 1px solid #15171C">
+          <div style="width: 140px; flex: none; display: flex; align-items: center; gap: 8px; position: relative"><span style="display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; background: rgba(107,138,253,0.22); color: #C5D2FA; font-size: 9.5px; font-weight: 600">A</span><span style="font-weight: 500; color: #EDEDEF" aria-label="Worker A · login retry">login retry</span><span style="position: absolute; left: 24px; bottom: 3px; font-size: 9px; color: #9A9DA6; font-family: 'JetBrains Mono', monospace; white-space: nowrap">lycoris-next</span><span style="font-size: 10px; color: #9A9DA6">thinking</span></div>
+          <div style="flex: 1 1 auto; position: relative; margin-right: 360px">
+            <div style="position: absolute; left: 23%; width: 7%; top: 11px; bottom: 11px; border-radius: 3px; background: #1E2A4A; padding: 0 8px; box-sizing: border-box; display: flex; align-items: center; font-size: 11px; color: #C5D2FA; white-space: nowrap; overflow: hidden; box-shadow: inset 0 0 0 1px #53699D">read login.ts</div>
+            <div style="position: absolute; left: 30%; width: 8%; top: 11px; bottom: 11px; border-radius: 3px; background: repeating-linear-gradient(135deg, #182036 0 5px, #121829 5px 10px); padding: 0 8px; box-sizing: border-box; display: flex; align-items: center; font-size: 11px; color: #8A9AC8; white-space: nowrap; overflow: hidden; box-shadow: inset 0 0 0 1px #53699D">thinking 48s</div>
+            <div style="position: absolute; left: 38%; width: 8%; top: 11px; bottom: 11px; border-radius: 3px; background: #1E2A4A; padding: 0 8px; box-sizing: border-box; display: flex; align-items: center; font-size: 11px; color: #C5D2FA; white-space: nowrap; overflow: hidden; box-shadow: inset 0 0 0 1px #53699D"><span aria-hidden="true" style="position: absolute; left: 0; top: 0; width: 10px; height: 2px; background: #D9A24A"></span>patch retry</div>
+            <div style="position: absolute; left: 46.5%; width: 7.5%; top: 11px; bottom: 11px; border-radius: 3px; background: repeating-linear-gradient(135deg, #182036 0 5px, #121829 5px 10px); padding: 0 8px; box-sizing: border-box; display: flex; align-items: center; font-size: 11px; color: #8A9AC8; white-space: nowrap; overflow: hidden; box-shadow: inset 0 0 0 1px #53699D">thinking</div>
+            <div style="position: absolute; left: 54%; width: 3%; top: 11px; bottom: 11px; border-radius: 3px 0 0 3px; background: #1E2A4A; padding: 0 6px; box-sizing: border-box; display: flex; align-items: center; font-size: 11px; color: #C5D2FA; white-space: nowrap; overflow: hidden; box-shadow: inset 0 0 0 1px #53699D">logger</div>
+            <div style="position: absolute; left: 57%; width: 0.5%; top: 11px; bottom: 11px; border-radius: 0 3px 3px 0; background: rgba(217,162,74,0.08); border-left: 2px solid #D9A24A; box-sizing: border-box"></div>
+            <div style="position: absolute; left: 58%; width: 2.5%; top: 11px; bottom: 11px; border-radius: 3px; background: repeating-linear-gradient(135deg, #182036 0 5px, #121829 5px 10px); padding: 0 6px; box-sizing: border-box; display: flex; align-items: center; font-size: 11px; color: #8A9AC8; white-space: nowrap; overflow: hidden; box-shadow: inset 0 0 0 1px #53699D">thinking</div>
+            <div style="position: absolute; left: 60.5%; width: 11.5%; top: 11px; bottom: 11px; border-radius: 3px; background: #1E2A4A; padding: 0 8px; box-sizing: border-box; display: flex; align-items: center; font-size: 11px; color: #C5D2FA; white-space: nowrap; overflow: hidden; box-shadow: inset 0 0 0 1px #53699D"><span aria-hidden="true" style="position: absolute; left: 0; top: 0; width: 10px; height: 2px; background: #D9A24A"></span>patch: use services/logger</div>
+            <div style="position: absolute; left: 72.5%; width: 7.5%; top: 11px; bottom: 11px; border-radius: 3px 0 0 3px; border-right: 2px solid #EDEDEF; background: repeating-linear-gradient(135deg, #182036 0 5px, #121829 5px 10px); padding: 0 8px; box-sizing: border-box; display: flex; align-items: center; font-size: 11px; color: #8A9AC8; white-space: nowrap; overflow: hidden; box-shadow: inset 0 0 0 1px #53699D">thinking</div>
+            <div style="position: absolute; left: 77.5%; top: 50%; width: 7px; height: 7px; border-radius: 2px; background: #D9A24A; transform: translate(-50%,-50%) rotate(45deg); box-shadow: 0 0 0 4px rgba(217,162,74,0.16)"></div>
+            <div title="changelog" style="position: absolute; left: calc(100% + 8px); width: 152px; top: 5px; bottom: 5px; border-radius: 3px; border: 1px dashed #53699D; box-sizing: border-box; padding: 0 8px; display: flex; flex-direction: column; justify-content: center; gap: 1px; font-size: 11px; line-height: 1.3; color: #8A9AC8; white-space: nowrap; overflow: hidden"><span aria-hidden="true" style="position: absolute; left: 0; top: 0; width: 10px; height: 2px; background: #D9A24A"></span><span style="overflow: hidden; text-overflow: ellipsis">changelog</span><span style="font-size: 10px; color: #8A9AC8; overflow: hidden; text-overflow: ellipsis">after this turn</span></div><div title="run tests" style="position: absolute; left: calc(100% + 168px); width: 152px; top: 5px; bottom: 5px; border-radius: 3px; border: 1px dashed #53699D; box-sizing: border-box; padding: 0 8px; display: flex; flex-direction: column; justify-content: center; gap: 1px; font-size: 11px; line-height: 1.3; color: #8A9AC8; white-space: nowrap; overflow: hidden"><span style="overflow: hidden; text-overflow: ellipsis">run tests</span></div>
+          </div>
+        </div>
+
+        <!-- Worker B -->
+        <div style="display: flex; height: 44px; border-top: 1px solid #15171C">
+          <div style="width: 140px; flex: none; display: flex; align-items: center; gap: 8px; position: relative"><span style="display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; background: rgba(63,182,168,0.22); color: #BFF0E6; font-size: 9.5px; font-weight: 600">B</span><span style="font-weight: 500" aria-label="Worker B · rate limits">rate limits</span><span style="position: absolute; left: 24px; bottom: 3px; font-size: 9px; color: #9A9DA6; font-family: 'JetBrains Mono', monospace; white-space: nowrap">hitoiro-api</span><span style="font-size: 10px; color: #9A9DA6">working</span></div>
+          <div style="flex: 1 1 auto; position: relative; margin-right: 360px">
+            <div style="position: absolute; left: 78%; width: 2%; top: 11px; bottom: 11px; border-radius: 3px 0 0 3px; background: repeating-linear-gradient(135deg, #15302C 0 5px, #10231F 5px 10px); border-left: 2px solid #F2C572; box-sizing: border-box; box-shadow: inset 0 0 0 1px #32746C"></div>
+            <div title="rate-limit middleware" style="position: absolute; left: calc(100% + 8px); width: 152px; top: 5px; bottom: 5px; border-radius: 3px; border: 1px dashed #32746C; box-sizing: border-box; padding: 0 8px; display: flex; flex-direction: column; justify-content: center; gap: 1px; font-size: 11px; line-height: 1.3; color: #6FB8AD; white-space: nowrap; overflow: hidden"><span aria-hidden="true" style="position: absolute; left: 0; top: 0; width: 10px; height: 2px; background: #D9A24A"></span><span style="overflow: hidden; text-overflow: ellipsis">rate-limit middleware</span></div>
+          </div>
+        </div>
+
+        <!-- Reviewer -->
+        <div style="display: flex; height: 44px; border-top: 1px solid #15171C; border-bottom: 1px solid #15171C">
+          <div style="width: 140px; flex: none; display: flex; align-items: center; gap: 8px"><span style="display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; background: rgba(167,139,250,0.22); color: #E3D8FF; font-size: 9.5px; font-weight: 600">R</span><span style="font-weight: 500">Reviewer</span><span style="font-size: 10px; color: #9A9DA6">waiting</span></div>
+          <div style="flex: 1 1 auto; position: relative; margin-right: 360px">
+            <div style="position: absolute; left: 46.5%; width: 5%; top: 11px; bottom: 11px; border-radius: 3px; background: #2B2446; padding: 0 8px; box-sizing: border-box; display: flex; align-items: center; font-size: 11px; color: #D9CCFB; white-space: nowrap; overflow: hidden; box-shadow: inset 0 0 0 1px #6F60A8">retry ✓</div>
+            <div style="position: absolute; left: 73%; width: 6.5%; top: 11px; bottom: 11px; border-radius: 3px; background: #2B2446; padding: 0 8px; box-sizing: border-box; display: flex; align-items: center; gap: 6px; font-size: 11px; color: #D9CCFB; white-space: nowrap; overflow: hidden; box-shadow: inset 0 0 0 1px #6F60A8"><span>logger</span><span style="width: 6px; height: 6px; border-radius: 50%; background: #D9A24A"></span></div>
+          </div>
+        </div>
+
+        <!-- connectors: each decision hangs its work off the spine -->
+        <div aria-hidden="true" style="position: absolute; top: 62px; height: 30px; left: calc(140px + (100% - 140px - 360px) * 0.22); width: 1px; background: #2A2D35; pointer-events: none"></div>
+        <div aria-hidden="true" style="position: absolute; top: 62px; height: 30px; left: calc(140px + (100% - 140px - 360px) * 0.39); width: 1px; background: #2A2D35; pointer-events: none"></div>
+        <div aria-hidden="true" style="position: absolute; top: 62px; height: 30px; left: calc(140px + (100% - 140px - 360px) * 0.57); width: 1px; background: #2A2D35; pointer-events: none"></div>
+        <div aria-hidden="true" style="position: absolute; top: 62px; height: 74px; left: calc(140px + (100% - 140px - 360px) * 0.78); width: 1px; background: linear-gradient(to bottom, #F2C572, rgba(242,197,114,0.12)); pointer-events: none"></div>
+        <div aria-hidden="true" style="position: absolute; top: 0; bottom: 0; left: calc(140px + (100% - 140px - 360px) * 0.8); width: 1px; background: #EDEDEF; pointer-events: none"></div>
+      </div>
+
+      </div>
+
+      <!-- Desk: script, decisions, words in flight, composer -->
+      <div style="margin-top: 20px; flex: 1 1 auto; display: flex; flex-direction: column; background: #0F1013; box-shadow: inset 0 1px 0 #1A1C22; padding: 18px 24px 26px 24px; box-sizing: border-box">
+      <!-- Transcript: the selected track -->
+      <div style="margin-top: 0; display: flex; flex-wrap: wrap; gap: 0">
+        <div style="flex: 999 1 460px; min-width: 0">
+          <div style="display: flex; align-items: center; gap: 10px; height: 24px">
+            <span style="display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; background: rgba(107,138,253,0.22); color: #C5D2FA; font-size: 9.5px; font-weight: 600">A</span>
+            <span style="font-weight: 500">Worker A</span>
+            <span style="font-size: 11px; color: #8A9AC8; font-family: 'JetBrains Mono', monospace">thinking · 0m 45s</span>
+            <span title="this track’s model and effort" style="margin-left: auto; font-size: 11px; color: #9A9DA6; white-space: nowrap">Spark 1.3 · high</span><span style="margin-left: 14px; display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: #9A9DA6"><span style="width: 5px; height: 5px; border-radius: 50%; background: #C9CBD1"></span>live</span>
+          </div>
+          <div style="height: 158px; overflow: hidden; position: relative; margin-top: 6px">
+            <div aria-hidden="true" style="position: absolute; left: 0; right: 0; top: 0; height: 24px; background: linear-gradient(to bottom, #0F1013, rgba(15,16,19,0)); pointer-events: none; z-index: 1"></div>
+            <div style="position: absolute; left: 0; right: 0; bottom: 0; padding-top: 6px; display: flex; flex-direction: column; font-size: 12.5px; color: #9A9DA6">
+              <div style="display: flex; gap: 10px; align-items: baseline; padding: 5px 0; color: #9A9DA6"><span style="width: 6px; height: 6px; border-radius: 2px; background: #2F4A80; flex: none; margin-top: 4px"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">read login.ts · 212 lines</span></div>
+              <div style="display: flex; gap: 10px; align-items: baseline; padding: 5px 0; color: #9A9DA6"><span style="width: 6px; height: 6px; border-radius: 2px; background: repeating-linear-gradient(135deg, #3A4766 0 2px, #1A2238 2px 4px); flex: none; margin-top: 4px"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis"><span style="color: #9A9DA6">thinking 48s ·</span> retry with exponential backoff, 3 attempts, only on 5xx and timeouts</span></div>
+              <div style="display: flex; gap: 10px; align-items: baseline; padding: 5px 0"><span style="width: 6px; height: 6px; border-radius: 2px; background: #2F4A80; flex: none; margin-top: 4px"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">patch retry <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #4CC38A">+18</span> <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #F27979">−2</span></span></div>
+              <div style="display: flex; gap: 10px; align-items: baseline; padding: 5px 0"><span style="width: 6px; height: 6px; border-radius: 2px; background: repeating-linear-gradient(135deg, #3A4766 0 2px, #1A2238 2px 4px); flex: none; margin-top: 4px"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis"><span style="color: #9A9DA6">thinking 45s ·</span> where to log failed attempts; started an ad-hoc file logger</span></div>
+              <div style="display: flex; gap: 10px; align-items: baseline; padding: 5px 0"><span style="width: 6px; height: 6px; border-radius: 2px; background: #D9A24A; transform: rotate(45deg); flex: none; margin-top: 4px"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis"><span style="color: #D9A24A">you ·</span> wait, use the existing logger <span style="color: #9A9DA6">· cut 3s</span></span></div>
+              <div style="display: flex; gap: 10px; align-items: baseline; padding: 5px 0"><span style="width: 6px; height: 6px; border-radius: 2px; background: repeating-linear-gradient(135deg, #3A4766 0 2px, #1A2238 2px 4px); flex: none; margin-top: 4px"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis"><span style="color: #9A9DA6">thinking 15s ·</span> use services/logger instead; drop the file logger</span></div>
+              <div style="display: flex; gap: 10px; align-items: baseline; padding: 5px 0; color: #C9CBD1"><span style="width: 6px; height: 6px; border-radius: 2px; background: #2F4A80; flex: none; margin-top: 4px"></span><span style="flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">patch: use services/logger <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #4CC38A">+23</span> <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #F27979">−9</span> <span style="color: #A78BFA">· reviewer: mask() not imported</span></span></div>
+              <div style="display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px 8px 10px; margin: 2px 0 0 -10px; border-radius: 6px; background: #15161B; color: #C9CBD1">
+                <span style="width: 6px; height: 6px; border-radius: 2px; background: repeating-linear-gradient(135deg, #6B8AFD 0 2px, #1A2238 2px 4px); flex: none; margin-top: 7px"></span>
+                <span style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px">
+                  <span style="line-height: 1.55">Checking whether <span style="font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: #EDEDEF">services/logger</span> masks PII by default. It doesn’t export <span style="font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: #EDEDEF">mask()</span>. Two options: import from <span style="font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: #EDEDEF">utils/mask</span>, or add it to the logger. Leaning import — smaller diff, and the reviewer flagged exactly this<span style="display: inline-block; width: 6px; height: 13px; background: #6B8AFD; vertical-align: -2px; margin-left: 2px"></span></span>
+                  <span style="display: flex; gap: 10px; flex-wrap: wrap; font-size: 11px; font-family: 'JetBrains Mono', monospace; color: #9A9DA6"><span>read services/logger.ts</span><span>grep mask(</span><span style="color: #9A9DA6">edit login.ts ⋯</span></span>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="flex: 1 1 auto"></div>
+
+      <!-- Needs you -->
+      <div style="margin-top: 18px; display: flex; flex-direction: column; gap: 4px">
+        <div style="height: 20px; display: flex; align-items: center; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #9A9DA6">Needs you</div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 9px 10px 9px 12px; border-radius: 8px; background: #15161B; border-left: 2px solid #6B8AFD">
+          <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px">
+            <div style="display: flex; align-items: center; gap: 6px; color: #C9CBD1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis"><span style="display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; background: rgba(107,138,253,0.22); color: #C5D2FA; font-size: 9.5px; font-weight: 600; flex: none">A</span>import mask() from utils, or add it to the logger?</div>
+            <div style="font-size: 11px; color: #9A9DA6">Went with import. Settled at commit unless you say otherwise.</div>
+          </div>
+          <button style="height: 26px; padding: 0 10px; border-radius: 6px; border: none; background: transparent; color: #C9CBD1; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer">Import</button>
+          <button style="height: 26px; padding: 0 10px; border-radius: 6px; border: none; background: transparent; color: #9A9DA6; font: inherit; font-size: 12px; cursor: pointer">Add to logger</button>
+          <button style="height: 26px; padding: 0 10px; border-radius: 6px; border: none; background: transparent; color: #9A9DA6; font: inherit; font-size: 12px; cursor: pointer">Reply</button>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 9px 10px 9px 12px; border-radius: 8px; background: #15161B; border-left: 2px solid #D9A24A">
+          <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px">
+            <div style="display: flex; align-items: center; gap: 6px; color: #EDEDEF; white-space: nowrap; overflow: hidden; text-overflow: ellipsis"><span style="display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; background: rgba(138,143,152,0.18); flex: none"><svg aria-hidden="true" width="14" height="14" viewBox="6 8 88 88" style="flex: none"><g transform="rotate(-12 24 38)"><path d="M12 38 L36 38 L32 16 Q31 12 27 12 L21 12 Q17 12 16 16 Z" fill="#E0C8A4"/></g><g transform="rotate(12 70 38)"><path d="M58 38 L82 38 L78 16 Q77 12 73 12 L67 12 Q63 12 62 16 Z" fill="#E0C8A4"/></g><rect x="16" y="42" width="60" height="46" rx="5" fill="#C9A97C"/><rect x="24.0" y="53.0" width="16" height="18" rx="8.0" fill="#F2C572"/><rect x="52.0" y="53.0" width="16" height="18" rx="8.0" fill="#F2C572"/><rect x="30.0" y="60.0" width="6" height="8" rx="3.0" fill="#15161B"/><rect x="58.0" y="60.0" width="6" height="8" rx="3.0" fill="#15161B"/><ellipse cx="32" cy="92" rx="9" ry="4" fill="#2A2D35"/><ellipse cx="60" cy="92" rx="9" ry="4" fill="#2A2D35"/><path d="M86 72 q13 -4 11 -17" fill="none" stroke="#2A2D35" stroke-width="9" stroke-linecap="round"/></svg></span><span style="color: #9A9DA6">Can’t place</span> “Make it faster” <span style="color: #9A9DA6">— the login call, or the test run?</span></div>
+            <div style="font-size: 11px; color: #9A9DA6">Not started · pick a track</div>
+          </div>
+          <button style="height: 26px; padding: 0 10px; border-radius: 6px; border: none; background: #1F2127; color: #EDEDEF; font: inherit; font-size: 12px; cursor: pointer">Login call</button>
+          <button style="height: 26px; padding: 0 10px; border-radius: 6px; border: none; background: #1F2127; color: #EDEDEF; font: inherit; font-size: 12px; cursor: pointer">Test run</button>
+          <button style="height: 26px; padding: 0 10px; border-radius: 6px; border: none; background: transparent; color: #9A9DA6; font: inherit; font-size: 12px; cursor: pointer">Reply</button>
+        </div>
+      </div>
+
+      <!-- Your words that are not on the timeline yet: placed ones leave this row the moment they land -->
+      <div style="margin-top: 12px; display: flex; flex-direction: column; gap: 6px">
+        <div style="height: 20px; display: flex; align-items: center; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #9A9DA6; padding-left: 54px">Waiting to run</div>
+        <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding-left: 54px">
+          <span style="display: inline-flex; flex-direction: column; justify-content: center; gap: 3px; height: 44px; padding: 0 10px 0 6px; border-radius: 6px; background: #15161B; color: #9A9DA6; font-size: 12px; white-space: nowrap"><span style="display: inline-flex; align-items: center; gap: 8px"><span style="width: 7px; height: 7px; border-radius: 2px; border: 1.5px solid #D9A24A; box-sizing: border-box; transform: rotate(45deg); flex: none; margin: 0 4px 0 3px; opacity: 0.8"></span><span>hmm, maybe…</span></span><span style="display: flex; align-items: center; justify-content: space-between; padding-left: 19px; color: #9A9DA6; font-size: 11px"><span>parked · say where</span></span></span>
+          <span style="display: inline-flex; flex-direction: column; justify-content: center; gap: 3px; height: 44px; padding: 0 10px 0 6px; border-radius: 6px; background: #15161B; color: #C9CBD1; font-size: 12px; white-space: nowrap"><span style="display: inline-flex; align-items: center; gap: 8px"><span style="width: 7px; height: 7px; border-radius: 2px; background: #D9A24A; transform: rotate(45deg); flex: none; margin: 0 4px 0 3px"></span><span>add a changelog entry</span></span><span style="display: flex; align-items: center; justify-content: space-between; padding-left: 19px; color: #9A9DA6; font-size: 11px"><span>after this turn · <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px">0 m 03 s</span></span><span style="display: inline-flex; align-items: center; height: 16px; padding: 0 6px; border-radius: 4px; background: rgba(107,138,253,0.18); color: #C5D2FA; font-size: 10.5px; margin-left: 16px">Worker A</span></span></span>
+          <span style="display: inline-flex; flex-direction: column; justify-content: center; gap: 3px; height: 44px; padding: 0 10px 0 6px; border-radius: 6px; background: #15161B; color: #C9CBD1; font-size: 12px; white-space: nowrap"><span style="display: inline-flex; align-items: center; gap: 8px"><span style="width: 7px; height: 7px; border-radius: 2px; background: #D9A24A; transform: rotate(45deg); flex: none; margin: 0 4px 0 3px"></span><span>don’t touch the signup flow</span></span><span style="display: flex; align-items: center; justify-content: space-between; padding-left: 19px; color: #9A9DA6; font-size: 11px"><span>checking · <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px">3 s</span></span><span style="display: inline-flex; align-items: center; height: 16px; padding: 0 6px; border-radius: 4px; background: rgba(107,138,253,0.18); color: #C5D2FA; font-size: 10.5px; margin-left: 16px">Worker A</span></span></span>
+          <span style="display: inline-flex; flex-direction: column; justify-content: center; gap: 3px; height: 44px; padding: 0 10px 0 6px; border-radius: 6px; background: #15161B; color: #C9CBD1; font-size: 12px; white-space: nowrap"><span style="display: inline-flex; align-items: center; gap: 8px"><span style="width: 7px; height: 7px; border-radius: 2px; background: #D9A24A; transform: rotate(45deg); flex: none; margin: 0 4px 0 3px"></span><span>also bump the version</span></span><span style="display: flex; align-items: center; justify-content: space-between; padding-left: 19px; color: #9A9DA6; font-size: 11px"><span>checking</span><span style="display: inline-flex; align-items: center; height: 16px; padding: 0 6px; border-radius: 4px; background: rgba(107,138,253,0.18); color: #C5D2FA; font-size: 10.5px; margin-left: 16px">Worker A</span></span></span>
+        </div>
+      </div>
+
+      <!-- The Editor’s line: a fixed row right above the composer, over the cat’s head. Empty until it has something to say; the bubble hugs the sentence, tail into the cat -->
+      <div style="height: 26px; margin-top: 12px; padding-left: 2px; display: flex; align-items: flex-end; font-size: 12px; white-space: nowrap; position: relative"></div>
+      <!-- Composer -->
+      <div style="margin: 8px 0 0 0; display: flex; align-items: center; gap: 10px; padding: 10px 12px 10px 14px; border-radius: 12px; background: #1A1C22">
+        <svg aria-hidden="true" width="44" height="44" viewBox="0 0 100 100" style="flex: none; overflow: visible; margin: -14px 0 -6px 2px"><g transform=""><ellipse cx="52" cy="95" rx="34" ry="3" fill="#000" opacity="0.4"/><path d="M86 72 q13 -4 11 -17 q-1 -7 -7 -8" fill="none" stroke="#2A2D35" stroke-width="7" stroke-linecap="round"/><path d="M76 42 L86 33 L86 79 L76 88 Z" fill="#A4875F"/><path d="M16 42 L26 33 L86 33 L76 42 Z" fill="#5A4A33"/><g transform="rotate(-12 24 38)"><path d="M12 38 L36 38 L32 16 Q31 12 27 12 L21 12 Q17 12 16 16 Z" fill="#E0C8A4"/><path d="M18 36 L30 36 L27 17 Z" fill="#A4875F" opacity="0.35"/><path d="M16 16 L28 13 L22 22 Z" fill="#A4875F" opacity="0.6"/></g><g transform="rotate(12 70 38)"><path d="M58 38 L82 38 L78 16 Q77 12 73 12 L67 12 Q63 12 62 16 Z" fill="#E0C8A4"/><path d="M64 36 L76 36 L73 17 Z" fill="#A4875F" opacity="0.35"/></g><rect x="16" y="42" width="60" height="46" rx="4" fill="#C9A97C"/><rect x="43.5" y="42" width="5" height="46" fill="#B69368" opacity="0.9"/><rect x="16" y="42" width="60" height="3" fill="#E0C8A4"/><ellipse cx="32" cy="92" rx="8" ry="3.5" fill="#2A2D35"/><ellipse cx="60" cy="92" rx="8" ry="3.5" fill="#2A2D35"/><rect x="27.5" y="52.5" width="13" height="15" rx="6.5" fill="#F2C572"/><rect x="55.5" y="52.5" width="13" height="15" rx="6.5" fill="#F2C572"/><rect x="33.0" y="58.5" width="5" height="7" rx="2.5" fill="#15161B"/><rect x="61.0" y="58.5" width="5" height="7" rx="2.5" fill="#15161B"/><path d="M43 72 L49 72 L46 76.5 Z" fill="#5E4A2E"/><path d="M28 73 L10 69 M28 77 L11 82 M64 73 L82 69 M64 77 L81 82" stroke="#5E4A2E" stroke-width="2" stroke-linecap="round"/></g></svg>
+        <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9A9DA6" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>
+                <span style="display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 6px 0 8px; border-radius: 6px; background: #15161B; color: #C9CBD1; font-size: 11px; white-space: nowrap; box-shadow: inset 0 0 0 1px #2A2D35">Editor decides<svg aria-hidden="true" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="#9A9DA6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"></path></svg></span>
+        <label for="composer" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Tell the editor</label>
+        <input id="composer" type="text" placeholder="Say what should happen · ↵ to send" style="flex: 1; min-width: 0; height: 28px; border: none; outline: none; background: transparent; color: #EDEDEF; font: inherit; font-size: 13.5px">
+        <span style="flex: none; display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 50%; background: #22242B; margin: -4px -2px -4px 0"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#C9CBD1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"></rect><path d="M5 11a7 7 0 0 0 14 0"></path><path d="M12 18v3"></path></svg></span></div>
+      <!-- Status under the composer: the selected track’s model and effort (the Editor’s pick, press to override) and the plan’s usage as a ring; press it for the bars -->
+      <div style="height: 18px; margin-top: 8px; padding: 0 14px; display: flex; align-items: center; justify-content: flex-end; gap: 14px; font-size: 12px; color: #C9CBD1; position: relative"><button aria-label="Stop all turns in all sessions" style="display: inline-flex; align-items: center; gap: 6px; height: 18px; padding: 0; border: none; background: transparent; color: #EDEDEF; font: inherit; font-size: 12px; cursor: pointer"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 1.5px; background: #EDEDEF"></span>Stop all turns · 2 sessions</button><button aria-label="Stop Worker A" style="margin-right: auto; display: inline-flex; align-items: center; gap: 6px; height: 18px; padding: 0; border: none; background: transparent; color: #EDEDEF; font: inherit; font-size: 12px; cursor: pointer"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 1.5px; background: #EDEDEF"></span>Stop A</button><span style="display: inline-flex; align-items: center">Worker A · Spark 1.3 · high<svg aria-hidden="true" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="#858992" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="margin-left: 3px"><path d="M6 9l6 6 6-6"></path></svg></span><svg aria-hidden="true" width="14" height="14" viewBox="0 0 20 20" style="flex: none"><circle cx="10" cy="10" r="7.5" fill="none" stroke="#2A2D35" stroke-width="3"></circle><circle cx="10" cy="10" r="7.5" fill="none" stroke="#C9CBD1" stroke-width="3" stroke-dasharray="15.1 47.1" stroke-linecap="butt" transform="rotate(-90 10 10)"></circle></svg></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div style="font-family: Inter, system-ui, sans-serif; font-size: 13px; line-height: 1.45; letter-spacing: -0.01em; color: #EDEDEF; font-feature-settings: 'tnum' 1"><!-- 2e: the pointer rests on the right end of A’s running bar; ■ appears and does what ⌘. does. Thin marks on the lanes are turn ends -->
+<div aria-hidden="true" style="position: absolute; left: 638.0px; top: 157px; height: 36px; width: 1px; background: rgba(237,237,239,0.22); pointer-events: none"></div>
+<div aria-hidden="true" style="position: absolute; left: 768.4px; top: 157px; height: 36px; width: 1px; background: rgba(237,237,239,0.22); pointer-events: none"></div>
+<div aria-hidden="true" style="position: absolute; left: 730.1px; top: 247px; height: 36px; width: 1px; background: rgba(237,237,239,0.22); pointer-events: none"></div>
+<div style="position: absolute; left: 902.6px; top: 166px; width: 18px; height: 18px; border-radius: 4px; background: #2A2D35; box-shadow: 0 0 0 1px rgba(255,255,255,0.12); display: flex; align-items: center; justify-content: center; z-index: 12"><span style="width: 7px; height: 7px; border-radius: 1px; background: #EDEDEF"></span></div>
+<div role="tooltip" style="position: absolute; left: 861.6px; top: 192px; height: 24px; padding: 0 8px; border-radius: 6px; background: #2A2D35; display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: #EDEDEF; white-space: nowrap; z-index: 12">Stop now<span style="color: #9A9DA6; font-family: 'JetBrains Mono', monospace; font-size: 11px">⌘.</span></div></div>
+</body>
+</html>

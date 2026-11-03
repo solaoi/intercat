@@ -1,0 +1,9 @@
+# macOS が作るファイル
+.DS_Store
+
+# 作り直せるビルドの成果物
+target/
+node_modules/
+
+# 調査と実機検証の記録（公開しない。生ログに手元のパスや個人の設定が入る）
+research/
