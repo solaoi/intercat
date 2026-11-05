@@ -1,0 +1,46 @@
+{
+  "name": "intercat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.mjs",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "setup:tools": "node tools/install-gitleaks.mjs",
+    "start": "npm run setup:tools && cargo build --offline --bin intercatd && npm run build && electron .",
+    "preview": "npm run build && electron . --preview",
+    "test:desktop": "npm run build && playwright test"
+  },
+  "dependencies": {
+    "@fontsource/inter": "5.3.0",
+    "@fontsource/jetbrains-mono": "5.3.0",
+    "@napi-rs/keyring": "2.1.2",
+    "monaco-editor": "0.57.0",
+    "pdfjs-dist": "6.5.438",
+    "pixi.js": "8.22.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "6.2.1",
+    "electron": "45.2.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
+  },
+  "allowScripts": {
+    "electron@45.2.1": true,
+    "fsevents": false
+  },
+  "overrides": {
+    "monaco-editor": {
+      "dompurify": "3.4.17"
+    }
+  }
+}

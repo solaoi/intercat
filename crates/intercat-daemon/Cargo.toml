@@ -1,0 +1,42 @@
+[package]
+name = "intercat-daemon"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+fault-injection = []
+
+[lib]
+name = "intercat_daemon"
+
+[[bin]]
+name = "intercatd"
+path = "src/main.rs"
+
+[dependencies]
+intercat-git = { path = "../intercat-git" }
+libc.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+ring = "=0.17.14"
+uuid.workspace = true
+libproc = "=0.14.11"
+tempfile.workspace = true
+walkdir = "=2.5.0"
+subtle = "=2.6.1"
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
+base64.workspace = true
+muse-code-sdk = "=1.4.14"
+pcre2-sys = "=0.2.10"
+toml = { version = "=1.1.8", default-features = false, features = ["parse", "serde", "std"] }
+percent-encoding = "=2.3.2"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+[dev-dependencies]
+gix.workspace = true

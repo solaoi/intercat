@@ -1,0 +1,107 @@
+//! Typed validation for the pinned stable-schema wire fixture.
+use intercat_daemon::Result;
+use serde::Deserialize;
+use serde_json::Value;
+
+#[derive(Deserialize)]
+pub struct Validation {
+    pub name: String,
+    pub value: Value,
+}
+macro_rules! wire_types {
+    ($($name:ident),* $(,)?) => {
+        pub fn validate(input: &Validation) -> Result<()> {
+            match input.name.as_str() {
+                $(stringify!($name) => { let _: muse_code_sdk::msp::$name = serde_json::from_value(input.value.clone()).map_err(|error| format!("{}: {error}", input.name))?; },)*
+                name => return Err(format!("Unknown wire type: {name}").into()),
+            }
+            Ok(())
+        }
+    };
+}
+wire_types!(
+    ApprovalDecideParams,
+    ApprovalDecideResult,
+    ApprovalListPendingParams,
+    ApprovalListPendingResult,
+    ApprovalRequestParams,
+    ApprovalResolvedParams,
+    ApprovalUpdatedParams,
+    ComputerUseSetupChanged,
+    InitializeParams,
+    InitializeResult,
+    ItemCompletedParams,
+    ItemDeltaParams,
+    ItemReadOutputParams,
+    ItemReadOutputResult,
+    ItemStartedParams,
+    ItemUpdatedParams,
+    ModelListParams,
+    ModelListResult,
+    MonitorInboxItemAdmittedParams,
+    MonitorInboxItemDrainedParams,
+    MonitorInboxItemVoidedParams,
+    PluginChangedParams,
+    PluginMarketplaceChangedParams,
+    RecapCompletedParams,
+    SessionApprovalModeChangedParams,
+    SessionBranchChangedParams,
+    SessionClosedParams,
+    SessionContextUsageParams,
+    SessionForkParams,
+    SessionForkResult,
+    SessionGoalChangedParams,
+    SessionLeaveCompletedParams,
+    SessionListChangedParams,
+    SessionModelChangedParams,
+    SessionModelRouteUnservedParams,
+    SessionNameChangedParams,
+    SessionReadParams,
+    SessionReadResult,
+    SessionReasoningEffortChangedParams,
+    SessionResumeParams,
+    SessionResumeResult,
+    SessionSetModelParams,
+    SessionSetModelResult,
+    SessionStartParams,
+    SessionStartResult,
+    SessionStartedParams,
+    SessionStatusChangedParams,
+    SessionTodoListChangedParams,
+    SessionTokenUsageParams,
+    SessionViewHealthChangedParams,
+    SkillChangedParams,
+    SkillListParams,
+    SkillListResult,
+    SubscriptionUsage,
+    TurnCompletedParams,
+    TurnForegroundCompletedParams,
+    TurnInterruptParams,
+    TurnInterruptResult,
+    TurnModelRetryScheduledParams,
+    TurnRetractedParams,
+    TurnRetryScheduledParams,
+    TurnStartParams,
+    TurnStartResult,
+    TurnStartedParams,
+    TurnSteerParams,
+    TurnSteerResult,
+    TurnUnqueueParams,
+    TurnUnqueueResult,
+    TurnUnqueuedParams,
+    UsageReadResult,
+    UserInputAnswerParams,
+    UserInputAnswerResult,
+    UserInputCancelParams,
+    UserInputCancelResult,
+    UserInputClarifyParams,
+    UserInputClarifyResult,
+    UserInputEngagedParams,
+    UserInputInterruptParams,
+    UserInputInterruptResult,
+    UserInputRequestParams,
+    UserInputSettledParams,
+    ViewGapParams,
+    ViewPageParams,
+    ViewPageResult,
+);

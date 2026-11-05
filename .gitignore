@@ -4,6 +4,20 @@
 # 作り直せるビルドの成果物
 target/
 node_modules/
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+test-results/
+playwright-report/
+.tools/
 
 # 調査と実機検証の記録（公開しない。生ログに手元のパスや個人の設定が入る）
 research/
+
+# デモ動画の制作物（movie/ 以下はすべて管理外）
+/movie/
+
+# 手元の API キー
+.env

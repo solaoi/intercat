@@ -1,0 +1,468 @@
+//! Pinned Gitleaks rules and exact known values. Scan Git object bytes, never a
+//! mutable worktree. Only locations and fingerprints leave the private scanner.
+use crate::{Result, command};
+use intercat_git::{ObjectId, Repository};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Read,
+    ops::Range,
+    os::unix::fs::PermissionsExt,
+    path::{Component, Path, PathBuf},
+    time::Duration,
+};
+use tokio::sync::watch;
+
+pub const VERSION: &str = "8.30.1";
+const INPUT_LIMIT: usize = 64 * 1024 * 1024;
+const FINDING_LIMIT: usize = 2048;
+pub(crate) const CONFIG: &str = include_str!("../rules/gitleaks-8.30.1.toml");
+pub fn ruleset() -> String {
+    format!(
+        "gitleaks-{VERSION}/{};config={};input-v1",
+        binary_hash(),
+        digest(CONFIG.as_bytes())
+    )
+}
+
+fn binary_hash() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f"
+    } else {
+        "cee01fea7173f1b779dff188e1c26ecbcb4027d394acc573b23aaf0be260e291"
+    }
+}
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+fn verify(path: &Path) -> Result<()> {
+    let mut file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err("Gitleaks must be a regular file.".into());
+    }
+    let mut sha = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        sha.update(&buffer[..count]);
+    }
+    if sha
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+        != binary_hash()
+    {
+        return Err("Gitleaks integrity check failed. Run npm run setup:tools.".into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Engine {
+    executable: PathBuf,
+}
+impl Engine {
+    pub fn capture() -> Result<Self> {
+        Self::open(
+            std::env::var_os("INTERCAT_GITLEAKS")
+                .ok_or("Gitleaks is not configured. Run npm run setup:tools.")?
+                .into(),
+        )
+    }
+    pub fn open(path: PathBuf) -> Result<Self> {
+        let executable = path.canonicalize()?;
+        verify(&executable)?;
+        Ok(Self { executable })
+    }
+    pub fn start(&self, known_values: &[String]) -> Result<Scanner> {
+        let root = tempfile::Builder::new()
+            .prefix("intercat-scan-")
+            .tempdir()?;
+        let executable = root.path().join("gitleaks");
+        fs::copy(&self.executable, &executable)?;
+        verify(&executable)?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))?;
+        fs::write(root.path().join("rules.toml"), CONFIG)?;
+        fs::write(root.path().join("ignore"), "")?;
+        let mut values = known_values
+            .iter()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        values.sort();
+        values.dedup();
+        if values.len() > 256 || values.iter().map(String::len).sum::<usize>() > 1024 * 1024 {
+            return Err("Too many known secret values to scan safely.".into());
+        }
+        Ok(Scanner { root, values })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Binding {
+    pub commit: String,
+    pub parent_tree: String,
+    pub tree: String,
+    pub message_hash: String,
+    pub ruleset: String,
+    pub value_fingerprints: Vec<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Finding {
+    pub id: String,
+    pub path: String,
+    pub line: u32,
+    pub end_line: u32,
+    pub rule: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Scan {
+    pub binding: Binding,
+    pub findings: Vec<Finding>,
+}
+impl Scan {
+    pub fn accepted(&self, kept: &std::collections::BTreeSet<String>) -> bool {
+        self.findings
+            .iter()
+            .all(|finding| kept.contains(&finding.id))
+    }
+    pub fn fingerprint(&self) -> Result<String> {
+        Ok(digest(&serde_json::to_vec(self)?))
+    }
+}
+
+struct Fragment {
+    path: String,
+    bytes: Vec<u8>,
+    added: Vec<Range<u32>>,
+}
+impl Fragment {
+    fn all(path: String, bytes: Vec<u8>) -> Self {
+        Self {
+            path,
+            bytes,
+            added: std::iter::once(0..u32::MAX).collect(),
+        }
+    }
+    fn touches(&self, start: u32, end: u32) -> bool {
+        self.added
+            .iter()
+            .any(|range| range.start < end && start.saturating_sub(1) < range.end)
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Detected {
+    file: String,
+    start_line: u32,
+    end_line: u32,
+    #[serde(rename = "RuleID")]
+    rule: String,
+}
+
+pub struct Scanner {
+    root: tempfile::TempDir,
+    // Never serialized, logged, put in argv, or written to a config file.
+    values: Vec<String>,
+}
+fn quote(path: &Path) -> Result<String> {
+    Ok(serde_json::to_string(
+        path.to_str().ok_or("Invalid scanner path.")?,
+    )?)
+}
+impl Scanner {
+    fn ruleset(&self) -> String {
+        ruleset()
+    }
+    async fn fragments(
+        &self,
+        fragments: &[Fragment],
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Vec<Finding>> {
+        if fragments.is_empty() {
+            return Ok(vec![]);
+        }
+        let input = tempfile::Builder::new()
+            .prefix("input-")
+            .tempdir_in(self.root.path())?;
+        let mut mapping = BTreeMap::new();
+        let mut total = 0usize;
+        for (index, fragment) in fragments.iter().enumerate() {
+            total = total
+                .checked_add(fragment.bytes.len())
+                .ok_or("Secret scan input is too large.")?;
+            if total > INPUT_LIMIT {
+                return Err("Secret scan input exceeds 64 MiB.".into());
+            }
+            // Preserve the repository name for path-based rules, but materialize
+            // symlink blobs as ordinary bytes. No source path is ever followed.
+            let relative = Path::new(&fragment.path);
+            if relative
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+            {
+                return Err("Unsafe path in secret scan.".into());
+            }
+            let file = input.path().join(relative);
+            fs::create_dir_all(file.parent().ok_or("Missing scan parent.")?)?;
+            fs::write(&file, &fragment.bytes)?;
+            mapping.insert(file.to_string_lossy().into_owned(), index);
+        }
+        let root = self.root.path().canonicalize()?;
+        let executable = root.join("gitleaks");
+        let mut profile = format!(
+            "(version 1)(deny default)(allow process-info* sysctl-read mach-lookup)(allow signal (target self))(allow file-read-metadata)(allow file-read* (subpath {}) (subpath \"/System\") (subpath \"/usr/lib\") (subpath \"/private/var/db/dyld\") (subpath \"/private/preboot\") (subpath \"/dev\")) (allow process-exec (literal {}))(allow file-write* (literal \"/dev/null\"))",
+            quote(&root)?,
+            quote(&executable)?
+        );
+        for parent in root.ancestors() {
+            profile.push_str(&format!("(allow file-read* (literal {}))", quote(parent)?));
+        }
+        let mut command = command::gated_command("/usr/bin/sandbox-exec");
+        command
+            .args(["-p", &profile])
+            .arg(&executable)
+            .args([
+                "dir",
+                "--no-banner",
+                "--no-color",
+                "--redact=100",
+                "--ignore-gitleaks-allow",
+                "--log-level=error",
+                "--report-format=json",
+                "--report-path=-",
+                "--exit-code=10",
+                "--timeout=30",
+                "--config",
+            ])
+            .arg(root.join("rules.toml"))
+            .arg("--gitleaks-ignore-path")
+            .arg(root.join("ignore"))
+            .arg(input.path())
+            .current_dir(&root)
+            .env("HOME", &root)
+            .env("TMPDIR", &root);
+        let output = command::run(&mut command, cancel, Duration::from_secs(35)).await?;
+        if output.cancelled {
+            return Err("Secret scan cancelled.".into());
+        }
+        // Warnings/errors can mean an unreadable fragment or skipped input. Do
+        // not accept a partial scan, malformed report, or truncated report.
+        if output.timed_out
+            || output.truncated
+            || ![Some(0), Some(10)].contains(&output.code)
+            || !output.stderr.is_empty()
+        {
+            return Err("Secret scan did not complete. No scan result was accepted.".into());
+        }
+        let detected: Vec<Detected> =
+            serde_json::from_slice(&output.stdout).map_err(|_| "Invalid secret scan report.")?;
+        let mut findings = Vec::new();
+        if detected.len() > FINDING_LIMIT {
+            return Err("Too many secret findings; no partial result was accepted.".into());
+        }
+        for item in detected {
+            let index = mapping
+                .get(&item.file)
+                .ok_or("Secret scanner reported an unknown path.")?;
+            let fragment = &fragments[*index];
+            if item.start_line == 0 || item.end_line < item.start_line {
+                return Err("Invalid secret scan location.".into());
+            }
+            if fragment.touches(item.start_line, item.end_line) {
+                findings.push(Finding {
+                    id: String::new(),
+                    path: fragment.path.clone(),
+                    line: item.start_line,
+                    end_line: item.end_line,
+                    rule: item.rule,
+                });
+            }
+        }
+        for fragment in fragments {
+            // Exact values also scan binary bytes, independent of Gitleaks's
+            // supported encodings and its default rule allowlists.
+            for value in &self.values {
+                let mut previous = 0;
+                let mut line = 1;
+                let newlines = value.bytes().filter(|byte| *byte == b'\n').count() as u32;
+                for (offset, _) in fragment
+                    .bytes
+                    .windows(value.len())
+                    .enumerate()
+                    .filter(|(_, bytes)| *bytes == value.as_bytes())
+                {
+                    line += fragment.bytes[previous..offset]
+                        .iter()
+                        .filter(|byte| **byte == b'\n')
+                        .count() as u32;
+                    previous = offset;
+                    let end = line + newlines;
+                    if fragment.touches(line, end) {
+                        findings.push(Finding {
+                            id: String::new(),
+                            path: fragment.path.clone(),
+                            line,
+                            end_line: end,
+                            rule: "check-environment-value".into(),
+                        });
+                        if findings.len() > FINDING_LIMIT {
+                            return Err(
+                                "Too many secret findings; no partial result was accepted.".into(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        findings.sort_by(|a, b| {
+            (&a.path, a.line, a.end_line, &a.rule).cmp(&(&b.path, b.line, b.end_line, &b.rule))
+        });
+        findings.dedup();
+        Ok(findings)
+    }
+
+    pub async fn commit(
+        &self,
+        repository: &Repository,
+        parent: ObjectId,
+        commit: ObjectId,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Scan> {
+        let details = repository.commit_details(commit)?;
+        if details.parents != vec![parent] {
+            return Err("Secret scan requires the exact candidate parent.".into());
+        }
+        let parent_tree = repository.tree_id(parent)?;
+        let before = repository.tree_files(parent_tree)?;
+        let after = repository.tree_files(details.tree)?;
+        let binding = Binding {
+            commit: commit.to_string(),
+            parent_tree: parent_tree.to_string(),
+            tree: details.tree.to_string(),
+            message_hash: digest(details.message.as_bytes()),
+            ruleset: self.ruleset(),
+            value_fingerprints: self
+                .values
+                .iter()
+                .map(|value| digest(value.as_bytes()))
+                .collect(),
+        };
+        let mut fragments = vec![Fragment::all(
+            "commit-message.txt".into(),
+            details.message.into_bytes(),
+        )];
+        let mut findings = Vec::new();
+        let mut input_bytes = fragments[0].bytes.len() as u64;
+        for (path, file) in &after {
+            if before
+                .get(path)
+                .is_some_and(|old| old.object == file.object)
+            {
+                continue;
+            }
+            input_bytes = input_bytes.saturating_add(repository.saved_size(file)?);
+            if let Some(old) = before.get(path) {
+                input_bytes = input_bytes.saturating_add(repository.saved_size(old)?);
+            }
+            if input_bytes > INPUT_LIMIT as u64 {
+                return Err("Secret scan input exceeds 64 MiB.".into());
+            }
+            let old = before
+                .get(path)
+                .map(|file| repository.saved_bytes(file))
+                .transpose()?
+                .unwrap_or_default();
+            let bytes = repository.saved_bytes(file)?;
+            if intercat_git::secret_path(path) && !before.contains_key(path) {
+                findings.push(Finding {
+                    id: String::new(),
+                    path: path.clone(),
+                    line: 1,
+                    end_line: 1,
+                    rule: "secret-file".into(),
+                });
+            }
+            if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+                return Err(
+                    format!("Secret scan cannot fully inspect binary content: {path}").into(),
+                );
+            }
+            fragments.push(Fragment {
+                path: format!("files/{path}"),
+                added: intercat_git::added_lines(&old, &bytes),
+                bytes,
+            });
+        }
+        findings.extend(
+            self.fragments(&fragments, cancel)
+                .await?
+                .into_iter()
+                .map(|mut item| {
+                    if let Some(path) = item.path.strip_prefix("files/") {
+                        item.path = path.to_string();
+                    }
+                    item
+                }),
+        );
+        let seed = serde_json::to_vec(&binding)?;
+        for finding in &mut findings {
+            let mut key = seed.clone();
+            key.extend(serde_json::to_vec(&finding)?);
+            finding.id = digest(&key);
+        }
+        Ok(Scan { binding, findings })
+    }
+
+    /// Hide complete matching lines, including multiline matches, before a
+    /// message or subprocess output can enter the journal or reach a worker.
+    pub async fn redact(
+        &self,
+        texts: &[String],
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Vec<String>> {
+        let fragments = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Fragment::all(format!("{i}.txt"), text.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let findings = self.fragments(&fragments, cancel).await?;
+        Ok(texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let path = format!("{index}.txt");
+                text.split_inclusive('\n')
+                    .enumerate()
+                    .map(|(line, text)| {
+                        if findings.iter().any(|finding| {
+                            finding.path == path
+                                && finding.line as usize <= line + 1
+                                && line < finding.end_line as usize
+                        }) {
+                            if text.ends_with('\n') {
+                                "[redacted]\n"
+                            } else {
+                                "[redacted]"
+                            }
+                        } else {
+                            text
+                        }
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+}

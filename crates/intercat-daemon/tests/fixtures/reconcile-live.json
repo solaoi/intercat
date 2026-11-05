@@ -1,0 +1,445 @@
+{
+  "source": "Pinned Muse 1.4.14; recorded disposable pending-approval response, 2026-11-04",
+  "commandId": "01a1a392-02f8-704f-99a8-f71d64cb89c1",
+  "frames": [
+    {
+      "emittedAtMs": 1793745617673,
+      "jsonrpc": "2.0",
+      "method": "session/statusChanged",
+      "params": {
+        "permissionState": {
+          "axes": {
+            "approval": "onRequest",
+            "filesystem": "sandboxed",
+            "network": "off",
+            "reviewer": "human"
+          },
+          "profileId": "intercat-worker",
+          "reviewerAttached": true,
+          "reviewerAuthority": "human"
+        },
+        "sessionId": "session",
+        "status": "running",
+        "viewCursor": "v4:01a1a392-01a7-7212-bfc1-4ec2c8a577a6:4"
+      }
+    },
+    {
+      "emittedAtMs": 1793745617675,
+      "jsonrpc": "2.0",
+      "method": "turn/started",
+      "params": {
+        "commandId": "01a1a392-02f8-704f-99a8-f71d64cb89c1",
+        "sessionId": "session",
+        "sourceRange": {
+          "first": {
+            "id": "01a1a392-0303-7a00-aad8-b4a89980557d",
+            "sequence": 18
+          },
+          "last": {
+            "id": "01a1a392-0303-7a00-aad8-b4a89980557d",
+            "sequence": 18
+          },
+          "stream": {
+            "id": "session",
+            "kind": "session"
+          }
+        },
+        "turnId": "01a1a392-02f8-704f-99a8-f71d64cb89c1",
+        "viewCursor": "v4:01a1a392-01a7-7212-bfc1-4ec2c8a577a6:4"
+      }
+    },
+    {
+      "emittedAtMs": 1793745620477,
+      "jsonrpc": "2.0",
+      "method": "session/statusChanged",
+      "params": {
+        "attention": [
+          "approvalPending"
+        ],
+        "permissionState": {
+          "axes": {
+            "approval": "onRequest",
+            "filesystem": "sandboxed",
+            "network": "off",
+            "reviewer": "human"
+          },
+          "profileId": "intercat-worker",
+          "reviewerAttached": true,
+          "reviewerAuthority": "human"
+        },
+        "sessionId": "session",
+        "status": "running",
+        "viewCursor": "v4:01a1a392-01a7-7212-bfc1-4ec2c8a577a6:9"
+      }
+    },
+    {
+      "id": 1,
+      "jsonrpc": "2.0",
+      "method": "approval/request",
+      "params": {
+        "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "availableChoices": [
+          {
+            "choiceId": "allow_once",
+            "decision": "approved",
+            "label": "Allow once",
+            "scope": "once"
+          },
+          {
+            "choiceId": "allow_local_prefix",
+            "decision": "approvedPolicyAmendment",
+            "label": "Always allow in this workspace: git push ...",
+            "rulePreview": "Always allow in this workspace: git push ...",
+            "scope": "localPersistent"
+          },
+          {
+            "acceptsFeedback": true,
+            "choiceId": "abort",
+            "decision": "abort",
+            "label": "Reject",
+            "scope": "once"
+          }
+        ],
+        "currentRequirementId": {
+          "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+          "sourceIndex": 0
+        },
+        "itemId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "judgeEscalated": false,
+        "protectedWrite": false,
+        "rawArgs": "{\"command\":\"git push origin main\"}",
+        "sessionId": "session",
+        "sourceRange": {
+          "first": {
+            "id": "01a1a392-0df2-74a1-a837-d8a1add3a163",
+            "sequence": 48
+          },
+          "last": {
+            "id": "01a1a392-0df2-74a1-a837-d8a1add3a163",
+            "sequence": 48
+          },
+          "stream": {
+            "id": "session",
+            "kind": "session"
+          }
+        },
+        "subject": {
+          "command": "git push origin main",
+          "kind": "shell",
+          "stages": [
+            {
+              "argv": [
+                "git",
+                "push",
+                "origin",
+                "main"
+              ],
+              "argvComplete": true,
+              "position": 1,
+              "requirementId": {
+                "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+                "sourceIndex": 0
+              },
+              "resolution": {
+                "kind": "unresolved"
+              },
+              "suggestedPrefix": {
+                "argvPrefix": [
+                  "git",
+                  "push"
+                ],
+                "label": "Always allow in this workspace: git push ..."
+              },
+              "totalStages": 1
+            }
+          ],
+          "workspaceRoot": "/fixture"
+        },
+        "taskId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "toolCallId": "call_01a1a3920a377327a896e6aeb87019a8",
+        "toolName": "bash",
+        "turnId": "01a1a392-02f8-704f-99a8-f71d64cb89c1",
+        "viewCursor": "v4:01a1a392-01a7-7212-bfc1-4ec2c8a577a6:9"
+      }
+    },
+    {
+      "emittedAtMs": 1793745620478,
+      "jsonrpc": "2.0",
+      "method": "approval/requested",
+      "params": {
+        "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "availableChoices": [
+          {
+            "choiceId": "allow_once",
+            "decision": "approved",
+            "label": "Allow once",
+            "scope": "once"
+          },
+          {
+            "choiceId": "allow_local_prefix",
+            "decision": "approvedPolicyAmendment",
+            "label": "Always allow in this workspace: git push ...",
+            "rulePreview": "Always allow in this workspace: git push ...",
+            "scope": "localPersistent"
+          },
+          {
+            "acceptsFeedback": true,
+            "choiceId": "abort",
+            "decision": "abort",
+            "label": "Reject",
+            "scope": "once"
+          }
+        ],
+        "currentRequirementId": {
+          "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+          "sourceIndex": 0
+        },
+        "itemId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "judgeEscalated": false,
+        "protectedWrite": false,
+        "rawArgs": "{\"command\":\"git push origin main\"}",
+        "sessionId": "session",
+        "sourceRange": {
+          "first": {
+            "id": "01a1a392-0df2-74a1-a837-d8a1add3a163",
+            "sequence": 48
+          },
+          "last": {
+            "id": "01a1a392-0df2-74a1-a837-d8a1add3a163",
+            "sequence": 48
+          },
+          "stream": {
+            "id": "session",
+            "kind": "session"
+          }
+        },
+        "subject": {
+          "command": "git push origin main",
+          "kind": "shell",
+          "stages": [
+            {
+              "argv": [
+                "git",
+                "push",
+                "origin",
+                "main"
+              ],
+              "argvComplete": true,
+              "position": 1,
+              "requirementId": {
+                "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+                "sourceIndex": 0
+              },
+              "resolution": {
+                "kind": "unresolved"
+              },
+              "suggestedPrefix": {
+                "argvPrefix": [
+                  "git",
+                  "push"
+                ],
+                "label": "Always allow in this workspace: git push ..."
+              },
+              "totalStages": 1
+            }
+          ],
+          "workspaceRoot": "/fixture"
+        },
+        "taskId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "toolCallId": "call_01a1a3920a377327a896e6aeb87019a8",
+        "toolName": "bash",
+        "turnId": "01a1a392-02f8-704f-99a8-f71d64cb89c1",
+        "viewCursor": "v4:01a1a392-01a7-7212-bfc1-4ec2c8a577a6:9"
+      }
+    }
+  ],
+  "read": {
+    "session": {
+      "sessionId": "session",
+      "status": "running",
+      "activeTurnId": "01a1a392-02f8-704f-99a8-f71d64cb89c1",
+      "turnCount": 0
+    },
+    "pendingRequests": [
+      {
+        "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "availableChoices": [
+          {
+            "choiceId": "allow_once",
+            "decision": "approved",
+            "label": "Allow once",
+            "scope": "once"
+          },
+          {
+            "choiceId": "allow_local_prefix",
+            "decision": "approvedPolicyAmendment",
+            "label": "Always allow in this workspace: git push ...",
+            "rulePreview": "Always allow in this workspace: git push ...",
+            "scope": "localPersistent"
+          },
+          {
+            "acceptsFeedback": true,
+            "choiceId": "abort",
+            "decision": "abort",
+            "label": "Reject",
+            "scope": "once"
+          }
+        ],
+        "currentRequirementId": {
+          "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+          "sourceIndex": 0
+        },
+        "itemId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "judgeEscalated": false,
+        "protectedWrite": false,
+        "rawArgs": "{\"command\":\"git push origin main\"}",
+        "sessionId": "session",
+        "sourceRange": {
+          "first": {
+            "id": "01a1a392-0df2-74a1-a837-d8a1add3a163",
+            "sequence": 48
+          },
+          "last": {
+            "id": "01a1a392-0df2-74a1-a837-d8a1add3a163",
+            "sequence": 48
+          },
+          "stream": {
+            "id": "session",
+            "kind": "session"
+          }
+        },
+        "subject": {
+          "command": "git push origin main",
+          "kind": "shell",
+          "stages": [
+            {
+              "argv": [
+                "git",
+                "push",
+                "origin",
+                "main"
+              ],
+              "argvComplete": true,
+              "position": 1,
+              "requirementId": {
+                "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+                "sourceIndex": 0
+              },
+              "resolution": {
+                "kind": "unresolved"
+              },
+              "suggestedPrefix": {
+                "argvPrefix": [
+                  "git",
+                  "push"
+                ],
+                "label": "Always allow in this workspace: git push ..."
+              },
+              "totalStages": 1
+            }
+          ],
+          "workspaceRoot": "/fixture"
+        },
+        "taskId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "toolCallId": "call_01a1a3920a377327a896e6aeb87019a8",
+        "toolName": "bash",
+        "turnId": "01a1a392-02f8-704f-99a8-f71d64cb89c1",
+        "viewCursor": "v4:01a1a392-01a7-7212-bfc1-4ec2c8a577a6:9"
+      }
+    ],
+    "viewCursor": "v4:01a1a392-01a7-7212-bfc1-4ec2c8a577a6:9",
+    "history": {
+      "mode": "inline"
+    }
+  },
+  "pending": {
+    "approvals": [
+      {
+        "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "availableChoices": [
+          {
+            "choiceId": "allow_once",
+            "decision": "approved",
+            "label": "Allow once",
+            "scope": "once"
+          },
+          {
+            "choiceId": "allow_local_prefix",
+            "decision": "approvedPolicyAmendment",
+            "label": "Always allow in this workspace: git push ...",
+            "rulePreview": "Always allow in this workspace: git push ...",
+            "scope": "localPersistent"
+          },
+          {
+            "acceptsFeedback": true,
+            "choiceId": "abort",
+            "decision": "abort",
+            "label": "Reject",
+            "scope": "once"
+          }
+        ],
+        "currentRequirementId": {
+          "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+          "sourceIndex": 0
+        },
+        "itemId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "judgeEscalated": false,
+        "protectedWrite": false,
+        "rawArgs": "{\"command\":\"git push origin main\"}",
+        "sessionId": "session",
+        "sourceRange": {
+          "first": {
+            "id": "01a1a392-0df2-74a1-a837-d8a1add3a163",
+            "sequence": 48
+          },
+          "last": {
+            "id": "01a1a392-0df2-74a1-a837-d8a1add3a163",
+            "sequence": 48
+          },
+          "stream": {
+            "id": "session",
+            "kind": "session"
+          }
+        },
+        "subject": {
+          "command": "git push origin main",
+          "kind": "shell",
+          "stages": [
+            {
+              "argv": [
+                "git",
+                "push",
+                "origin",
+                "main"
+              ],
+              "argvComplete": true,
+              "position": 1,
+              "requirementId": {
+                "approvalId": "01a1a392-0de1-7171-a055-29b888c19b14",
+                "sourceIndex": 0
+              },
+              "resolution": {
+                "kind": "unresolved"
+              },
+              "suggestedPrefix": {
+                "argvPrefix": [
+                  "git",
+                  "push"
+                ],
+                "label": "Always allow in this workspace: git push ..."
+              },
+              "totalStages": 1
+            }
+          ],
+          "workspaceRoot": "/fixture"
+        },
+        "taskId": "01a1a392-0de1-7171-a055-29b888c19b14",
+        "toolCallId": "call_01a1a3920a377327a896e6aeb87019a8",
+        "toolName": "bash",
+        "turnId": "01a1a392-02f8-704f-99a8-f71d64cb89c1",
+        "viewCursor": "v4:01a1a392-01a7-7212-bfc1-4ec2c8a577a6:9"
+      }
+    ],
+    "userInputs": []
+  }
+}

@@ -1,0 +1,18 @@
+[project]
+name = "intercat-editor"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["mlx==0.32.4", "mlx-lm==0.32.2", "huggingface_hub==2.4.0"]
+
+[project.scripts]
+intercat-editor = "intercat_editor.server:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+intercat_editor = ["model_manifest.json"]

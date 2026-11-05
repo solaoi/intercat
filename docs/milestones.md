@@ -4,9 +4,17 @@
 
 ハッカソンの提出最終日までは、何も公開しない（[README](../README.md) の「公開しない」）。remote への push、リポジトリの作成、共有リンクは、人がそのつど明示したときだけ行う。
 
+実装の進捗と検証履歴は [implementation.md](implementation.md)、M1の60条件と証跡は [m1-acceptance.md](m1-acceptance.md) に記録する。
+
+2026-11-05 時点の進捗率：M1 100%、M2〜M13 各0%。M1の60条件、追加UI修正、Rust481件・UI84件・Python13件の最終回帰を確認した。M1をローカルcommitし、続けてM2へ進む。認証など人の操作が必要な場合だけ確認し、こちらの判断では一時停止しない。
+
 ## マイルストーン 1：一本のトラックを最後まで通す
 
 依頼 → 実行 → 承認 → 結果 → 仕上げを、一本のトラックで最後まで通す。
+
+60個の完了条件の照合状況は [M1 受入条件の照合表](m1-acceptance.md) に記録する。個別の実装・試験だけで、M1全体を完了とは扱わない。
+
+2026-11-05 のユーザー指示：M1の全受入条件を満たしたら、その時点の成果をローカルにcommitする。目標をこちらの判断で一時停止しない。
 
 ### 範囲
 
@@ -18,7 +26,7 @@
 - プロジェクト：フォルダ一つのプロジェクトを、設定で与える。作成ダイアログ（板 0b）は後に回す。
 - セッションの名前と slug：slug は `s-<yyyymmdd-hhmm>` だ。セッションを始めたときに決まり、変わらない（設計書「5. プロジェクト・セッション・git」のセッションの名前とブランチ）。名前は、最初の言葉の先頭 30 字にする。Glimmer が来たら、Editor が付け直す。
 - ホスト：stdio の子プロセスを、トラックごとに一つ立てる（一本目はトラックが一本なので、ホストも一つ）。フラグ・許可リストの 8 個・渡す環境は、設計書「15. アーキテクチャ」の起動規定のとおりだ。走らせるのは、Intercat が持つ Muse Code の写しだ。インストール先の本体を APFS の複製で写して作る。写しの SHA-256・版・initialize の fingerprint の三つが合わなければ、走らせない（設計書 15 節の Muse Code の写し、検証項目 ㊸）。PATH はログインシェル（`$SHELL -lic`）から取って保存する（research/verify の E2）。approvalMode は常に promptUnmatched だ。
-- ホスト専用の設定ファイル：デーモンが作り、その場所を `XDG_CONFIG_HOME` で渡す（設計書 15 節のホストの起動規定）。profile は `intercat-worker` で、`:ask-me` を継承し、秘密ファイルの deny を足す。既定の deny は `**/.env`、`**/.env.*`、`**/.envrc`、`**/*.pem`、`**/*.key`、`**/.netrc` だ。`.env.*` からは、例の名前（`.env.example`・`.env.sample`・`.env.template`・`.env.dist`）を除く。除外を deny に書けなければ、よくある名前を並べる（検証項目 ㉝ の続き）。同じ一覧を、初期コミットの除外と開始元の検査にも使う。プロジェクトの Muse hook は、全部のホストで既定で止める。まず設定の鍵 `extensions.hooks.*` で止め、使えなければ trust を外す（検証項目 ㊽）。capacity・道具の許可リスト・Contributor mode・モデルも、このファイルに書き、`-c` とフラグには書かない（第七回の F2）。利用者の settings は変えない。session/start では permissionProfile を省き、返事の profileId が `intercat-worker` でなければ走らせない。
+- ホスト専用の設定ファイル：デーモンが作り、その場所を `XDG_CONFIG_HOME` で渡す（設計書 15 節のホストの起動規定）。profile は `intercat-worker` で、`:ask-me` を継承し、秘密ファイルの deny を足す。既定の deny は `**/.env`、`**/.env.*`、`**/.envrc`、`**/*.pem`、`**/*.key`、`**/.netrc` だ。`.env.*` からは、例の名前（`.env.example`・`.env.sample`・`.env.template`・`.env.dist`）を除く。4つの例示名から接頭辞ごとの deny を生成し、それ以外の任意の `.env.*` 名を拒否する（検証項目 ㉝）。同じ一覧を、初期コミットの除外と開始元の検査にも使う。プロジェクトの Muse hook は、全部のホストで既定で止める。trust を付けずに起動し、AGENTS.md の指示は適用範囲を保ってターンに添える（検証項目 ㊽、2026-11-04）。capacity・道具の許可リスト・Contributor mode・モデルも、このファイルに書き、`-c` とフラグには書かない（第七回の F2）。利用者の settings は変えない。session/start では permissionProfile を省き、返事の profileId が `intercat-worker` でなければ走らせない。
 - ホストの準備：セッションを作ったときに、持ち主の無いホストを一つ立てる。worktree と session/start まで済ませて待たせ、最初に言葉を受けたトラックに渡す。起動から userMessage までは、中央値 985 ms だった（第五回の A12）。こうしておけば、ホストの起動を待たない。最初の言葉が届くまでには、判定の待ちと保存が足される（下の完了の条件 1）。
 - worktree と ref：ワーカーの worktree は detached HEAD で作る。トラックの先頭は、隠し ref `refs/intercat/<slug>/tracks/A` に記録する。ブランチ `intercat/<slug>` を持つのは、統合 worktree だけだ（設計書「19. worktree」の worktree の ref）。統合 worktree は、セッションとリポジトリの組ごとに一つだ。slug の重なりは、リポジトリの ref でも確かめる。
 - 依存：worktree を作るときに、デーモンが sandbox-exec の中で入れる。プロファイルは、Check とは別だ（設計書「19. worktree」の依存の共有）。ダミーのリポジトリに依存が無ければ、この段は空で通る。統合の作業場所では、トラックを載せるたびに、manifest・lockfile・導入の設定のどれかが変わっていれば、lockfile を変えない導入（`npm ci`）で準備し直す。Check の直前は、変わっていなくても準備し直す。導入は、既定では秘密ファイルを読めない。失敗は env-failed で、Check は走らせない（設計書「13.3 Commit の手順」の手順 5）。
@@ -28,7 +36,7 @@
 - 描画：最初から PixiJS（GPU）で描く（設計書 15 節の描画）。実機のトラックは 1 本でも、合成データで性能の門を通す。
 - 舞台のキー操作：↑ ↓ で全トラックを一本ずつ選ぶ。先が画面の外なら舞台をスクロールし、選んだ行は仮想化で外さない。1–9 は近道として残す（設計書「3.4 タイムラインの描き方」のアクセシビリティ）。領域は ⌃Tab / ⌃⇧Tab で巡る（設計書「3.2 領域ごとの役割」）。アクセシビリティは、最小の鏡を入れる。role は `grid` で、行（トラック）の名前と状態だけを持つ。選んだ行は、画面の外へ出ても鏡から外さない。クリップのセル・住所・読み上げの規則は、マイルストーン 11 で足す。
 - intercat-report：
-  - worktree を作ったら、`.agents/skills/intercat-report/` に置き、exclude に足す（`# Intercat` はパターンとは別の行）。
+  - ホスト専用の `<XDG_CONFIG_HOME>/muse/skills/intercat-report/` に置く。worktree と利用者のグローバル設定には置かない。
   - skill パートで渡し、依頼文は `arguments` に入れる。
   - 同じ形の指示を、依頼文の末尾にも入れる（保険。設計書「17. Editor ハーネスの内部」）。
   - 答えを待つ質問は、最後に「Waiting for you: …」の一行で書かせる。この行は規則で読む。
@@ -133,7 +141,7 @@
    - `git log` のトレーラーに `Intercat: <名前> · <slug>/A:<番号>` が入る。
 8. 止める：A に、何歩かかかる依頼（「ログイン関数のテストを 5 本足して、一本ずつ走らせて」）を送る。走っている間に ⌘. を押すと、走っている一歩が cut で閉じ、A は done になる。終わり方は stopped-by-you で、見出しは灰の ■ と「stopped」になる（緑の ✓ ではない）。Editor のモデル（Glimmer）は動いていない（一本目は呼ばない）。止める操作はモデルを通らず、デーモンが直接 turn/interrupt を送るので、モデルが止まっていても中断できる。もう一度同じ依頼を送り、走っている間に「CHANGELOG にも一行足して」と打ってから ⇧⌘. を押す。A のターンは最後まで走り、その後、境目待ちの言葉は送られず「held · Start」で残る。⌘. は、押した時点で走っていたターンの turnId を明示して送る。
    - bash が走っている間に止めたとき、そのプロセスが残るかを、この試験のログで見る。残れば、shell のクリップになる。
-9. kill -9 からの再接続：A に何歩かかかる依頼を送り、走っている間に A のホスト（`muse serve`）を kill -9 する。A は reconnecting になり、20 秒以内に戻る。戻る道は、新しいホストの session/resume（excludeItems）と approval/listPending だ。欠けた分は、記録した viewCursor から view/page で読む（設計書「18. 失敗と上限」の再接続の手順）。第五回の A4 では、約 1 秒で戻った。
+9. kill -9 からの再接続：A に何歩かかかる依頼を送り、走っている間に A のホスト（`muse serve`）を kill -9 する。A は reconnecting になり、20 秒以内に戻る。戻る道は、新しいホストの session/resume（excludeItems）と approval/listPending だ。欠けた分は、記録した viewCursor から view/page で読む（設計書「18. 失敗と上限」の再接続の手順）。第五回の A4 では、約 1 秒で戻った。 2026-11-04 の実装検証では、承認待ちの実行中ホストを強制終了し、同じセッションへの自動再接続とチェックポイント保存まで 3,821 ms。開始の再送と承認命令は無し（`research/verify/reconnect-20261104/`）。
    - 途中のターンも戻る（userMessage と、完了していたツール）。走っていた bash は failed、保留中だった承認は rejected で閉じる（第五回の A4）。途中の一歩は failed で閉じ、古い承認のカードは無効にする（再表示も再承認もしない）。A は waiting か done になり、その言葉をもう一度送るかは、人が決める。
    - ターンの後に残ったシェルは、shell のクリップとして見える（検証項目 ⑱）。
 10. 分岐の土台（検証項目 ⑧ の続き。UI の Branch from here は後）：A のあるターンのチェックポイント（turnId と SHA の一組）を使う。デーモンはそこから新しい worktree を作り、同じ turnId で session/fork する。分けた会話には、毎回 turn/start の `workspaceRoots` で新しい worktree を渡す。session/fork の workspaceRoot は無視されるからだ（第五回の A3）。新しい worktree の HEAD の木が ref の SHA の木と一致し、git status が空。分けた会話は、そのターンまでを持ち、新しい worktree のファイルを読む。
@@ -188,7 +196,7 @@
 54. 添付の除外：`.intercat/attachments/brief.txt` を `git add -f` し、`.gitignore` の否定のパターンも置く。チェックポイントにも Commit にも、添付は入らない。
 55. 未解決の競合：人の checkout に merge の途中の競合を残して始める。「Your checkout has unresolved conflicts · resolve them first · Cancel」で止まる。
 56. 止める道とログ：書き手に SQLITE\_FULL を返させたまま、窓の Stop を押す。RPC の入口で待たずに、turn/interrupt が届く（UI → RPC → MSP の全部の道）。
-57. 組み込みのスキルの除外：`.agents/skills/intercat-report/` を `git add -f` しても、チェックポイントにも Commit にも入らない。同じ名前のスキルを追跡済みのリポジトリでは、上書きせず、カードが出る。
+57. 組み込みのスキルの隔離：intercat-report がホスト専用のカタログにだけ出る。リポジトリに同名のスキルがあっても、そのファイルと index は変更されない。専用設定のスキルは worktree の外にあり、チェックポイントにも Commit にも入らない。
 58. 非対応のリポジトリ：LFS を使うダミーのリポジトリで始める。「This repository uses Git LFS · not supported yet · Cancel」で止まり、セッションは作られない。filter と sparse checkout のリポジトリも、仕組みの名前を替えた同じカードで止まる（2026-11-03 のレビュー）。
 59. 毎回変わる hook：pre-commit の hook がビルドの ID を書く形で Commit する。候補のコミットは一度だけ作られ、Commit は確定する。commit-msg の hook が文を足したら、シートには足した後の文が出る。シートでメッセージを直すと、候補を作り直し、Check をやり直す。
 60. ワーカーの未解決の競合：A に merge の途中の競合を残させる。チェックポイントは作られ、シートに「A has unresolved conflicts in 2 files · Ask A to resolve」が出る。解くまで Commit は灰だ。
@@ -198,7 +206,7 @@
 作る順は、二段に分ける。一段目（1〜9）は、少数のトラックで「依頼 → 介入 → 停止 → 復旧 → Commit」を通す。これは提出に必ず入れる線だ。二段目（10）は、MSP の全メソッドと性能の門だ。完了の条件はどちらも M1 のままで、二段目は提出の後でもよい。
 
 0. 済み（第四回、2026-11-01。[research/verify](../research/verify/README.md#round4)）：検証項目 ㉕ で、onRequest のローカル push は要求なしに走った。promptUnmatched では、拒否で止まり、allow\_once で通った。核の往復は中央値 95.95 ms。④ の続きで、一歩の切れ目の steer は 5 回とも次の一歩に間に合わなかったので、境目をターンの切れ目にした。第五回（[research/verify](../research/verify/README.md#round5)）で、実装の前に確かめられる点の多くも確かめた。残っていた ㉝（秘密ファイルと `.muse/` を道具から守れるか）は、第六回と第七回で確かめた。
-1. デーモン（Rust）：先に検証項目 ㊱（gix で管理の操作が揃うか）を行う。起動の最初に、ユーザー単位のロック（lock ファイルの flock）を取る。取れなければ、既存のデーモンへ接続する側になる（設計書「15. アーキテクチャ」の常駐）。公式の Rust の SDK は、開発用の依存として足す（第六回の E1 で組めた）。MSP のクライアントを作る。一段目は、この段で使うメソッドだけを作る。その後の順は、worktree を作る（ワーカーは detached HEAD）→ intercat-report を置いて exclude に足す → ホストを起動する。ホストを起動する前に、検証項目 ㊸（Muse Code の写し）・㊹（同時に立ったシェルの帰属）・㊺（組の外に出たプロセスと印）を行う。続けて、session/start → turn/start → イベントを SQLite に流す。画面は作らず、ログで確かめる。
+1. デーモン（Rust）：先に検証項目 ㊱（gix で管理の操作が揃うか）を行う。起動の最初に、ユーザー単位のロック（lock ファイルの flock）を取る。取れなければ、既存のデーモンへ接続する側になる（設計書「15. アーキテクチャ」の常駐）。公式の Rust の SDK は、開発用の依存として足す（第六回の E1 で組めた）。MSP のクライアントを作る。一段目は、この段で使うメソッドだけを作る。その後の順は、worktree を作る（ワーカーは detached HEAD）→ ホスト専用設定に intercat-report を置く → trust を付けずにホストを起動する。ホストを起動する前に、検証項目 ㊸（Muse Code の写し）・㊹（同時に立ったシェルの帰属）・㊺（組の外に出たプロセスと印）を行う。続けて、session/start → turn/start → イベントを SQLite に流す。画面は作らず、ログで確かめる。
 2. 舞台：先に検証項目 ㊴（レンダラーの CSP で Monaco と pdf.js が動くか）を行い、CSP と窓の設定を最初から入れる。PixiJS で、イベントからレーンとクリップ（一歩と、境目待ちの点線）を描く（先に静的なデータで）。未来の点線は同じ幅のタイルで、レーンの右端に幅を固定した未来の列に並べる（最小の窓で 1 枚、レーン 900px 以上で 2 枚）。再生ヘッドは、時間の領域の 80% に留まり、92% で頁を送る。再生ヘッドの右に目盛を出さない（設計書「3.4 タイムラインの描き方」の未来の描き方）。少数のトラックで動かす。
 3. UI とデーモンの間の RPC：ユーザー専用のフォルダ（0700）に置いた Unix ソケット（0600）で通す（設計書 15 節）。接続の最初に、UI だけが持つ token を示す。token は Keychain に置き、デーモンにはパイプで渡す。ソケットのフォルダは、ワーカーのホストの deny と sandbox-exec で拒む（先に検証項目 V55）。状態を変える呼び出しには操作 ID を付け、受理を効果と同じトランザクションで記録する（設計書 22 節）。
 4. 机：入力欄 → 帯 → 置く → 最小の判定（`/decide` で操作と宛先）→ turn/start。Local の Glimmer の MLX のサーバーの起動・停止と、保留（editor）もここで入れる（先に検証項目 ㊿）。先に検証項目 ㊵（並んだ turn/start の取り戻し）を行い、送る条件と disposition の確かめを最初から入れる。

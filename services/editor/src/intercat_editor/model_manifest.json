@@ -1,0 +1,84 @@
+{
+  "repository": "mlx-community/Muse-Glimmer-30B-4bit",
+  "revision": "3e7677d7a40d348a3daba263a2b1c0aa41910710",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "size": 1570,
+      "algorithm": "git-sha1",
+      "digest": "52373fe24473b1aa44333d318f578ae6bf04b49b"
+    },
+    {
+      "path": "README.md",
+      "size": 683,
+      "algorithm": "git-sha1",
+      "digest": "b19a8acbd25121c764402b42fb041c5f558f216a"
+    },
+    {
+      "path": "chat_template.jinja",
+      "size": 7167,
+      "algorithm": "git-sha1",
+      "digest": "8a8673897ed588c171d50088c89e25360130abe6"
+    },
+    {
+      "path": "config.json",
+      "size": 6796,
+      "algorithm": "git-sha1",
+      "digest": "d9a91d7b4a0256adaf39464d11a25d0eef2fb3b1"
+    },
+    {
+      "path": "generation_config.json",
+      "size": 148,
+      "algorithm": "git-sha1",
+      "digest": "3495c31ea76c03c093a1d14e8221c3410b76ded2"
+    },
+    {
+      "path": "model-00001-of-00004.safetensors",
+      "size": 5310085129,
+      "algorithm": "sha256",
+      "digest": "72c99dc670867308f70aab212331e4dd0e19d46bf409a134da1848b9dbe47c91"
+    },
+    {
+      "path": "model-00002-of-00004.safetensors",
+      "size": 5366299665,
+      "algorithm": "sha256",
+      "digest": "f2af4b82d578cee5eeeef3f0d3f139eae3adfc2fc2a27b52ec2ac5886e131cf4"
+    },
+    {
+      "path": "model-00003-of-00004.safetensors",
+      "size": 5343216475,
+      "algorithm": "sha256",
+      "digest": "2892bb7971d20a7ecfd84a51404e0ae1f0863580562ccef58fdf444da25bc5a2"
+    },
+    {
+      "path": "model-00004-of-00004.safetensors",
+      "size": 3395202844,
+      "algorithm": "sha256",
+      "digest": "6496c62ac6a229be31c784835c43077224e80750182c2693e29c08ddae455a31"
+    },
+    {
+      "path": "model.safetensors.index.json",
+      "size": 218191,
+      "algorithm": "git-sha1",
+      "digest": "5cc67683bfbcd38ac7d10d1bbfe5b8349a642841"
+    },
+    {
+      "path": "processor_config.json",
+      "size": 395,
+      "algorithm": "git-sha1",
+      "digest": "82e0b73bcf751936da5acdd82fb89d0257eec2e0"
+    },
+    {
+      "path": "tokenizer.json",
+      "size": 28129897,
+      "algorithm": "sha256",
+      "digest": "c9dbee66967b58f31a7c27f723c3760da3526ccd0427578e8905b0abb0031c4d"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "size": 79985,
+      "algorithm": "git-sha1",
+      "digest": "d1b80588d3aadbf3a7c538249aecc99d75e52e6c"
+    }
+  ]
+}

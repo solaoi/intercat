@@ -1,0 +1,101 @@
+//! Session daemon: state changes stay in the reducer; blocking work stays outside it.
+
+pub mod approval;
+mod attachment_history;
+pub mod attachment_store;
+pub mod attachments;
+mod backup_apply;
+mod backup_attachments;
+pub mod backup_choices;
+mod backup_files;
+pub mod backup_review;
+pub mod branch;
+mod branch_run;
+pub mod candidate;
+pub mod checkout;
+pub mod checkpoint;
+pub mod clock;
+pub mod command;
+pub mod decision;
+pub mod deletion;
+pub mod delivery;
+pub mod dependencies;
+pub mod dispatch_control;
+pub mod editor;
+pub mod effects;
+pub mod execution;
+#[cfg(all(feature = "fault-injection", debug_assertions))]
+pub mod fault_injection;
+pub mod handoff;
+mod handoff_run;
+pub mod history;
+mod history_store;
+pub mod hooks;
+pub mod host;
+pub mod host_monitor;
+pub mod input;
+pub mod instructions;
+pub mod integration;
+mod integration_refs;
+mod integration_store;
+pub mod journal;
+pub mod lock;
+pub mod msp;
+pub mod output_flow;
+pub mod pickup;
+mod pickup_run;
+pub mod policy;
+mod policy_store;
+pub mod preparation;
+pub mod process;
+pub mod process_audit;
+mod process_ledger;
+pub mod project;
+pub mod publication;
+pub mod questions;
+pub mod reconcile;
+mod reconcile_store;
+pub mod recording;
+pub mod redirect;
+pub mod repair;
+pub mod repair_application;
+pub mod repair_checkpoint;
+pub mod repair_execution;
+pub mod repair_host;
+pub mod repair_run;
+mod repair_run_store;
+pub mod repair_service;
+mod report_store;
+pub mod reports;
+mod restoration;
+pub mod rpc;
+pub mod run;
+pub mod runtime;
+pub mod secret_paths;
+pub mod secret_scan;
+pub mod timeline;
+pub mod worker;
+pub mod worktree;
+
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+pub mod fingerprint_receipt;
+pub mod fingerprint_recovery;
+pub mod progress;
+mod secret_prefix;
+
+mod secret_store;
+pub mod secrets;
+mod session_retirement;
+pub mod session_snapshot;
+pub mod session_view;
+mod snapshot_store;
+
+pub mod external_content;
+pub mod project_secret_usage;
+pub mod project_secrets;
+pub mod secret_input;
+mod secret_input_store;
+
+#[cfg(test)]
+mod sandbox_probe;
