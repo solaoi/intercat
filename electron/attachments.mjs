@@ -1,10 +1,13 @@
-// Renderer callers choose through a native dialog; they cannot supply paths.
+// Paths come from the native chooser or a disk-backed File in the preload.
 export function referenceImporter({ choose, client, operationId }) {
   let pending = null;
   let running = false;
-  return async function importReference(reselect = false) {
+  return async function importReference(reselect = false, droppedPath = null) {
     if (running) throw new Error('A reference file is already being saved.');
     if (reselect) pending = null;
+    if (droppedPath && pending?.path !== droppedPath) {
+      pending = { opId: operationId(), path: droppedPath };
+    }
     running = true;
     try {
       if (!pending) {

@@ -39,7 +39,12 @@ fn safe_target(root: &Path, relative: &Path) -> Result<PathBuf> {
     Ok(current)
 }
 
-pub fn prepare(checkout: &Checkout, source: &WorktreeSource, tree: ObjectId) -> Result<Prepared> {
+pub fn prepare(
+    checkout: &Checkout,
+    source: &WorktreeSource,
+    tree: ObjectId,
+    excluded: Option<&Path>,
+) -> Result<Prepared> {
     checkout.verify_storage()?;
     let source_hook = &checkout.configuration.hooks_directory;
     let (source_root, destination_root, git_metadata) = if source_hook
@@ -109,6 +114,9 @@ pub fn prepare(checkout: &Checkout, source: &WorktreeSource, tree: ObjectId) -> 
                 }
             }
             let canonical = entry.path().canonicalize()?;
+            if excluded == Some(canonical.as_path()) {
+                continue;
+            }
             if !(canonical.starts_with(&source.root) || canonical.starts_with(source_hook))
                 || canonical.starts_with(&source.common_dir) && !canonical.starts_with(source_hook)
                 || !canonical.is_file()

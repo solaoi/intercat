@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 contextBridge.exposeInMainWorld('intercat', Object.freeze({
   reviewExternal: request => ipcRenderer.invoke('intercat:external-review', request),
   confirmExternal: request => ipcRenderer.invoke('intercat:external-confirm', request),
@@ -13,6 +13,16 @@ contextBridge.exposeInMainWorld('intercat', Object.freeze({
   respondToRepair: request => ipcRenderer.invoke('intercat:repair-respond', request),
   getIntegrationDiff: request => ipcRenderer.invoke('intercat:integration-diff', request),
   getStatus: () => ipcRenderer.invoke('intercat:status'),
+  editHistory: request => ipcRenderer.invoke('intercat:history', request),
+  nativeHistory: direction => ipcRenderer.invoke('intercat:native-history', direction),
+  onHistoryShortcut: listener => {
+    const receive = (_event, direction) => { if (direction === 'undo' || direction === 'redo') listener(direction); };
+    ipcRenderer.on('intercat:history-shortcut', receive);
+    return () => ipcRenderer.removeListener('intercat:history-shortcut', receive);
+  },
+  readDrafts: session => ipcRenderer.invoke('intercat:drafts-read', session),
+  writeDrafts: request => ipcRenderer.invoke('intercat:drafts-write', request),
+  discardDrafts: session => ipcRenderer.invoke('intercat:drafts-discard', session),
   retryConnection: () => ipcRenderer.invoke('intercat:retry-connection'),
   rebuildFingerprints: request => ipcRenderer.invoke('intercat:rebuild-fingerprints', request),
   reviewBackup: request => ipcRenderer.invoke('intercat:backup-review', request),
@@ -24,10 +34,30 @@ contextBridge.exposeInMainWorld('intercat', Object.freeze({
   pauseDispatch: request => ipcRenderer.invoke('intercat:dispatch-pause', request),
   getQuitPreference: () => ipcRenderer.invoke('intercat:quit-preference'),
   setQuitPreference: value => ipcRenderer.invoke('intercat:quit-preference', value),
+  getUtterance: id => ipcRenderer.invoke('intercat:utterance-read', id),
+  getRequestOrigin: id => ipcRenderer.invoke('intercat:utterance-origin', id),
+  getRequestChanges: identity => ipcRenderer.invoke('intercat:utterance-changes', identity),
+  getRequestDiff: request => ipcRenderer.invoke('intercat:utterance-diff', request),
+  stopRequestTurn: request => ipcRenderer.invoke('intercat:utterance-stop', request),
+  changeConfirmation: request => ipcRenderer.invoke('intercat:confirmation-change', request),
+  confirmUtterance: request => ipcRenderer.invoke('intercat:utterance-confirm', request),
+  markMisread: request => ipcRenderer.invoke('intercat:utterance-misread', request),
+  getEditorLog: request => ipcRenderer.invoke('intercat:editor-log', request),
+  getEditorPresentation: () => ipcRenderer.invoke('intercat:editor-presentation'),
+  setEditorCharacter: value => ipcRenderer.invoke('intercat:editor-character', value),
+  acknowledgeEditorReturn: id => ipcRenderer.invoke('intercat:editor-return-read', id),
+  getEditorAway: query => ipcRenderer.invoke('intercat:editor-away', query),
+  onEditorPresentation: listener => {
+    const receive = (_event, state) => listener(state);
+    ipcRenderer.on('intercat:editor-presentation-changed', receive);
+    return () => ipcRenderer.removeListener('intercat:editor-presentation-changed', receive);
+  },
   getTimelineWindow: request => ipcRenderer.invoke('intercat:timeline-window', request),
+  observeTimeline: view => ipcRenderer.invoke('intercat:timeline-observe', view),
   pickupFromFiles: request => ipcRenderer.invoke('intercat:pickup', request),
   cancelFileRecovery: request => ipcRenderer.invoke('intercat:pickup-cancel', request),
   branchFromCheckpoint: request => ipcRenderer.invoke('intercat:branch', request),
+  getBranchPoints: request => ipcRenderer.invoke('intercat:branch-points', request),
   getClipDetail: clipId => ipcRenderer.invoke('intercat:clip-detail', clipId),
   createOperationId: () => ipcRenderer.invoke('intercat:operation-id'),
   installEditor: () => ipcRenderer.invoke('intercat:editor-install'),
@@ -45,15 +75,35 @@ contextBridge.exposeInMainWorld('intercat', Object.freeze({
   provideWorkerSecret: request => ipcRenderer.invoke('intercat:worker-secret', request),
   getProjectSecretUsage: () => ipcRenderer.invoke('intercat:project-secret-usage'),
   getProjectSecretSettings: () => ipcRenderer.invoke('intercat:project-secret-settings'),
+  getCheckEnvironment: () => ipcRenderer.invoke('intercat:check-environment'),
+  chooseCheckEnvironment: () => ipcRenderer.invoke('intercat:check-environment-choose'),
+  changeCheckEnvironment: request => ipcRenderer.invoke('intercat:check-environment-change', request),
   retryProjectSecrets: () => ipcRenderer.invoke('intercat:project-secret-retry'),
   removeProjectSecret: request => ipcRenderer.invoke('intercat:project-secret-remove', request),
   applyProjectSecrets: revision => ipcRenderer.invoke('intercat:project-secret-apply', revision),
   decideProjectSecretProcess: request => ipcRenderer.invoke('intercat:project-secret-process', request),
   respondToWorker: request => ipcRenderer.invoke('intercat:worker-respond', request),
+  answerProposal: request => ipcRenderer.invoke('intercat:proposal-answer', request),
+  answerAssumption: request => ipcRenderer.invoke('intercat:assumption-answer', request),
   respondToReport: request => ipcRenderer.invoke('intercat:report-response', request),
   retryPreparation: opId => ipcRenderer.invoke('intercat:preparation-retry', opId),
   stageUtterance: request => ipcRenderer.invoke('intercat:stage', request),
+  stagePastedText: request => ipcRenderer.invoke('intercat:paste-stage', request),
+  finishPastedText: id => ipcRenderer.invoke('intercat:paste-finish', id),
+  changePrivacy: request => ipcRenderer.invoke('intercat:privacy-change', request),
+  previewPrivacy: texts => ipcRenderer.invoke('intercat:privacy-preview', texts),
+  readPrivacyOriginal: id => ipcRenderer.invoke('intercat:privacy-original', id),
+  readPastedText: id => ipcRenderer.invoke('intercat:paste-read', id),
+  refreshPastedText: request => ipcRenderer.invoke('intercat:paste-refresh', request),
+  readPastedReferences: request => ipcRenderer.invoke('intercat:paste-list', request),
   attachReference: reselect => ipcRenderer.invoke('intercat:attach-reference', reselect),
+  attachDroppedReference: async file => {
+    const selectedPath = webUtils.getPathForFile(file);
+    if (!selectedPath) throw new Error('Drop a file from your computer.');
+    return ipcRenderer.invoke('intercat:attach-dropped-reference', selectedPath);
+  },
   cutUtterance: id => ipcRenderer.invoke('intercat:cut', id),
+  rephraseUtterance: request => ipcRenderer.invoke('intercat:rephrase', request),
   resolveUtterance: request => ipcRenderer.invoke('intercat:resolve', request),
+  editUtterance: action => ipcRenderer.invoke('intercat:edit-request', action),
 }));

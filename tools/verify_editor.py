@@ -52,7 +52,7 @@ REQUESTS = [
 
 
 def payload(index, prefix=PREFIX):
-    return {"prefix": prefix, "tail": json.dumps({
+    return {"prefix": prefix, "cachePrefix": False, "tail": json.dumps({
         "tracks": [{"lane": 1, "name": "math tests", "state": "working", "clip": "add boundary cases"},
                    {"lane": 2, "name": "README", "state": "done"},
                    {"lane": 3, "name": "server", "state": "working"}],

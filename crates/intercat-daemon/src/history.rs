@@ -90,7 +90,11 @@ pub(crate) async fn replay_start(
     params: Value,
     guard: crate::msp::StartGuard,
 ) -> Result<Reply> {
-    let request = connection.client.query_start(params, guard).await?;
+    let prepared = context
+        .journal
+        .screen_replay(params, context.track.into(), context.session.into())
+        .await?;
+    let request = connection.client.query_start(prepared, guard).await?;
     exchange_request(connection, context, request).await
 }
 

@@ -1,3 +1,4 @@
+import { mockDrafts } from './support/drafts';
 import { closeWindow } from './support/close';
 import { _electron as electron, expect, test, type ElectronApplication } from '@playwright/test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -9,6 +10,7 @@ let data: string;
 test.beforeEach(async () => {
   data = await mkdtemp(path.join(tmpdir(), 'intercat-desktop-'));
   app = await electron.launch({ args: ['.', '--preview', `--user-data-dir=${data}`], env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: 'false' } });
+  await mockDrafts(app);
 });
 test.afterEach(async () => { if (app) await closeWindow(app); await rm(data, { recursive: true, force: true }); });
 
@@ -113,20 +115,26 @@ test('old input markers use the time window, retain close inputs and apply delta
     ipcMain.handle('intercat:status', () => state);
     ipcMain.removeHandler('intercat:timeline-window');
     ipcMain.handle('intercat:timeline-window', (_event, request) => ({ revision: state.sequence, reset: request.since === null, clips: [], removed: [], marks: request.since === state.sequence ? [] : (state.sequence === 1 ? marks : [{ ...marks[0], text: 'Updated old input' }, marks[1]]).filter(mark => mark.at >= request.start && mark.at <= request.end), removedMarks: request.since === 1 && state.sequence === 2 ? ['session/remove'] : [] }));
+    ipcMain.removeHandler('intercat:utterance-read');
+    ipcMain.handle('intercat:utterance-read', (_event, id) => ({ id, text: marks.find(mark => mark.inputId === id)!.text, state: 'landed', createdAt: now, revision: 1, target: { mode: 'none' }, attachments: [], reason: null, decision: { kind: 'extend', trackId: id === 'close' ? 'b' : 'a', boundary: 'now', command: null, confidence: 1, inferenceMs: 1, timedOut: false } }));
     BrowserWindow.getAllWindows()[0].setSize(1040, 760);
     BrowserWindow.getAllWindows()[0].reload();
   });
-  const inputs = page.getByLabel('Received inputs', { exact: true });
-  const old = inputs.getByRole('button', { name: 'Old input beyond the former 200 item limit · to A', exact: true });
-  const close = inputs.getByRole('button', { name: 'Closely spaced input with its full text · to B', exact: true });
-  await expect(old).toBeVisible(); await expect(close).toBeVisible();
-  await close.focus(); await close.press('Enter');
+  const inputs = page.getByLabel('Timeline requests', { exact: true });
+  const group = inputs.getByRole('button', { name: '2 requests at this time', exact: true });
+  await group.focus(); await group.press('Enter');
+  const choices = page.getByRole('dialog', { name: 'Requests at this time', exact: true });
+  await expect(choices).toContainText('Old input beyond the former 200 item limit');
+  await choices.getByRole('button', { name: 'Closely spaced input with its full text to B', exact: true }).click();
   await expect(page.locator('#track-b')).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('dialog', { name: 'Request', exact: true })).toContainText('Closely spaced input with its full text');
+  await page.getByRole('button', { name: 'Close request details', exact: true }).click();
   await page.screenshot({ path: 'research/verify/timeline-marks-20261104/close-inputs.png' });
   await app.evaluate(() => (globalThis as typeof globalThis & { advanceMarks: () => void }).advanceMarks());
-  await expect(inputs.getByRole('button', { name: 'Updated old input · to A', exact: true })).toBeVisible();
   await expect(inputs.getByRole('button', { name: 'Removed on the next revision · to A', exact: true })).toHaveCount(0);
-  await expect(close).toBeVisible();
+  await group.click();
+  await expect(choices).toContainText('Updated old input');
+  await expect(choices).toContainText('Closely spaced input with its full text');
 });
 
 test('project secret settings remove values and account for retained processes', async () => {
@@ -548,15 +556,15 @@ function questionFixture() {
 test('a redirect shows its stop boundary and a held correction needs an explicit Start', async () => {
   const page = await app.firstWindow();
   await app.evaluate(({ ipcMain }) => {
-    const word = { attachments: [], id: 'redirect-input', text: '別の方法で修正して', createdAt: Date.now(), state: 'redirecting', revision: 1, target: { mode: 'none' }, decision: { kind: 'trim', trackId: 'A', boundary: 'now', command: null, confidence: 1, inferenceMs: 1, timedOut: false }, reason: null };
-    const state = { connected: true, sequence: 1, tracks: [{ id: 'A', label: 'A', title: '作業中', status: 'working' }], utterances: [word], redirects: [{ inputId: word.id, revision: 1, trackId: 'A', sessionId: 'session', turnId: 'turn', phase: 'stopping' }] };
+    const word = { attachments: [], id: 'redirect-input', text: '別の方法で修正して', createdAt: Date.now(), state: 'redirecting', interruptStarted: true, revision: 1, target: { mode: 'none' }, decision: { kind: 'trim', trackId: 'A', boundary: 'now', command: null, confidence: 1, inferenceMs: 1, timedOut: false }, reason: null };
+    const state = { connected: true, sequence: 1, tracks: [{ id: 'A', label: 'A', title: '作業中', status: 'working' }], utterances: [word], redirects: [{ inputId: word.id, revision: 1, trackId: 'A', sessionId: 'session', turnId: 'turn', phase: 'interrupting' }] };
     const shared = globalThis as typeof globalThis & { redirectFixture: typeof state; redirectCalls: unknown[] };
     shared.redirectFixture = state; shared.redirectCalls = [];
     ipcMain.removeHandler('intercat:status'); ipcMain.handle('intercat:status', () => state);
     ipcMain.removeHandler('intercat:resolve'); ipcMain.handle('intercat:resolve', (_event, request) => { shared.redirectCalls.push(request); return { ...word, state: 'placed' }; });
   });
   const chip = page.locator('.request-chip').filter({ hasText: '別の方法で修正して' });
-  await expect(chip).toContainText('redirect A · stopping');
+  await expect(chip).toContainText('redirect A · sent · stopping');
   await expect(chip.getByRole('button', { name: /Cut request/ })).toHaveCount(0);
   await app.evaluate(() => {
     const state = (globalThis as typeof globalThis & { redirectFixture: { sequence: number; utterances: { state: string }[]; redirects: { phase: string }[] } }).redirectFixture;
@@ -631,6 +639,7 @@ test('report replies keep their question when browsing another track', async () 
   await expect(page.locator('.reply-target')).toContainText('Reply to Worker A');
   await page.getByRole('textbox', { name: 'Request draft' }).fill('Use the approved output.');
   await page.getByRole('button', { name: 'Send reply', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'Request draft' })).toHaveValue('');
   const responses = await app.evaluate(() => (globalThis as typeof globalThis & { reportResponses: { questionId: string; revision: number; answer: unknown }[] }).reportResponses);
   expect(responses).toHaveLength(1);
   expect(responses[0]).toMatchObject({ questionId: 'question-A', revision: 2, answer: { action: 'reply', text: 'Use the approved output.' } });
@@ -690,6 +699,10 @@ test('lost workers offer retry and stop while stale approvals stay disabled', as
     BrowserWindow.getAllWindows()[0].setSize(1040, 760);
   });
   const card = page.getByRole('group', { name: 'Approval for Worker A' });
+  await expect(page.locator('.worker-controls')).toContainText('lost');
+  if (!await page.getByRole('button', { name: 'Retry connection', exact: true }).isVisible()) {
+    await page.getByRole('button', { name: /^\+\d+ more/ }).click();
+  }
   await expect(page.getByRole('button', { name: 'Retry connection', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Stop here', exact: true })).toBeVisible();
   await expect(card.getByRole('button', { name: 'Allow once', exact: true })).toBeDisabled();

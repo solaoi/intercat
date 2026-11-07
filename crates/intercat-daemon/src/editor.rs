@@ -1,5 +1,5 @@
 //! Own the local editor process independently of model calls and worker Stop.
-use crate::Result;
+use crate::{Result, screening::EditorRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -94,7 +94,63 @@ struct Inner {
 #[derive(Clone)]
 pub struct Manager(Arc<Inner>);
 
+pub struct Inference {
+    response: reqwest::Response,
+    manager: Manager,
+    generation: u64,
+}
+
+impl Inference {
+    pub async fn finish(self, budget: Duration) -> Result<Value> {
+        let body = tokio::time::timeout(budget, bounded_json(self.response))
+            .await
+            .map_err(|_| InferenceTimeout)??;
+        let now = self.manager.status();
+        if now.generation != self.generation || !now.model_loaded {
+            return Err(std::io::Error::other("editor changed during inference").into());
+        }
+        Ok(body)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Priority {
+    Input,
+    Question,
+    Park,
+    Background,
+}
+impl Priority {
+    fn header(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Question => "question",
+            Self::Park => "park",
+            Self::Background => "background",
+        }
+    }
+}
+
+pub(crate) struct ReadingCancellation {
+    pub editor: Manager,
+    pub request: crate::input_readings::Ticket,
+}
+impl Drop for ReadingCancellation {
+    fn drop(&mut self) {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let editor = self.editor.clone();
+            let request = self.request.clone();
+            runtime.spawn(async move {
+                let _ = editor.cancel_reading(&request).await;
+            });
+        }
+    }
+}
+
 impl Manager {
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub fn new(source: &Path, log: &Path) -> Result<Self> {
         let http = reqwest::Client::builder()
             .no_proxy()
@@ -247,28 +303,207 @@ impl Manager {
             .status
             .send_replace(Status::initial(self.status().generation + 1, "stopped"));
     }
-    pub async fn decide(&self, request: &Value) -> Result<Value> {
-        self.request_decision(request, Duration::from_millis(1200))
+    pub async fn decide(
+        &self,
+        request: EditorRequest,
+        priority: Priority,
+        reading: Option<&crate::input_readings::Ticket>,
+    ) -> Result<Inference> {
+        self.admit(
+            "decide",
+            request,
+            priority,
+            Duration::from_secs(120),
+            reading,
+        )
+        .await
+    }
+    pub async fn analyze_report(
+        &self,
+        request: EditorRequest,
+        priority: Priority,
+        remaining: Duration,
+        reading: Option<&crate::input_readings::Ticket>,
+    ) -> Result<Value> {
+        self.request("decide", request, remaining, priority, remaining, reading)
             .await
     }
-    pub async fn analyze_report(&self, request: &Value) -> Result<Value> {
-        self.request_decision(request, Duration::from_secs(10))
+    pub(crate) fn privacy_ready(&self) -> bool {
+        let status = self.status();
+        status.model_loaded
+            && status.accepting
+            && status
+                .endpoint
+                .and_then(|value| reqwest::Url::parse(&value).ok())
+                .is_some_and(|url| {
+                    url.scheme() == "http"
+                        && url.host_str() == Some("127.0.0.1")
+                        && url.port().is_some()
+                })
+    }
+    pub(crate) async fn inspect_privacy(
+        &self,
+        request: EditorRequest,
+        priority: Priority,
+    ) -> Result<Value> {
+        if !self.privacy_ready() {
+            return Err("Full privacy is waiting for the local Editor.".into());
+        }
+        let reading = crate::input_readings::Ticket {
+            input: uuid::Uuid::now_v7().to_string(),
+            revision: 1,
+            index: 1,
+        };
+        let _cancel = ReadingCancellation {
+            editor: self.clone(),
+            request: reading.clone(),
+        };
+        let prompt = format!(
+            "{}{}\nFindings:\n",
+            request.params["prefix"]
+                .as_str()
+                .ok_or("Missing privacy prefix.")?,
+            request.params["tail"]
+                .as_str()
+                .ok_or("Missing privacy sources.")?
+        );
+        let counter = EditorRequest {
+            params: serde_json::json!({"text":prompt}),
+            seal: request.seal.clone(),
+            permit: request.permit.clone(),
+        };
+        let tokens = self
+            .request(
+                "tokens",
+                counter,
+                Duration::from_secs(5),
+                priority,
+                Duration::from_secs(30),
+                Some(&reading),
+            )
+            .await?;
+        if tokens["tokens"].as_u64().is_none_or(|count| count > 8000) {
+            return Err("Full privacy context exceeds the local model limit.".into());
+        }
+        self.request(
+            "privacy",
+            request,
+            Duration::from_secs(30),
+            priority,
+            Duration::from_secs(30),
+            Some(&reading),
+        )
+        .await
+    }
+    pub async fn generate(
+        &self,
+        request: EditorRequest,
+        reading: Option<&crate::input_readings::Ticket>,
+    ) -> Result<Value> {
+        self.request(
+            "generate",
+            request,
+            Duration::from_secs(30),
+            Priority::Background,
+            Duration::from_secs(30),
+            reading,
+        )
+        .await
+    }
+    pub async fn count_tokens(
+        &self,
+        request: &EditorRequest,
+        priority: Priority,
+        reading: Option<&crate::input_readings::Ticket>,
+    ) -> Result<usize> {
+        self.count_prepared_tokens(request.token_count()?, priority, reading)
             .await
     }
-    async fn request_decision(&self, request: &Value, budget: Duration) -> Result<Value> {
+    pub(crate) async fn count_generation_tokens(
+        &self,
+        request: &EditorRequest,
+        reading: Option<&crate::input_readings::Ticket>,
+    ) -> Result<usize> {
+        self.count_prepared_tokens(
+            request.generation_token_count()?,
+            Priority::Background,
+            reading,
+        )
+        .await
+    }
+    async fn count_prepared_tokens(
+        &self,
+        request: EditorRequest,
+        priority: Priority,
+        reading: Option<&crate::input_readings::Ticket>,
+    ) -> Result<usize> {
+        let response = self
+            .request(
+                "tokens",
+                request,
+                Duration::from_secs(5),
+                priority,
+                Duration::from_secs(120),
+                reading,
+            )
+            .await?;
+        response["tokens"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| "The Editor returned an invalid token count.".into())
+    }
+    async fn request(
+        &self,
+        path: &str,
+        request: EditorRequest,
+        budget: Duration,
+        priority: Priority,
+        total_budget: Duration,
+        reading: Option<&crate::input_readings::Ticket>,
+    ) -> Result<Value> {
+        self.admit(path, request, priority, total_budget, reading)
+            .await?
+            .finish(budget)
+            .await
+    }
+
+    async fn admit(
+        &self,
+        path: &str,
+        request: EditorRequest,
+        priority: Priority,
+        total_budget: Duration,
+        reading: Option<&crate::input_readings::Ticket>,
+    ) -> Result<Inference> {
         let status = self.status();
         let endpoint = status
             .endpoint
             .filter(|_| status.model_loaded)
             .ok_or_else(|| std::io::Error::other("editor unavailable"))?;
-        let response = self
+        let mut sending = self
             .0
             .http
-            .post(format!("{endpoint}/decide"))
-            .json(request)
-            .timeout(Duration::from_secs(120))
-            .send()
-            .await?;
+            .post(format!("{endpoint}/{path}"))
+            .header("X-Intercat-Priority", priority.header())
+            .header(
+                "X-Intercat-Timeout-Ms",
+                total_budget.as_millis().clamp(1, 120_000).to_string(),
+            )
+            .json(request.params())
+            .timeout(total_budget);
+        if let Some(reading) = reading {
+            sending = sending
+                .header("X-Intercat-Reading", &reading.input)
+                .header("X-Intercat-Reading-Index", reading.index.to_string());
+        }
+        let response = tokio::spawn(async move {
+            let response = sending.send().await;
+            // The Editor reads the request body before returning headers. Keep
+            // its lease through this point even if the waiting caller cancels.
+            drop(request);
+            response
+        })
+        .await??;
         if response
             .headers()
             .get("X-Intercat-Inference")
@@ -277,14 +512,25 @@ impl Manager {
         {
             return Err(std::io::Error::other("editor did not report inference admission").into());
         }
-        let body = tokio::time::timeout(budget, bounded_json(response))
-            .await
-            .map_err(|_| InferenceTimeout)??;
-        let now = self.status();
-        if now.generation != status.generation || !now.model_loaded {
-            return Err(std::io::Error::other("editor changed during inference").into());
+        Ok(Inference {
+            response,
+            manager: self.clone(),
+            generation: status.generation,
+        })
+    }
+
+    pub async fn cancel_reading(&self, reading: &crate::input_readings::Ticket) -> Result<()> {
+        if let Some(endpoint) = self.status().endpoint {
+            self.0
+                .http
+                .post(format!("{endpoint}/cancel-reading"))
+                .json(&serde_json::json!({"input":reading.input,"index":reading.index}))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await?
+                .error_for_status()?;
         }
-        Ok(body)
+        Ok(())
     }
 }
 

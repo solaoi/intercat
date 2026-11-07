@@ -8,6 +8,12 @@ async fn main() -> Result<()> {
     let input = std::env::args_os().nth(1).ok_or("Expected fixture path")?;
     let output = std::env::args_os().nth(2).ok_or("Expected output path")?;
     let fixture: Value = serde_json::from_slice(&std::fs::read(input)?)?;
+    let temporary = tempfile::tempdir()?;
+    let journal = intercat_daemon::journal::Journal::open(
+        temporary.path().join("db"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await?;
     let mut cases = Vec::new();
     for case in fixture["cases"].as_array().ok_or("Expected cases")? {
         let session = case["sessionId"].as_str().ok_or("Expected session")?;
@@ -25,8 +31,11 @@ async fn main() -> Result<()> {
             if let Some(params) = action.get("send") {
                 let client = connection.client.clone();
                 let params = params.clone();
-                let request =
-                    tokio::spawn(async move { client.request("turn/start", params).await });
+                let prepared = journal.screen_start(params).await?;
+                let guard = intercat_daemon::msp::StartGuard::Stopped(std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ));
+                let request = tokio::spawn(async move { client.start(prepared, guard).await });
                 let mut line = String::new();
                 requests.read_line(&mut line).await?;
                 let submitted: Value = serde_json::from_str(&line)?;

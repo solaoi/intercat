@@ -617,6 +617,27 @@ impl Service {
         }
         self.stop(id, track).await
     }
+    pub async fn stop_input_origin(
+        &self,
+        id: Uuid,
+        track: String,
+        identity: crate::input_origin::Identity,
+    ) -> Result<()> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let port = service.port(&track)?;
+            port.stop_origin(id, &identity.session_id, identity.turn_id)
+                .await?;
+            let generation = port
+                .stop_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let hold = Uuid::new_v5(&id, b"hold-after-stop");
+            service.journal.hold_inputs(hold, track).await?;
+            port.saved_local_hold(generation, hold);
+            Ok(())
+        })
+        .await?
+    }
     pub async fn hold(&self, id: Uuid, track: &str) -> Result<()> {
         let port = self.port(track).ok().filter(|port| !port.is_closed());
         let generation = if let Some(port) = &port {
@@ -643,6 +664,9 @@ impl Service {
             .as_array()
             .and_then(|words| words.iter().find(|word| word["id"] == input))
             .ok_or("The request is unavailable.")?;
+        if word["decision"]["kind"] == "command" {
+            return self.journal.start_held_input(id, input, revision).await;
+        }
         let track = word["decision"]["trackId"]
             .as_str()
             .ok_or("The request needs a destination.")?;
@@ -717,10 +741,23 @@ impl Service {
         track: &str,
         approval: String,
         requirement: Value,
-        allow: bool,
+        response: crate::approval::Response,
     ) -> Result<()> {
+        if crate::approval::replay(
+            &self.journal,
+            id,
+            &crate::secret_input::Owner::Work.key(track),
+            &approval,
+            &requirement,
+            &response,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        response.screen(&self.journal).await?;
         self.port(track)?
-            .answer(id, approval, requirement, allow)
+            .answer(id, approval, requirement, response)
             .await
     }
     pub async fn respond(
@@ -825,6 +862,9 @@ impl Runtime {
             loop {
                 changes.borrow_and_update();
                 if *stopping.borrow() {
+                    break;
+                }
+                if journal.advance_approval_replies().await.is_err() {
                     break;
                 }
                 let snapshot = match journal.snapshot().await {
@@ -1494,6 +1534,7 @@ impl WorkerRunner {
             | Command::Retry { reply, .. }
             | Command::Answer { reply, .. }
             | Command::Respond { reply, .. }
+            | Command::StopOrigin { reply, .. }
             | Command::InstallSecret { reply, .. } => {
                 let _ = reply.send(Err(error.into()));
             }

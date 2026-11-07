@@ -331,6 +331,7 @@ async fn local_directory_dependencies_use_saved_sources_and_invalidate_on_source
     let checked = checkout
         .run_check(
             "node -e \"if(require('tiny-dep')!==43)process.exit(1)\"",
+            &std::collections::BTreeMap::new(),
             no_cancel(),
             Duration::from_secs(30),
         )
@@ -363,6 +364,7 @@ async fn local_directory_dependencies_use_saved_sources_and_invalidate_on_source
     let checked = checkout
         .run_check(
             "node -e \"if(require('tiny-dep')!==44)process.exit(1)\"",
+            &std::collections::BTreeMap::new(),
             no_cancel(),
             Duration::from_secs(30),
         )
@@ -528,7 +530,12 @@ async fn installs_from_verified_archives_and_forces_fresh_generated_files_before
         "two\n"
     );
     let result = checkout
-        .run_check("npm test", no_cancel(), Duration::from_secs(10))
+        .run_check(
+            "npm test",
+            &std::collections::BTreeMap::new(),
+            no_cancel(),
+            Duration::from_secs(10),
+        )
         .await?;
     assert!(
         result.success(),
@@ -599,7 +606,12 @@ async fn installation_scripts_cannot_connect_to_registry_or_modify_source_or_sha
     );
     let script = format!("node -e '{}'", js.replace('\'', "'\\''"));
     let blocked = checkout
-        .run_check(&script, no_cancel(), Duration::from_secs(10))
+        .run_check(
+            &script,
+            &std::collections::BTreeMap::new(),
+            no_cancel(),
+            Duration::from_secs(10),
+        )
         .await?;
     assert!(
         blocked.success(),
@@ -821,6 +833,11 @@ async fn candidate_fixture(
     repo.compare_and_swap(&reference, None, checkpoint)?;
     repo.sync_objects(&[marker, checkpoint])?;
     let mut job = Job {
+        order_review: None,
+        assumptions: Vec::new(),
+        assumptions_changed: false,
+        assumptions_pending: 0,
+        assumptions_failed: 0,
         id: uuid::Uuid::now_v7(),
         revision: 1,
         status: Status::Preparing,
@@ -857,6 +874,7 @@ async fn candidate_fixture(
     job.plan = Some(integration::freeze(&job)?);
     job.plan = Some(integration::plan(&job)?);
     let settings = Settings {
+        environment: None,
         scanner: intercat_daemon::secret_scan::Engine::capture()?,
         command: CheckCommand::Auto,
         npm: Some(f.npm.clone()),

@@ -34,7 +34,7 @@ def main():
     engine=Engine(args.model);rows=[]
     for variant,prefix,labels,prompt in [('production',current,['0','1','2'],'\nLABEL:')]:
         for name,report,expected in cases:
-            request=DecisionRequest.parse({'prefix':prefix,'tail':json.dumps({'report':report},ensure_ascii=False),'stages':[{'name':'question','prompt':prompt,'candidates':labels}],'temperature':1})
+            request=DecisionRequest.parse({'prefix':prefix,'cachePrefix':False,'tail':json.dumps({'report':report},ensure_ascii=False),'stages':[{'name':'question','prompt':prompt,'candidates':labels}],'temperature':1})
             value=engine.decide(request);stage=value['stages']['question'];selected=stage['selected'];predicted=selected; gate='clear' if selected=='0' and stage['confidence']>=.8 else 'hold'
             rows.append({'variant':variant,'name':name,'expected':expected,'predicted':predicted,'gate':gate,'result':value})
             print(json.dumps({'variant':variant,'name':name,'expected':expected,'predicted':predicted,'gate':gate,'confidence':stage['confidence']}),flush=True)

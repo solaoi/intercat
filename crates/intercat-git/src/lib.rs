@@ -91,6 +91,9 @@ fn full_sync(path: &Path) -> std::io::Result<()> {
 }
 
 impl Repository {
+    pub fn common_directory(&self) -> Result<std::path::PathBuf> {
+        Ok(self.0.common_dir().canonicalize()?)
+    }
     pub fn commit_details(&self, id: ObjectId) -> Result<CommitDetails> {
         let commit = self.0.find_commit(id)?;
         let decoded = commit.decode()?;
@@ -222,6 +225,59 @@ impl Repository {
             return Err("Saved file is not a blob.".into());
         }
         Ok(header.size())
+    }
+    /// Apply only Git's built-in clean conversions, using the fixed base's
+    /// attributes. An external filter is not a safe source of comparison bytes.
+    pub fn normalized_file(&self, base: ObjectId, path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let root = self.0.workdir().ok_or("A worktree is required.")?;
+        let mut repo = Self::open(root)?.0;
+        let mut config = repo.config_snapshot_mut();
+        config.append_config(["core.attributesFile=/dev/null"], gix::config::Source::Api)?;
+        config.commit()?;
+        let index = repo.index_from_tree(&repo.find_commit(base)?.tree_id()?.detach())?;
+        let cache = repo.attributes_only(
+            &index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?;
+        let (mut pipeline, mut cache) =
+            gix::filter::Pipeline::new(&repo, cache.detach())?.into_parts();
+        let entry = cache.at_entry(gix::bstr::BStr::new(path.as_bytes()), None, &repo.objects)?;
+        let mut external = false;
+        let mut converted = pipeline.convert_to_git(
+            std::io::Cursor::new(bytes),
+            Path::new(path),
+            &mut |_, attributes| {
+                entry.matching_attributes(attributes);
+                external = attributes.iter_selected().any(|value| {
+                    value.assignment.name.as_str() == "filter"
+                        && matches!(
+                            value.assignment.state,
+                            gix::attrs::StateRef::Value(_) | gix::attrs::StateRef::Set
+                        )
+                });
+            },
+            &mut |buffer| {
+                let Some(entry) = index.entry_by_path(gix::bstr::BStr::new(path.as_bytes())) else {
+                    return Ok(None);
+                };
+                let blob = repo.find_blob(entry.id)?;
+                buffer.extend_from_slice(&blob.data);
+                Ok(Some(()))
+            },
+        )?;
+        if external {
+            return Err("External clean filter is not supported in file comparison.".into());
+        }
+        let mut result = Vec::new();
+        converted
+            .by_ref()
+            .take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut result)?;
+        if result.len() > 64 * 1024 * 1024 {
+            return Err("Normalized file exceeds the comparison limit.".into());
+        }
+        Ok(result)
     }
     pub fn tracked_paths(&self) -> Result<Vec<String>> {
         let index = self.0.index_or_empty()?;

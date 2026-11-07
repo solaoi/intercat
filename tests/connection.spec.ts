@@ -147,6 +147,10 @@ test('local editor classifies a queued request through the UI and exits with its
     const wordId = word.id;
     expect(word.decision?.boundary).toBe('when-told');
     expect(word.state).toBe('placed');
+    expect(word.decision?.timings?.[0]?.roundTripMs).toBeGreaterThanOrEqual(word.decision!.inferenceMs);
+    await writeFile(test.info().outputPath('decision-timing.json'), JSON.stringify({
+      timings: word.decision!.timings,
+    }, null, 2));
     expect(classified.tracks).toHaveLength(1);
     await expect(page.locator('.request-chip.placed')).toHaveCount(1);
     await expect(page.getByRole('row')).toHaveCount(1);

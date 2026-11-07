@@ -130,7 +130,7 @@ async fn verify_pending_recovery(kill_host: bool) -> Result<()> {
         let command=Uuid::now_v7();let params=json!({"commandId":command,"sessionId":id,"reasoningEffort":"minimal","input":[{"type":"text","text":"This is a disposable local test repository. Use the bash tool to run exactly `git push origin main`. Do not inspect or change any files. Wait for the approval result. Do not try another command or tool."}]});
         journal.intent(&command.to_string(),"turn.start",params.clone()).await?;
         fs::write(target.join("attempt.json"),serde_json::to_vec_pretty(&json!({"sessionId":id,"commandId":command,"attemptedModelTurns":1}))?)?;
-        let response=host.connection.client.request("turn/start",params).await?;turn=Some(response["turnId"].as_str().ok_or("No fixture turn")?.parse()?);
+        let response=host.connection.client.start(journal.screen_start(params).await?, intercat_daemon::msp::StartGuard::Stopped(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))).await?;turn=Some(response["turnId"].as_str().ok_or("No fixture turn")?.parse()?);
         let approval=tokio::time::timeout(Duration::from_secs(100),async {
             loop {
                 let Some(Event::Frame(received))=host.connection.next_event().await else {return Err("Fixture host closed before approval.".into());};

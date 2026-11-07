@@ -28,11 +28,20 @@ pub enum Action {
         track: String,
         included: bool,
     },
+    Order {
+        id: Uuid,
+        revision: u64,
+        tracks: Vec<String>,
+    },
     Discard {
         id: Uuid,
         revision: u64,
     },
     Prepare {
+        id: Uuid,
+        revision: u64,
+    },
+    Recheck {
         id: Uuid,
         revision: u64,
     },
@@ -56,6 +65,15 @@ pub enum Action {
     RetryCommit {
         id: Uuid,
         revision: u64,
+    },
+    RetryAssumptions {
+        id: Uuid,
+        revision: u64,
+    },
+    KeepAssumption {
+        id: Uuid,
+        revision: u64,
+        assumption: Uuid,
     },
     KeepSecret {
         id: Uuid,
@@ -94,6 +112,7 @@ pub struct Diff {
 #[serde(rename_all = "kebab-case")]
 pub enum Status {
     Preparing,
+    Ordering,
     Open,
     MergeConflict,
     Failed,
@@ -139,6 +158,23 @@ pub struct Job {
     pub publication: Option<crate::publication::Publication>,
     pub kept_secrets: std::collections::BTreeSet<String>,
     pub contributions: BTreeMap<String, crate::candidate::Contribution>,
+    // These relations are hydrated by the journal and projected explicitly for the UI.
+    #[serde(skip)]
+    pub assumptions: Vec<crate::integration_assumptions::Review>,
+    #[serde(skip)]
+    pub assumptions_changed: bool,
+    #[serde(skip)]
+    pub assumptions_pending: usize,
+    #[serde(skip)]
+    pub assumptions_failed: usize,
+    #[serde(skip)]
+    pub order_review: Option<crate::integration_order::Review>,
+}
+
+pub(crate) fn project(job: &Job) -> Result<serde_json::Value> {
+    let mut value = crate::integration_assumptions::project(job)?;
+    value["orderReview"] = serde_json::to_value(&job.order_review)?;
+    Ok(value)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -210,6 +246,48 @@ pub struct Conflict {
     /// Earlier selected tracks that changed this path. An empty list means
     /// the conflict is with changes already in the session branch.
     pub with_tracks: Vec<String>,
+}
+
+pub(crate) fn read_diff(root: std::path::PathBuf, change: Change) -> Result<Diff> {
+    let path = change.path.clone();
+    let repository = Repository::open(root)?;
+    let mut too_large = false;
+    let mut binary = false;
+    let mut read = |file: Option<File>| -> Result<String> {
+        let Some(file) = file else {
+            return Ok(String::new());
+        };
+        let saved = SavedFile {
+            object: file.object.parse()?,
+            mode: file.mode,
+        };
+        if repository.saved_size(&saved)? > 1024 * 1024 {
+            too_large = true;
+            return Ok(String::new());
+        }
+        let bytes = repository.saved_bytes(&saved)?;
+        if bytes.contains(&0) {
+            binary = true;
+            return Ok(String::new());
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(text),
+            Err(_) => {
+                binary = true;
+                Ok(String::new())
+            }
+        }
+    };
+    let before = read(change.before)?;
+    let after = read(change.after)?;
+    Ok(Diff {
+        path,
+        before,
+        after,
+        redacted: false,
+        binary,
+        too_large,
+    })
 }
 
 pub(crate) fn changes(repo: &Repository, before: ObjectId, after: ObjectId) -> Result<Vec<Change>> {
@@ -466,49 +544,8 @@ impl Service {
             .find(|change| change.path == request.path)
             .ok_or("The file is not in this candidate.")?
             .clone();
-        let path = request.path;
-        let mut diff = tokio::task::spawn_blocking(move || -> Result<Diff> {
-            let repository = Repository::open(root)?;
-            let mut too_large = false;
-            let mut binary = false;
-            let mut read = |file: Option<File>| -> Result<String> {
-                let Some(file) = file else {
-                    return Ok(String::new());
-                };
-                let saved = SavedFile {
-                    object: file.object.parse()?,
-                    mode: file.mode,
-                };
-                if repository.saved_size(&saved)? > 1024 * 1024 {
-                    too_large = true;
-                    return Ok(String::new());
-                }
-                let bytes = repository.saved_bytes(&saved)?;
-                if bytes.contains(&0) {
-                    binary = true;
-                    return Ok(String::new());
-                }
-                match String::from_utf8(bytes) {
-                    Ok(text) => Ok(text),
-                    Err(_) => {
-                        binary = true;
-                        Ok(String::new())
-                    }
-                }
-            };
-            let before = read(change.before)?;
-            let after = read(change.after)?;
-            Ok(Diff {
-                path,
-                before,
-                after,
-                redacted: false,
-                binary,
-                too_large,
-            })
-        })
-        .await??;
-        let scanner = settings.scanner.start(&[])?;
+        let mut diff = tokio::task::spawn_blocking(move || read_diff(root, change)).await??;
+        let scanner = settings.scanner()?;
         let safe = scanner
             .redact(
                 &[diff.before.clone(), diff.after.clone()],
@@ -536,6 +573,24 @@ impl Service {
             let run = state.running.take().unwrap();
             run.task.await?;
         }
+        if let Action::Recheck { id, revision } = &command.action {
+            if self.journal.operation(command.op_id).await?.is_some() {
+                let job = self.journal.integration_command(command).await?;
+                return self.advance(&mut state, job).await;
+            }
+            let job: Job =
+                serde_json::from_value(self.journal.snapshot().await?["integration"].clone())?;
+            if job.id != *id || job.revision != *revision {
+                return Err("The sheet changed · review again".into());
+            }
+            let environment = self.journal.check_environment().await?;
+            let settings = tokio::task::spawn_blocking(move || {
+                crate::candidate::Settings::capture(&job, environment)
+            })
+            .await??;
+            let job = self.journal.recheck_integration(command, settings).await?;
+            return self.advance(&mut state, job).await;
+        }
         if let Action::EditMessage {
             id,
             revision,
@@ -551,7 +606,7 @@ impl Service {
                 .integration_settings(*id, *revision)
                 .await?
                 .ok_or("Missing Check settings.")?;
-            let scanner = settings.scanner.start(&[])?;
+            let scanner = settings.scanner()?;
             let safe = scanner
                 .redact(
                     std::slice::from_ref(message),
@@ -729,9 +784,11 @@ impl Service {
             .is_none()
         {
             let input = job.clone();
-            let settings =
-                tokio::task::spawn_blocking(move || crate::candidate::Settings::capture(&input))
-                    .await??;
+            let environment = self.journal.check_environment().await?;
+            let settings = tokio::task::spawn_blocking(move || {
+                crate::candidate::Settings::capture(&input, environment)
+            })
+            .await??;
             self.journal
                 .integration_save_settings(job.id, job.revision, settings)
                 .await?;
@@ -753,6 +810,29 @@ impl Service {
                         .await;
                 }
             }
+        }
+        if job.order_review.is_none() {
+            let input = job.clone();
+            let review =
+                tokio::task::spawn_blocking(move || crate::integration_order::inspect(&input))
+                    .await?;
+            match review {
+                Ok(review) => {
+                    job = self
+                        .journal
+                        .integration_order_review(job.id, job.revision, review)
+                        .await?
+                }
+                Err(error) => {
+                    return self
+                        .journal
+                        .integration_planned(job.id, job.revision, Err(error.to_string()))
+                        .await;
+                }
+            }
+        }
+        if job.status == Status::Ordering {
+            return Ok(job);
         }
         let input = job.clone();
         let result = tokio::task::spawn_blocking(move || plan(&input)).await?;

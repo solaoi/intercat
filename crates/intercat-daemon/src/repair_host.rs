@@ -205,7 +205,7 @@ pub async fn open(
             return Err("Repair preparation was stopped.".into());
         }
         let previous = run.session.clone();
-        let history_scanner = settings.scanner.start(&[])?;
+        let history_scanner = settings.scanner()?;
         let session = tokio::select! {
             biased;
             _ = stopping(journal, run.id) => return Err("Repair preparation was stopped.".into()),
@@ -230,7 +230,7 @@ pub async fn open(
             },
         )
         .await?;
-        let detail = match settings.scanner.start(&[]) {
+        let detail = match settings.scanner() {
             Ok(scanner) => scanner
                 .redact(&[error.to_string()], tokio::sync::watch::channel(false).1)
                 .await
@@ -265,7 +265,7 @@ async fn close_host(
     };
     let owns = current.host == Some(identity) && current.host_nonce == Some(nonce);
     let release = if owns && current.session_ready {
-        let scanner = settings.scanner.start(&[]);
+        let scanner = settings.scanner();
         match scanner {
             Ok(scanner) => {
                 crate::runtime::release_session(

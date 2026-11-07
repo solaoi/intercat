@@ -27,10 +27,14 @@ test('a report question holds queued work until its reply is sent and checkpoint
     await page.getByRole('textbox', { name: 'Request draft' }).fill('Start now. Do not use tools and do not change files. Ask me what answer.txt should contain. End the final answer with this exact standalone line: Waiting for you: What should answer.txt contain? Do not choose the contents yourself.');
     await page.getByRole('button', { name: 'New track', exact: true }).click();
     await page.getByRole('button', { name: 'Connect workers', exact: true }).click();
+    await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).workerConfigured, { timeout: 15000 }).toBe(true);
     const question = page.getByRole('group', { name: 'Question from Worker A' });
     await expect(question).toContainText('What should answer.txt contain?', { timeout: 120000 });
     await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).workers?.[0]?.checkpointPending, { timeout: 15000 }).toBe(false);
+    await expect(page.getByRole('gridcell', { name: /^A ·.* · stopped$/ })).toBeVisible();
+    await expect(question).not.toContainText('asked before your last message');
     const state = await page.evaluate(() => window.intercat.getStatus()); const track = state.tracks![0].id; const qid = state.reportQuestions![0].id; const working = state.workspaces![0].path;
+    expect(state.reportQuestions![0].askedBeforeLastMessage).toBe(false);
     const normal = await page.evaluate(async trackId => window.intercat.stageUtterance({ attachmentIds: [], opId: await window.intercat.createOperationId(), text: 'Create later.txt containing queued on one line. Do not change other files. Report completion.', target: { mode: 'lock', trackId }, selectedTrackId: trackId }), track);
     await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).utterances?.find(word => word.id === normal.id)?.state, { timeout: 15000 }).toBe('placed');
     await page.waitForTimeout(500); expect(await exists(path.join(working, 'later.txt'))).toBe(false);

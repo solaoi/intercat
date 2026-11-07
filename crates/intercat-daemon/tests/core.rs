@@ -209,14 +209,14 @@ async fn disconnect_fails_pending_request_instead_of_resending_it() -> Result<()
     assert!(
         connection
             .client
-            .request("turn/start", json!({}))
+            .request("fixture/request", json!({}))
             .await
             .is_err()
     );
     assert!(
         connection
             .client
-            .request("turn/start", json!({}))
+            .request("fixture/request", json!({}))
             .await
             .is_err()
     );

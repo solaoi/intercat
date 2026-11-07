@@ -644,7 +644,9 @@ async fn changed_saved_file_review_metadata_is_not_accepted_as_a_current_confirm
     Ok(())
 }
 
-async fn referenced_fixture() -> Result<(
+async fn referenced_fixture(
+    pasted: bool,
+) -> Result<(
     tempfile::TempDir,
     Journal,
     Receipt,
@@ -659,10 +661,23 @@ async fn referenced_fixture() -> Result<(
         intercat_daemon::attachments::reserve(&workspace.path, &workspace.base)?;
     journal.workspace_result(workspace).await?;
     let source = root.path().join("reference.txt");
-    fs::write(&source, PRIVATE)?;
-    let attachment = journal
-        .import_attachment(Uuid::now_v7(), source.clone())
-        .await?;
+    let attachment = if pasted {
+        fs::write(
+            &source,
+            format!(
+                "{PRIVATE}\n{}",
+                concat!("ghp_", "A6k9P2mR7x4T1v8B5n0Q3s6Z9c2Y7w4L8d1H")
+            ),
+        )?;
+        journal
+            .import_pasted_text(Uuid::now_v7(), source.clone())
+            .await?
+    } else {
+        fs::write(&source, PRIVATE)?;
+        journal
+            .import_attachment(Uuid::now_v7(), source.clone())
+            .await?
+    };
     fs::remove_file(source)?;
     journal
         .stage_utterance(
@@ -723,6 +738,40 @@ fn compare_request() -> Request {
         track_id: "track".into(),
     }
 }
+
+#[tokio::test]
+async fn pasted_original_and_redacted_copy_are_independently_verified_after_backup() -> Result<()> {
+    let (root, journal, receipt, attachment, copy) = referenced_fixture(true).await?;
+    assert_eq!(
+        fs::read_to_string(&copy)?,
+        format!("{PRIVATE}\n<redacted:api-key#1>")
+    );
+    let data = root.path().join("restored");
+    let result = backup_review::run(&journal, &data, receipt.clone(), compare_request()).await?;
+    assert_eq!(result["workspaces"][0]["attachmentsReviewed"], true);
+    assert_eq!(
+        result["fileReview"]["attachments"]["copies"][0]["state"],
+        "matched"
+    );
+    let original = data.join("attachments").join(attachment.id.to_string());
+    let mut bytes = fs::read(&original)?;
+    let header = u32::from_be_bytes(bytes[8..12].try_into()?);
+    bytes[12 + header as usize] ^= 1;
+    fs::set_permissions(&original, fs::Permissions::from_mode(0o600))?;
+    fs::write(&original, bytes)?;
+    fs::set_permissions(&original, fs::Permissions::from_mode(0o400))?;
+    let changed = backup_review::run(&journal, &data, receipt, compare_request()).await?;
+    assert_eq!(changed["workspaces"][0]["attachmentsReviewed"], false);
+    assert_eq!(
+        changed["fileReview"]["attachments"]["invalidOriginals"][0],
+        attachment.id.to_string()
+    );
+    assert_eq!(
+        fs::read_to_string(copy)?,
+        format!("{PRIVATE}\n<redacted:api-key#1>")
+    );
+    Ok(())
+}
 async fn recovery_command(data: &Path, receipt: &Receipt, request: Request) -> Result<Value> {
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_intercatd"))
         .args(["review-backup", data.to_str().unwrap()])
@@ -759,7 +808,7 @@ async fn recovery_command(data: &Path, receipt: &Receipt, request: Request) -> R
 #[tokio::test]
 async fn restored_originals_and_owned_copies_are_verified_without_writes_and_changed_sets_are_stale()
 -> Result<()> {
-    let (root, journal, receipt, attachment, copy) = referenced_fixture().await?;
+    let (root, journal, receipt, attachment, copy) = referenced_fixture(false).await?;
     let data = root.path().join("restored");
     let original = data.join("attachments").join(attachment.id.to_string());
     let before_original = fs::read(&original)?;
@@ -860,7 +909,7 @@ async fn restored_originals_and_owned_copies_are_verified_without_writes_and_cha
 async fn missing_or_changed_originals_and_unsafe_copies_remain_unverified_without_recreation()
 -> Result<()> {
     use std::os::unix::fs::symlink;
-    let (root, journal, receipt, attachment, copy) = referenced_fixture().await?;
+    let (root, journal, receipt, attachment, copy) = referenced_fixture(false).await?;
     let data = root.path().join("restored");
     let originals = data.join("attachments");
     let original = originals.join(attachment.id.to_string());
@@ -957,7 +1006,7 @@ async fn missing_or_changed_originals_and_unsafe_copies_remain_unverified_withou
 #[tokio::test]
 async fn newer_originals_and_unassigned_copies_are_reported_and_forged_reviews_are_stale()
 -> Result<()> {
-    let (root, journal, receipt, _attachment, copy) = referenced_fixture().await?;
+    let (root, journal, receipt, _attachment, copy) = referenced_fixture(false).await?;
     let data = root.path().join("restored");
     let request = compare_request();
     let first = backup_review::run(&journal, &data, receipt.clone(), request.clone()).await?;
@@ -1134,7 +1183,7 @@ async fn session_choices_are_review_bound_durable_and_do_not_reopen_or_change_hi
 async fn changed_files_invalid_targets_and_unverified_originals_cannot_silently_receive_a_pickup_choice()
 -> Result<()> {
     use intercat_daemon::backup_choices::Choice;
-    let (root, journal, receipt) = referenced_fixture()
+    let (root, journal, receipt) = referenced_fixture(false)
         .await
         .map(|(a, b, c, _, _)| (a, b, c))?;
     let data = root.path().join("restored");
@@ -1260,7 +1309,7 @@ async fn sessions_missing_from_the_restored_workspace_require_acknowledged_disca
 async fn applied_file_pickup_retires_only_the_old_session_and_waits_for_external_confirmation()
 -> Result<()> {
     use intercat_daemon::backup_choices::Choice;
-    let (root, journal, receipt, attachment, copy) = referenced_fixture().await?;
+    let (root, journal, receipt, attachment, copy) = referenced_fixture(false).await?;
     let data = root.path().join("restored");
     let project = root.path().join("project");
     let latest = "refs/intercat/test/A-checkpoint";
@@ -1582,7 +1631,7 @@ async fn apply_requires_current_decisions_and_preserves_unverified_files_on_disc
 async fn prepared_recovery_keeps_later_edits_and_rejects_a_changed_snapshot_reference() -> Result<()>
 {
     use intercat_daemon::backup_choices::Choice;
-    let (root, journal, receipt, _, _) = referenced_fixture().await?;
+    let (root, journal, receipt, _, _) = referenced_fixture(false).await?;
     let data = root.path().join("restored");
     let project = root.path().join("project");
     let review = backup_review::run(&journal, &data, receipt.clone(), compare_request()).await?;
@@ -1686,7 +1735,7 @@ async fn prepared_recovery_keeps_later_edits_and_rejects_a_changed_snapshot_refe
 async fn real_backup_recovery_starts_one_new_session_without_importing_retired_history()
 -> Result<()> {
     use intercat_daemon::backup_choices::Choice;
-    let (root, journal, receipt, _, copy) = referenced_fixture().await?;
+    let (root, journal, receipt, _, copy) = referenced_fixture(false).await?;
     let data = root.path().join("restored");
     let project = root.path().join("project");
     fs::write(
@@ -1750,7 +1799,7 @@ class Handler(BaseHTTPRequestHandler):
   body=json.dumps(value).encode();self.send_response(200);self.send_header('X-Intercat-Inference','started');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
  def do_GET(self):self.respond({'accepting':True,'modelLoaded':True})
  def do_POST(self):
-  self.rfile.read(int(self.headers['Content-Length']));self.respond({'stages':{'decision':{'selected':' A'}},'inferenceMs':1})
+  self.rfile.read(int(self.headers['Content-Length']));self.respond({'cachePrefix':False,'stages':{'decision':{'selected':' A'}},'inferenceMs':1})
 server=ThreadingHTTPServer(('127.0.0.1',0),Handler);print(json.dumps({'host':'127.0.0.1','port':server.server_port}),flush=True);server.serve_forever()
 "#,
     )?;
@@ -1790,7 +1839,7 @@ server=ThreadingHTTPServer(('127.0.0.1',0),Handler);print(json.dumps({'host':'12
                     let structured=serde_json::from_str::<Value>(&approval.subject).ok();
                     let command=structured.as_ref().and_then(|v|v["command"].as_str()).unwrap_or(&approval.subject);
                     if !approval.can_allow || !allowed.contains(&command) { return Err(format!("Unexpected fixture approval: {}",approval.subject).into()); }
-                    runtime.service.answer(Uuid::now_v7(),"track",approval.id,approval.requirement,true).await?;
+                    runtime.service.answer(Uuid::now_v7(),"track",approval.id,approval.requirement,intercat_daemon::approval::Response::Allow).await?;
                 }
             }
             if worker["output"]
@@ -1852,7 +1901,7 @@ server=ThreadingHTTPServer(('127.0.0.1',0),Handler);print(json.dumps({'host':'12
 async fn interrupted_snapshot_preparation_can_be_cancelled_without_retiring_history() -> Result<()>
 {
     use intercat_daemon::backup_choices::Choice;
-    let (root, journal, receipt, _, _) = referenced_fixture().await?;
+    let (root, journal, receipt, _, _) = referenced_fixture(false).await?;
     let data = root.path().join("restored");
     let project = root.path().join("project");
     let index = fs::read(project.join(".git/index"))?;

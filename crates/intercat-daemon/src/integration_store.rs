@@ -25,7 +25,13 @@ pub(crate) fn read(db: &Connection, id: Uuid) -> Result<Job> {
         [id.to_string()],
         |row| row.get(0),
     )?;
-    Ok(serde_json::from_str(&record)?)
+    let mut job: Job = serde_json::from_str(&record)?;
+    job.order_review = crate::integration_order::read(db, id, job.revision)?;
+    job.assumptions = crate::integration_assumptions::read(db, id)?;
+    job.assumptions_changed = !crate::integration_assumptions::current(db, &job)?;
+    (job.assumptions_pending, job.assumptions_failed) =
+        crate::integration_assumptions::unfinished(db, &job)?;
+    Ok(job)
 }
 fn setting(db: &Connection, key: &str) -> Result<Value> {
     let value: String = db.query_row("SELECT value FROM settings WHERE key=?1", [key], |row| {
@@ -150,7 +156,16 @@ fn capture(
     if tracks.is_empty() {
         return Err("No prepared tracks are available.".into());
     }
-    Ok(Job {
+    if let Some(previous) = previous {
+        tracks.sort_by_key(|track| {
+            previous
+                .tracks
+                .iter()
+                .position(|old| old.id == track.id)
+                .unwrap_or(usize::MAX)
+        });
+    }
+    let mut job = Job {
         id,
         revision: previous.map_or(1, |p| p.revision + 1),
         status: Status::Preparing,
@@ -167,7 +182,14 @@ fn capture(
         publication: None,
         kept_secrets: Default::default(),
         contributions: Default::default(),
-    })
+        assumptions: Vec::new(),
+        assumptions_changed: false,
+        assumptions_pending: 0,
+        assumptions_failed: 0,
+        order_review: None,
+    };
+    crate::integration_assumptions::capture(db, &mut job)?;
+    Ok(job)
 }
 fn editable(job: &Job, revision: u64) -> Result<()> {
     if job.revision != revision {
@@ -188,9 +210,32 @@ fn editable(job: &Job, revision: u64) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn command(db: &mut Connection, command: &Command) -> Result<Job> {
+pub(crate) fn command(
+    db: &mut Connection,
+    command: &Command,
+    captured: Option<crate::candidate::Settings>,
+) -> Result<Job> {
+    let replay: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1)",
+        [command.op_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if !replay && matches!(command.action, Action::Recheck { .. }) != captured.is_some() {
+        return Err("Re-check requires freshly captured settings.".into());
+    }
     let tx = db.transaction()?;
     let job = command_in(&tx, command)?;
+    if let Some(captured) = captured {
+        // A lost acknowledgement retains the settings from the first application.
+        tx.execute(
+            "INSERT OR IGNORE INTO integration_settings VALUES(?1,?2,?3)",
+            params![
+                job.id.to_string(),
+                i64::try_from(job.revision)?,
+                serde_json::to_string(&captured)?
+            ],
+        )?;
+    }
     tx.commit()?;
     Ok(job)
 }
@@ -226,7 +271,7 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
             "A repair Run owns this candidate. Stop and discard it before changing the job.".into(),
         );
     }
-    let job = match &command.action {
+    let mut job = match &command.action {
         Action::Open { tracks } => {
             let session = setting(tx, "session")?;
             let active: Option<String> = tx
@@ -237,7 +282,22 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
                 )
                 .optional()?;
             match active {
-                Some(id) => read(tx, Uuid::parse_str(&id)?)?,
+                Some(id) => {
+                    let job = read(tx, Uuid::parse_str(&id)?)?;
+                    if let Some(selected) = tracks {
+                        let requested: std::collections::BTreeSet<_> = selected.iter().collect();
+                        let included: std::collections::BTreeSet<_> = job
+                            .tracks
+                            .iter()
+                            .filter(|track| track.included)
+                            .map(|track| &track.id)
+                            .collect();
+                        if requested.len() != selected.len() || requested != included {
+                            return Err("A saved Commit review contains different tracks. Finish or discard it before opening this group.".into());
+                        }
+                    }
+                    job
+                }
                 None => capture(
                     tx,
                     Uuid::new_v5(&command.op_id, b"integration"),
@@ -249,6 +309,7 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
         Action::Refresh { id, revision } => {
             let old = read(tx, *id)?;
             editable(&old, *revision)?;
+            crate::integration_assumptions::discard_changes(tx, &old)?;
             capture(tx, *id, Some(&old), None)?
         }
         Action::Select {
@@ -282,11 +343,41 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
             // or excluding a row is not an implicit Refresh.
             job
         }
+        Action::Order {
+            id,
+            revision,
+            tracks,
+        } => {
+            let mut job = read(tx, *id)?;
+            editable(&job, *revision)?;
+            crate::integration_order::confirm(tx, &mut job, tracks)?;
+            copy_settings(tx, *id, *revision, job.revision, None)?;
+            job
+        }
         Action::Discard { id, revision } => {
             let mut job = read(tx, *id)?;
             editable(&job, *revision)?;
             job.revision += 1;
+            crate::integration_assumptions::discard_changes(tx, &job)?;
             job.status = Status::Discarded;
+            job
+        }
+        Action::Recheck { id, revision } => {
+            let mut job = read(tx, *id)?;
+            editable(&job, *revision)?;
+            if job
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.tree.as_ref())
+                .is_none()
+            {
+                return Err("Resolve the candidate before re-checking.".into());
+            }
+            job.revision += 1;
+            job.status = Status::Building;
+            job.candidate = None;
+            job.kept_secrets.clear();
+            job.error = None;
             job
         }
         Action::Prepare { id, revision } => {
@@ -379,6 +470,35 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
             job.error = None;
             job
         }
+        Action::RetryAssumptions { id, revision } => {
+            let mut job = read(tx, *id)?;
+            editable(&job, *revision)?;
+            crate::integration_assumptions::retry(tx, &job)?;
+            job.revision += 1;
+            copy_settings(tx, *id, *revision, job.revision, None)?;
+            if let Some(candidate) = &mut job.candidate {
+                candidate.revision = job.revision;
+            }
+            job
+        }
+        Action::KeepAssumption {
+            id,
+            revision,
+            assumption,
+        } => {
+            let mut job = read(tx, *id)?;
+            editable(&job, *revision)?;
+            if job.status != Status::Checked {
+                return Err("Wait for the candidate to finish checking.".into());
+            }
+            crate::integration_assumptions::keep(tx, &mut job, Some(&assumption.to_string()))?;
+            job.revision += 1;
+            copy_settings(tx, *id, *revision, job.revision, None)?;
+            // The checked message already contains the choices the Commit button accepts.
+            // Keeping one explicitly does not change that message or its candidate tree.
+            job.candidate.as_mut().unwrap().revision = job.revision;
+            job
+        }
         Action::KeepSecret {
             id,
             revision,
@@ -443,6 +563,7 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
             {
                 return Err("The sheet changed · review again".into());
             }
+            crate::integration_assumptions::keep(tx, &mut job, None)?;
             let publication = crate::publication::intent(
                 &job,
                 Uuid::new_v5(&command.op_id, b"integration.publish"),
@@ -472,6 +593,10 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
             job
         }
     };
+    job.order_review = crate::integration_order::read(tx, job.id, job.revision)?;
+    job.assumptions_changed = !crate::integration_assumptions::current(tx, &job)?;
+    (job.assumptions_pending, job.assumptions_failed) =
+        crate::integration_assumptions::unfinished(tx, &job)?;
     save(tx, &job)?;
     let payload = json!({"request":request,"job":job.id});
     tx.execute(
@@ -489,7 +614,10 @@ pub(crate) fn pending_publications(db: &Connection) -> Result<Vec<Job>> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     records
         .into_iter()
-        .map(|record| Ok(serde_json::from_str(&record)?))
+        .map(|record| {
+            let job: Job = serde_json::from_str(&record)?;
+            read(db, job.id)
+        })
         .collect()
 }
 pub(crate) fn published(
@@ -517,6 +645,28 @@ pub(crate) fn published(
                     .find(|track| track.id == commit.track)
                     .ok_or("Missing committed track.")?;
                 tx.execute("INSERT INTO integration_counts VALUES(?1,?2) ON CONFLICT(track) DO UPDATE SET count=excluded.count",params![track.id,i64::try_from(track.integration_count.checked_add(1).ok_or("Integration count overflow.")?)?])?;
+            }
+            for track in &job.tracks {
+                if job.candidate.as_ref().is_some_and(|candidate| {
+                    candidate
+                        .commits
+                        .iter()
+                        .any(|commit| commit.track == track.id)
+                }) {
+                    crate::editor_log::record(
+                        &tx,
+                        crate::editor_log::Note {
+                            source: &format!("commit/{}/{}", operation, track.id),
+                            track: Some(&track.id),
+                            scene: "commit",
+                            input: None,
+                            title: "Committed",
+                            line: "Committed. Push when you like.",
+                            detail: "The selected changes were committed to the session branch. Nothing was pushed by this action.",
+                            persistent: false,
+                        },
+                    )?;
+                }
             }
             job.status = Status::Done;
             job.error = None;
@@ -782,7 +932,8 @@ pub(crate) fn snapshot(db: &Connection) -> Result<Value> {
     let Some(record) = record else {
         return Ok(Value::Null);
     };
-    let job: Job = serde_json::from_str(&record)?;
+    let saved: Job = serde_json::from_str(&record)?;
+    let job = read(db, saved.id)?;
     if job.status == Status::Discarded {
         return Ok(Value::Null);
     }
@@ -790,7 +941,13 @@ pub(crate) fn snapshot(db: &Connection) -> Result<Value> {
     for track in &job.tracks {
         finished += checkpoint_count(db, &track.id)?.saturating_sub(track.checkpoint_count);
     }
-    let mut value = serde_json::to_value(job)?;
+    let mut value = crate::integration::project(&job)?;
     value["finishedSinceOpen"] = finished.into();
+    let captured = settings(db, job.id, job.revision)?;
+    let environment_revision = captured
+        .and_then(|settings| settings.environment)
+        .map_or(0, |environment| environment.selection.revision);
+    value["settingsChanged"] =
+        (environment_revision != crate::check_environment::selection(db)?.revision).into();
     Ok(value)
 }

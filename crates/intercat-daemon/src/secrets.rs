@@ -114,12 +114,21 @@ impl Catalog {
 }
 
 pub fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
+    valid_environment_name(name)
         && name.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
         && name
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+pub fn valid_environment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         && ![
             "PATH",
             "HOME",

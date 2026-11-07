@@ -18,18 +18,21 @@ class DecisionRequest:
     tail: str
     stages: tuple[Stage, ...]
     temperature: float
+    cache_prefix: bool
 
     @classmethod
     def parse(cls, value: dict) -> "DecisionRequest":
         if not isinstance(value, dict):
             raise ValueError("request must be an object")
-        if value.keys() - {"prefix", "tail", "stages", "temperature"}:
+        if value.keys() - {"prefix", "tail", "stages", "temperature", "cachePrefix"}:
             raise ValueError("unknown request field")
+        if not isinstance(value.get("cachePrefix"), bool):
+            raise ValueError("cachePrefix must be an explicit boolean")
         if not isinstance(value.get("prefix"), str) or not isinstance(value.get("tail"), str):
             raise ValueError("prefix and tail must be strings")
         raw_stages = value.get("stages")
-        if not isinstance(raw_stages, list) or not 1 <= len(raw_stages) <= 8:
-            raise ValueError("stages must contain 1–8 entries")
+        if not isinstance(raw_stages, list) or not 1 <= len(raw_stages) <= 301:
+            raise ValueError("stages must contain 1–301 entries")
         stages = []
         known = {}
         for raw in raw_stages:
@@ -57,7 +60,7 @@ class DecisionRequest:
         temperature = value.get("temperature", 1.0)
         if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be positive and finite")
-        return cls(value["prefix"], value["tail"], tuple(stages), float(temperature))
+        return cls(value["prefix"], value["tail"], tuple(stages), float(temperature), value["cachePrefix"])
 
 
 def distribution(logprobs: list[float], temperature: float) -> list[float]:

@@ -73,6 +73,7 @@ pub fn record(db: &mut Connection, track: &str, session: &str, source: i64) -> R
     // Validate the complete splice before committing its source reference.
     let local = crate::reconcile_store::local(&tx, session)?;
     crate::timeline::project_snapshot(&tx, track, session, &local.view, &at)?;
+    crate::session_parameters::from_view(&tx, session, &local.view)?;
     tx.commit()?;
     Ok(())
 }
@@ -126,6 +127,7 @@ pub fn opening(
     }
     let local = crate::reconcile_store::local(&tx, session)?;
     crate::timeline::project_snapshot(&tx, track, session, &local.view, &at)?;
+    crate::session_parameters::from_view(&tx, session, &local.view)?;
     tx.commit()?;
     Ok(true)
 }

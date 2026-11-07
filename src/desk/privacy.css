@@ -1,0 +1,6 @@
+.privacy-value{display:inline;padding:1px 3px;margin:0 1px;border:1px solid #65758b;border-radius:3px;background:#2a3545;color:#d5e2f5;font:inherit;cursor:help;overflow-wrap:anywhere}
+.privacy-value:focus-visible{outline:2px solid #a5c5f5;outline-offset:2px}
+.privacy-original{position:fixed;inset:auto;margin:0;box-sizing:border-box;max-width:min(36rem,calc(100vw - 16px));max-height:min(20rem,calc(100dvh - 16px));padding:10px 12px;border:1px solid #6c7787;border-radius:5px;background:#202a38;color:#f0f4fa;font:12px/1.5 'JetBrains Mono',monospace;white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;user-select:none;box-shadow:0 8px 28px #0008}
+.privacy-copy-row{display:flex;align-items:center;justify-content:flex-end;gap:10px;margin-top:10px;white-space:normal;font:12px/1.4 Inter,sans-serif;user-select:none}
+.privacy-copy-row button,.privacy-pending button{padding:4px 7px;border:1px solid #465368;border-radius:4px;background:#283244;color:#dce6f7;font:inherit}
+.privacy-pending{color:#aab5c4;font-size:12px;white-space:normal}.privacy-pending button{margin-left:8px}

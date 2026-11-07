@@ -238,6 +238,7 @@ pub fn apply(
                 // duplicating its payload or replaying effects. The reference
                 // and cursor advance commit together, including across a crash.
                 tx.execute("INSERT INTO events(ts,mono,boot,position,track_id,session_id,kind,payload,source_seq) VALUES(?1,?2,?3,?4,?5,?6,'msp.replayed',?7,?8)",params![at.epoch_ms,at.mono_ms,at.boot_id,at.timeline_ms,track,session,json!({"appliedSequence":applied}).to_string(),raw])?;
+                crate::session_parameters::replay(&tx, session, applied)?;
                 tx.execute(
                     "UPDATE msp_positions SET cursor=?2 WHERE session=?1",
                     params![session, position],
@@ -255,6 +256,7 @@ pub fn apply(
     }
     tx.execute("INSERT INTO events(ts,mono,boot,position,track_id,session_id,kind,payload,source_seq) VALUES(?1,?2,?3,?4,?5,?6,'msp.applied',?7,?8)",params![at.epoch_ms,at.mono_ms,at.boot_id,at.timeline_ms,track,session,serde_json::to_string(frame)?,raw])?;
     let sequence = tx.last_insert_rowid();
+    crate::session_parameters::observe(&tx, session, frame)?;
     crate::attachment_history::observe(&tx, session, frame)?;
     crate::timeline::fold(&tx, track, session, at, frame)?;
     crate::effects::fold(&tx, session, at.epoch_ms, frame)?;

@@ -72,7 +72,7 @@ class Handler(BaseHTTPRequestHandler):
   self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
  def do_POST(self):
   self.rfile.read(int(self.headers['Content-Length']))
-  body=b'{"stages":{},"inferenceMs":0}'
+  body=b'{"stages":{},"inferenceMs":0,"cachePrefix":false}'
   self.send_response(200);self.send_header('X-Intercat-Inference','started');self.end_headers();self.wfile.write(body)
 server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
 print(json.dumps({'host':'127.0.0.1','port':server.server_port}),flush=True)
@@ -162,7 +162,7 @@ server.serve_forever()
                 identity = (approval['id'], json.dumps(approval['requirement'], sort_keys=True))
                 if identity in answered: continue
                 allowed = approval['subject'] == fixture['command'] and approval['canAllow']
-                call('worker.answer', {'opId': command_id(), 'trackId': fixture['track'], 'approvalId': approval['id'], 'requirement': approval['requirement'], 'allow': allowed})
+                call('worker.answer', {'opId': command_id(), 'trackId': fixture['track'], 'approvalId': approval['id'], 'requirement': approval['requirement'], 'response': {'action': 'allow' if allowed else 'deny'}})
                 answered.add(identity)
             file = workspace / 'rpc-result.json'
             if file.exists() and worker.get('checkpoint') and not worker.get('checkpointPending'):

@@ -1,3 +1,4 @@
+import { mockDrafts } from './support/drafts';
 import { closeWindow } from './support/close';
 import { _electron as electron, expect, test, type ElectronApplication } from '@playwright/test';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
@@ -8,6 +9,7 @@ let data: string;
 test.beforeEach(async () => {
   data = await mkdtemp('/private/tmp/ic-editor-ui-');
   app = await electron.launch({ args: ['.', '--preview', `--user-data-dir=${data}`] });
+  await mockDrafts(app);
   await app.firstWindow();
 });
 test.afterEach(async () => { await closeWindow(app); await rm(data, { recursive: true, force: true }); });
@@ -73,11 +75,13 @@ test('first installation explains the local model download before starting it', 
   await expect(editor).toContainText('Downloading Editor');
 });
 
-test('approval answers and the Stop shortcut remain available while the Editor is unavailable', async () => {
+test('approval answers and the Stop shortcut remain available while Full privacy waits for the Editor', async () => {
   const page = await fixture('unavailable');
   await app.evaluate(({ ipcMain }) => {
     const memory = globalThis as typeof globalThis & { editorState: { sequence: number; tracks: unknown[]; workers: unknown[] }; workerActions: string[] };
     memory.workerActions = [];
+    Object.assign(memory.editorState, { privacy: { mode: 'full', revision: 1 }, privacyRevision: 1 });
+    ipcMain.removeHandler('intercat:privacy-preview'); ipcMain.handle('intercat:privacy-preview', () => { throw new Error('Full privacy is waiting for the local Editor.'); });
     memory.editorState.tracks = [{ id: 'a', label: 'A', title: 'A local task', status: 'working' }];
     memory.editorState.workers = [{ trackId: 'a', phase: 'approval', sessionId: 'session', activeTurn: 'turn', detail: null, prompts: [], checkpoint: null, checkpointPending: false, output: null, approvals: [{ id: 'approval', requirement: {}, subject: 'node local-test.cjs', reason: { kind: 'shell', message: 'Run a local test' }, canAllow: true, canDeny: true }] }];
     memory.editorState.sequence++;
@@ -85,7 +89,9 @@ test('approval answers and the Stop shortcut remain available while the Editor i
     ipcMain.removeHandler('intercat:worker-stop'); ipcMain.handle('intercat:worker-stop', () => { memory.workerActions.push('stop'); });
   });
   await page.getByRole('button', { name: 'Allow once', exact: true }).click();
-  await page.getByRole('region', { name: 'Local Editor' }).getByRole('button', { name: 'Details', exact: true }).click();
+  const details = page.getByRole('region', { name: 'Local Editor' }).getByRole('button', { name: 'Details', exact: true });
+  if (!await details.isVisible()) await page.getByRole('button', { name: /^\+\d+ more/ }).click();
+  await details.click();
   await page.getByRole('dialog', { name: 'Editor details' }).press('Meta+.');
   await expect.poll(() => app.evaluate(() => (globalThis as typeof globalThis & { workerActions: string[] }).workerActions)).toEqual(['answer', 'stop']);
 });

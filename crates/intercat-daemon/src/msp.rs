@@ -39,31 +39,45 @@ impl std::error::Error for StartCancelled {}
 
 /// Stop generations are checked again by the writer, after queueing delays.
 #[derive(Clone, Debug)]
-pub struct StartGuard {
-    generation: Arc<AtomicU64>,
-    expected: u64,
-    paused: Arc<crate::dispatch_control::Gate>,
-    pause_epoch: u64,
+pub enum StartGuard {
+    Worker {
+        generation: Arc<AtomicU64>,
+        expected: u64,
+        paused: Arc<crate::dispatch_control::Gate>,
+        pause_epoch: u64,
+    },
+    Stopped(Arc<AtomicBool>),
+    Shutdown(tokio::sync::watch::Receiver<bool>),
 }
 impl StartGuard {
     pub fn new(generation: Arc<AtomicU64>, paused: Arc<crate::dispatch_control::Gate>) -> Self {
-        let expected = generation.load(Ordering::Acquire);
-        let pause_epoch = paused.epoch();
-        Self {
+        Self::Worker {
+            expected: generation.load(Ordering::Acquire),
+            pause_epoch: paused.epoch(),
             generation,
-            expected,
             paused,
-            pause_epoch,
         }
     }
     fn current(&self) -> bool {
-        self.generation.load(Ordering::Acquire) == self.expected
-            && !self.paused.paused()
-            && self.paused.epoch() == self.pause_epoch
+        match self {
+            Self::Worker {
+                generation,
+                expected,
+                paused,
+                pause_epoch,
+            } => {
+                generation.load(Ordering::Acquire) == *expected
+                    && !paused.paused()
+                    && paused.epoch() == *pause_epoch
+            }
+            Self::Stopped(stopped) => !stopped.load(Ordering::Acquire),
+            Self::Shutdown(stopping) => !*stopping.borrow() && stopping.has_changed().is_ok(),
+        }
     }
 }
 type Reply = oneshot::Sender<Result<Value>>;
 struct PendingReply {
+    screening: Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
     sender: Option<Reply>,
     history: bool,
     cancelled: Option<oneshot::Sender<()>>,
@@ -113,6 +127,8 @@ pub struct Connection {
     events: mpsc::UnboundedReceiver<Event>,
     buffered: VecDeque<Event>,
     tasks: Vec<JoinHandle<()>>,
+    #[cfg(test)]
+    pub(crate) hide_approval_feedback: bool,
 }
 
 pub(crate) struct PendingRequest {
@@ -187,13 +203,17 @@ impl Connection {
                 let Some(frame) = frame else {
                     break;
                 };
-                let frame = match frame {
-                    Outgoing::Frame(frame) => frame,
+                let (frame, _screening) = match frame {
+                    Outgoing::Frame(frame) => (frame, None),
                     Outgoing::Start { frame, guard } => {
-                        let pending = frame["id"]
-                            .as_u64()
-                            .is_some_and(|id| writer_pending.lock().unwrap().contains_key(&id));
-                        if !guard.current() || !pending {
+                        let screening = frame["id"].as_u64().and_then(|id| {
+                            writer_pending
+                                .lock()
+                                .unwrap()
+                                .get_mut(&id)
+                                .and_then(|reply| reply.screening.take())
+                        });
+                        if !guard.current() || screening.is_none() {
                             let reply = frame["id"]
                                 .as_u64()
                                 .and_then(|id| writer_pending.lock().unwrap().remove(&id));
@@ -207,7 +227,7 @@ impl Connection {
                             }
                             continue;
                         }
-                        frame
+                        (frame, screening)
                     }
                     Outgoing::Flushed(reply) => {
                         let result = write.flush().await;
@@ -465,6 +485,8 @@ impl Connection {
             events,
             buffered: VecDeque::new(),
             tasks: vec![reader, writer, preview],
+            #[cfg(test)]
+            hide_approval_feedback: false,
         }
     }
 
@@ -481,16 +503,36 @@ impl Connection {
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
-        if let Some(event) = self.buffered.pop_front() {
-            return Some(event);
-        }
-        self.events.recv().await
+        let event = match self.buffered.pop_front() {
+            Some(event) => event,
+            None => self.events.recv().await?,
+        };
+        #[cfg(test)]
+        let event = self.test_capabilities(event);
+        Some(event)
     }
     pub fn try_next_event(&mut self) -> std::result::Result<Event, mpsc::error::TryRecvError> {
-        self.buffered
+        let event = self
+            .buffered
             .pop_front()
             .map(Ok)
-            .unwrap_or_else(|| self.events.try_recv())
+            .unwrap_or_else(|| self.events.try_recv());
+        #[cfg(test)]
+        let event = event.map(|event| self.test_capabilities(event));
+        event
+    }
+    #[cfg(test)]
+    fn test_capabilities(&self, mut event: Event) -> Event {
+        if self.hide_approval_feedback
+            && let Event::Frame(received) = &mut event
+            && let Some(choices) = received.frame["params"]["availableChoices"].as_array_mut()
+        {
+            for choice in choices {
+                choice.as_object_mut().unwrap().remove("acceptsFeedback");
+            }
+            received.recorded_display = None;
+        }
+        event
     }
     pub(crate) fn restore_events(&mut self, events: Vec<Event>) {
         for event in events.into_iter().rev() {
@@ -576,20 +618,28 @@ impl Client {
     }
     /// The receive loop consumes and records this reply in physical order.
     pub(crate) async fn query(&self, method: &str, params: Value) -> Result<PendingRequest> {
+        if method == "turn/start" {
+            return Err("Turn starts require a screened request.".into());
+        }
         self.query_guarded(method, params, None).await
     }
     pub(crate) async fn query_start(
         &self,
-        params: Value,
+        prepared: crate::screening::Command,
         guard: StartGuard,
     ) -> Result<PendingRequest> {
-        self.query_guarded("turn/start", params, Some(guard)).await
+        self.query_guarded(
+            "turn/start",
+            prepared.params,
+            Some((guard, prepared.permit)),
+        )
+        .await
     }
     async fn query_guarded(
         &self,
         method: &str,
         params: Value,
-        guard: Option<StartGuard>,
+        guard: Option<(StartGuard, Arc<tokio::sync::OwnedRwLockReadGuard<()>>)>,
     ) -> Result<PendingRequest> {
         if self.is_closed() {
             return Err(ConnectionLost("MSP connection closed".into()).into());
@@ -600,6 +650,7 @@ impl Client {
         self.pending.lock().unwrap().insert(
             id,
             PendingReply {
+                screening: guard.as_ref().map(|(_, permit)| permit.clone()),
                 sender: None,
                 history: matches!(method, "session/read" | "session/resume" | "session/fork"),
                 cancelled: Some(cancelled),
@@ -617,7 +668,7 @@ impl Client {
         };
         let frame = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
         let outgoing = match guard {
-            Some(guard) => Outgoing::Start { frame, guard },
+            Some((guard, _permit)) => Outgoing::Start { frame, guard },
             None => Outgoing::Frame(frame),
         };
         sender.send(outgoing).await?;
@@ -639,6 +690,9 @@ impl Client {
         self.control_now("turn/interrupt", params)
     }
     pub fn control_now(&self, method: &str, params: Value) -> Result<()> {
+        if method == "turn/start" {
+            return Err("Turn starts require a screened request.".into());
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.priority.try_send(Outgoing::Frame(
             json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
@@ -646,6 +700,9 @@ impl Client {
         Ok(())
     }
     pub fn notify_now(&self, method: &str, params: Value) -> Result<()> {
+        if method == "turn/start" {
+            return Err("Turn starts require a screened request.".into());
+        }
         self.priority.try_send(Outgoing::Frame(
             json!({"jsonrpc":"2.0","method":method,"params":params}),
         ))?;
@@ -677,17 +734,32 @@ impl Client {
         Ok(())
     }
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        if method == "turn/start" {
+            return Err("Turn starts require a screened request.".into());
+        }
         self.request_guarded(method, params, None).await
     }
-    pub(crate) async fn start(&self, params: Value, guard: StartGuard) -> Result<Value> {
-        self.request_guarded("turn/start", params, Some(guard))
-            .await
+    pub async fn decide(&self, prepared: crate::screening::Command) -> Result<Value> {
+        let _permit = prepared.permit;
+        self.request("approval/decide", prepared.params).await
+    }
+    pub async fn start(
+        &self,
+        prepared: crate::screening::Command,
+        guard: StartGuard,
+    ) -> Result<Value> {
+        self.request_guarded(
+            "turn/start",
+            prepared.params,
+            Some((guard, prepared.permit)),
+        )
+        .await
     }
     async fn request_guarded(
         &self,
         method: &str,
         params: Value,
-        guard: Option<StartGuard>,
+        guard: Option<(StartGuard, Arc<tokio::sync::OwnedRwLockReadGuard<()>>)>,
     ) -> Result<Value> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(ConnectionLost("MSP connection closed".into()).into());
@@ -698,6 +770,7 @@ impl Client {
         self.pending.lock().unwrap().insert(
             id,
             PendingReply {
+                screening: guard.as_ref().map(|(_, permit)| permit.clone()),
                 sender: Some(send),
                 history: matches!(method, "session/read" | "session/resume" | "session/fork"),
                 cancelled: None,
@@ -724,7 +797,7 @@ impl Client {
             &self.normal
         };
         let outgoing = match guard {
-            Some(guard) => Outgoing::Start { frame, guard },
+            Some((guard, _permit)) => Outgoing::Start { frame, guard },
             None => Outgoing::Frame(frame),
         };
         if let Err(error) = sender.send(outgoing).await {
@@ -740,6 +813,9 @@ impl Client {
         }
     }
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
+        if method == "turn/start" {
+            return Err("Turn starts require a screened request.".into());
+        }
         if self.closed.load(Ordering::SeqCst) {
             return Err(ConnectionLost("MSP connection closed".into()).into());
         }
@@ -802,6 +878,13 @@ impl Client {
 mod tests {
     use super::*;
 
+    async fn screened(params: Value) -> crate::screening::Command {
+        crate::screening::Command {
+            params,
+            permit: Arc::new(Arc::new(tokio::sync::RwLock::new(())).read_owned().await),
+        }
+    }
+
     #[tokio::test]
     async fn a_stop_cancels_queued_starts_but_keeps_the_connection_usable() {
         queued_starts_cancel(false).await;
@@ -827,7 +910,10 @@ mod tests {
         let client = connection.client.clone();
         let old = tokio::spawn(async move {
             client
-                .start(json!({"sessionId":"session","commandId":"old"}), guard)
+                .start(
+                    screened(json!({"sessionId":"session","commandId":"old"})).await,
+                    guard,
+                )
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -849,7 +935,7 @@ mod tests {
         let fresh = tokio::spawn(async move {
             client
                 .start(
-                    json!({"sessionId":"session","commandId":"new"}),
+                    screened(json!({"sessionId":"session","commandId":"new"})).await,
                     StartGuard::new(generation, paused),
                 )
                 .await
@@ -894,7 +980,10 @@ mod tests {
         generation.fetch_add(1, Ordering::AcqRel);
         let mut request = connection
             .client
-            .query_start(json!({"sessionId":"session","commandId":"old"}), guard)
+            .query_start(
+                screened(json!({"sessionId":"session","commandId":"old"})).await,
+                guard,
+            )
             .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), request.cancelled())
@@ -905,7 +994,7 @@ mod tests {
         let abandoned = connection
             .client
             .query_start(
-                json!({"sessionId":"session","commandId":"abandoned"}),
+                screened(json!({"sessionId":"session","commandId":"abandoned"})).await,
                 StartGuard::new(
                     generation,
                     std::sync::Arc::new(crate::dispatch_control::Gate::new(false)),
@@ -1048,7 +1137,18 @@ mod tests {
             let (read, mut host_write) = tokio::io::duplex(65536);
             let (host_read, write) = tokio::io::duplex(4096);
             let mut connection = Connection::new(read, write);
-            let request = connection.client.query(method, json!({})).await.unwrap();
+            let request = if method == "turn/start" {
+                connection
+                    .client
+                    .query_start(
+                        screened(json!({})).await,
+                        StartGuard::Stopped(Arc::new(AtomicBool::new(false))),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                connection.client.query(method, json!({})).await.unwrap()
+            };
             let id = request.id;
             let mut request = Some(request);
             let mut host_read = BufReader::new(host_read);
@@ -1150,7 +1250,10 @@ mod tests {
         let client = connection.client.clone();
         let request = tokio::spawn(async move {
             client
-                .request("turn/start", json!({"commandId":"one"}))
+                .start(
+                    screened(json!({"commandId":"one"})).await,
+                    StartGuard::Stopped(Arc::new(AtomicBool::new(false))),
+                )
                 .await
         });
         let mut input = BufReader::new(input);

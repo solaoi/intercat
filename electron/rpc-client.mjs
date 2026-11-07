@@ -43,7 +43,8 @@ export class RpcClient {
     const frame = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
     if (Buffer.byteLength(frame) > 512 * 1024) return Promise.reject(new Error('RPC request exceeds limit'));
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.#pending.delete(id); reject(new Error('RPC timed out; operation outcome may be unknown')); }, 15000);
+      const timeout = method === 'attachment.paste' || method === 'attachment.paste.refresh' ? 45000 : method === 'privacy.preview' ? 60000 : 15000;
+      const timer = setTimeout(() => { this.#pending.delete(id); reject(new Error('RPC timed out; operation outcome may be unknown')); }, timeout);
       this.#pending.set(id, { resolve, reject, timer });
       this.#socket.write(frame);
     });

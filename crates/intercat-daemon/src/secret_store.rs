@@ -216,7 +216,13 @@ pub fn read(db: &Connection, track: &str, session: &str) -> Result<Vec<Fingerpri
     )? {
         return Err("The secret fingerprints belong to another track.".into());
     }
-    let mut query=db.prepare("SELECT name,byte_len,tag FROM secret_fingerprints WHERE session=?1 ORDER BY name,byte_len,tag")?;
+    fingerprints(db, Some(session))
+}
+pub(crate) fn all(db: &Connection) -> Result<Vec<Fingerprint>> {
+    fingerprints(db, None)
+}
+fn fingerprints(db: &Connection, session: Option<&str>) -> Result<Vec<Fingerprint>> {
+    let mut query=db.prepare("SELECT name,byte_len,tag FROM secret_fingerprints WHERE (?1 IS NULL OR session=?1) ORDER BY name,byte_len,tag")?;
     let rows = query.query_map([session], |row| {
         Ok((
             row.get::<_, String>(0)?,

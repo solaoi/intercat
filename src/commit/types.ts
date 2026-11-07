@@ -1,4 +1,4 @@
-import type { Project } from '../bridge';
+import type { Assumption, Project } from '../bridge';
 
 export interface Change { path: string; before: { object: string; mode: number } | null; after: { object: string; mode: number } | null }
 export interface Commit { track: string; sha: string; parent: string; tree: string; message: string; author: string; changes: Change[] }
@@ -10,18 +10,25 @@ export interface Candidate {
   reason: string | null; failedTrack: string | null; hooksSkipped: boolean;
   dependencyRuns: { directory: string; forced: boolean; downloads: number; cacheHits: number }[];
 }
+export type CommitAssumption = Assumption & { included: boolean };
+export interface CommitOrderReview { overlaps: { path: string; tracks: string[] }[]; order: string[]; confirmed: boolean }
 export interface IntegrationJob {
-  id: string; revision: number; status: 'preparing' | 'open' | 'merge-conflict' | 'failed' | 'discarded' | 'building' | 'staging' | 'checked' | 'committing' | 'commit-blocked' | 'done';
+  orderReview?: CommitOrderReview | null;
+  assumptions: CommitAssumption[]; assumptionsChanged: boolean; assumptionsPending: number; assumptionsFailed: number;
+  id: string; revision: number; status: 'preparing' | 'ordering' | 'open' | 'merge-conflict' | 'failed' | 'discarded' | 'building' | 'staging' | 'checked' | 'committing' | 'commit-blocked' | 'done';
   sessionName: string; slug: string; project: Project; error: string | null; candidate: Candidate | null;
   tracks: { id: string; label: string; title: string; included: boolean; checkpointCount: number; lastClip: number | null; checkpoint: { sha: string } | null }[];
   plan: { targetRef: string; tree: string | null; rows: { track: string; state: string; changes: Change[]; conflicts: { path: string; withTracks: string[] }[] }[] } | null;
   messages: Record<string, string>; keptSecrets: string[]; finishedSinceOpen?: number;
-  contributions: Record<string, unknown>;
+  contributions: Record<string, unknown>; settingsChanged?: boolean;
 }
 export type IntegrationAction = { action: 'open'; tracks: string[] | null }
-  | { action: 'refresh' | 'discard' | 'prepare' | 'skipHooks' | 'retryCommit'; id: string; revision: number }
+  | { action: 'order'; id: string; revision: number; tracks: string[] }
+  | { action: 'refresh' | 'discard' | 'prepare' | 'recheck' | 'skipHooks' | 'retryCommit'; id: string; revision: number }
   | { action: 'select'; id: string; revision: number; track: string; included: boolean }
   | { action: 'editMessage'; id: string; revision: number; track: string; message: string }
+  | { action: 'retryAssumptions'; id: string; revision: number }
+  | { action: 'keepAssumption'; id: string; revision: number; assumption: string }
   | { action: 'keepSecret'; id: string; revision: number; finding: string }
   | { action: 'commit'; id: string; revision: number; head: string; tree: string; settingsHash: string };
 export interface IntegrationRequest { opId: string; action: IntegrationAction }

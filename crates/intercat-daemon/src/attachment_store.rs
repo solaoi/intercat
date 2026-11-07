@@ -17,8 +17,14 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 pub const FILE_LIMIT: usize = 25 * 1024 * 1024;
+pub const IMAGE_LIMIT: usize = 10 * 1024 * 1024;
 pub const INPUT_LIMIT: u64 = 100 * 1024 * 1024;
+pub const TEXT_LIMIT: usize = 2 * 1024 * 1024;
+pub(crate) fn digest(bytes: &[u8]) -> String {
+    hex(Sha256::digest(bytes))
+}
 const MAGIC: &[u8; 8] = b"ICATATT1";
+const TEXT_MAGIC: &[u8; 8] = b"ICATTXT1";
 const HEADER_LIMIT: usize = 16384;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -36,9 +42,17 @@ pub(crate) struct Stored {
     pub source: PathBuf,
     pub seal: String,
 }
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TextHeader {
+    stored: Stored,
+    original_length: usize,
+    original_sha256: String,
+}
 pub(crate) struct CopyPlan {
     pub workspace: Workspace,
     pub originals: Vec<Stored>,
+    pub input_ids: Vec<Uuid>,
 }
 pub(crate) fn copy_name(attachment: &Attachment) -> String {
     let extension = Path::new(&attachment.name)
@@ -67,7 +81,7 @@ pub(crate) struct Store {
     pub key: Arc<Key>,
 }
 
-pub(crate) fn save(db: &mut Connection, stored: &Stored) -> Result<()> {
+pub(crate) fn save(db: &mut Connection, stored: &Stored, masked: bool) -> Result<()> {
     db.pragma_update(None, "synchronous", "FULL")?;
     let tx = db.transaction()?;
     let id = stored.attachment.id.to_string();
@@ -100,6 +114,9 @@ pub(crate) fn save(db: &mut Connection, stored: &Stored) -> Result<()> {
             serde_json::to_string(&stored.attachment)?
         ],
     )?;
+    if masked {
+        crate::editor_log::pasted_masked(&tx, &format!("masked-paste/{id}"))?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -188,6 +205,7 @@ pub(crate) fn material(
     Ok(Some(CopyPlan {
         workspace,
         originals: records,
+        input_ids: current_ids,
     }))
 }
 pub(crate) fn frozen(
@@ -206,6 +224,7 @@ pub(crate) fn frozen(
     Ok(Some(CopyPlan {
         workspace,
         originals,
+        input_ids: vec![],
     }))
 }
 pub(crate) fn session(db: &Connection, session: &str, track: &str) -> Result<Option<CopyPlan>> {
@@ -227,6 +246,7 @@ pub(crate) fn session(db: &Connection, session: &str, track: &str) -> Result<Opt
     Ok(Some(CopyPlan {
         workspace,
         originals,
+        input_ids: vec![],
     }))
 }
 
@@ -303,8 +323,8 @@ impl Store {
         let source = std::path::absolute(source)?;
         let destination = self.root.join(id.to_string());
         if fs::symlink_metadata(&destination).is_ok() {
-            let (stored, _) = self.load(id)?;
-            if stored.source != source {
+            let (stored, _, original) = self.contents(id)?;
+            if original.is_some() || stored.source != source {
                 return Err("Attachment operation ID reused for another file.".into());
             }
             return Ok(stored);
@@ -330,6 +350,9 @@ impl Store {
         {
             return Err("The reference file changed while being copied.".into());
         }
+        if bytes.len() > IMAGE_LIMIT && image::guess_format(&bytes).is_ok() {
+            return Err("This image exceeds the 10 MiB reference limit.".into());
+        }
         let name = source
             .file_name()
             .and_then(|s| s.to_str())
@@ -348,22 +371,125 @@ impl Store {
             source,
         };
         let header = serde_json::to_vec(&stored)?;
+        self.persist(stored, MAGIC, header, None, &bytes)
+    }
+    pub(crate) fn read_text_source(source: &Path) -> Result<String> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(source)?;
+        let before = file.metadata()?;
+        if !before.is_file() || before.len() > TEXT_LIMIT as u64 {
+            return Err("Pasted text must be a regular UTF-8 file of at most 2 MiB.".into());
+        }
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(TEXT_LIMIT as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > TEXT_LIMIT
+            || !unchanged(&before, &file.metadata()?)
+            || !unchanged(&before, &fs::symlink_metadata(source)?)
+        {
+            return Err("The pasted text changed while being saved.".into());
+        }
+        Ok(String::from_utf8(bytes)?)
+    }
+    fn text_seal(&self, header: &TextHeader) -> Result<String> {
+        let mut bytes = b"intercat.pasted-text.v1\0".to_vec();
+        bytes.extend(serde_json::to_vec(&(
+            &header.stored.attachment,
+            &header.stored.source,
+            header.original_length,
+            &header.original_sha256,
+        ))?);
+        Ok(hex(self.key.tag(&bytes)))
+    }
+    pub(crate) fn import_text(
+        &self,
+        id: Uuid,
+        source: &Path,
+        original: &str,
+        redacted: &str,
+    ) -> Result<Stored> {
+        if id.get_version_num() != 7 || original.len() > TEXT_LIMIT || redacted.len() > FILE_LIMIT {
+            return Err("Invalid pasted text attachment.".into());
+        }
+        self.directory(true)?;
+        let mut header = TextHeader {
+            stored: Stored {
+                attachment: Attachment {
+                    id,
+                    name: "Pasted reference.txt".into(),
+                    byte_len: redacted.len() as u64,
+                    sha256: hex(Sha256::digest(redacted.as_bytes())),
+                },
+                source: std::path::absolute(source)?,
+                seal: String::new(),
+            },
+            original_length: original.len(),
+            original_sha256: hex(Sha256::digest(original.as_bytes())),
+        };
+        header.stored.seal = self.text_seal(&header)?;
+        let encoded = serde_json::to_vec(&header)?;
+        self.persist(
+            header.stored,
+            TEXT_MAGIC,
+            encoded,
+            Some(original.as_bytes()),
+            redacted.as_bytes(),
+        )
+    }
+    pub(crate) fn screened_copy(&self, original: &Stored, text: &str) -> Result<Stored> {
+        if text.len() > FILE_LIMIT {
+            return Err("The screened reference exceeds the file limit.".into());
+        }
+        let digest = hex(Sha256::digest(text.as_bytes()));
+        let attachment = Attachment {
+            id: Uuid::new_v5(&original.attachment.id, digest.as_bytes()),
+            name: original.attachment.name.clone(),
+            byte_len: text.len() as u64,
+            sha256: digest,
+        };
+        let stored = Stored {
+            seal: self.seal(&attachment, &original.source)?,
+            attachment,
+            source: original.source.clone(),
+        };
+        self.persist(
+            stored.clone(),
+            MAGIC,
+            serde_json::to_vec(&stored)?,
+            None,
+            text.as_bytes(),
+        )
+    }
+    fn persist(
+        &self,
+        stored: Stored,
+        magic: &[u8; 8],
+        header: Vec<u8>,
+        original: Option<&[u8]>,
+        bytes: &[u8],
+    ) -> Result<Stored> {
         if header.len() > HEADER_LIMIT {
             return Err("Attachment metadata exceeds its limit.".into());
         }
         let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
-        temporary.write_all(MAGIC)?;
+        temporary.write_all(magic)?;
         temporary.write_all(&(header.len() as u32).to_be_bytes())?;
         temporary.write_all(&header)?;
-        temporary.write_all(&bytes)?;
+        if let Some(original) = original {
+            temporary.write_all(original)?;
+        }
+        temporary.write_all(bytes)?;
         temporary
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o400))?;
         sync(temporary.as_file())?;
-        match temporary.persist_noclobber(&destination) {
+        match temporary.persist_noclobber(self.root.join(stored.attachment.id.to_string())) {
             Ok(_) => {}
             Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let (current, _) = self.load(id)?;
+                let (current, _) = self.load(stored.attachment.id)?;
                 if current != stored {
                     return Err("Concurrent attachment imports disagree.".into());
                 }
@@ -374,6 +500,22 @@ impl Store {
         Ok(stored)
     }
     pub(crate) fn load(&self, id: Uuid) -> Result<(Stored, Vec<u8>)> {
+        let (stored, bytes, _) = self.contents(id)?;
+        Ok((stored, bytes))
+    }
+    pub(crate) fn text(&self, id: Uuid) -> Result<Option<(Stored, String, String)>> {
+        let (stored, bytes, original) = self.contents(id)?;
+        original
+            .map(|original| {
+                Ok((
+                    stored,
+                    String::from_utf8(original)?,
+                    String::from_utf8(bytes)?,
+                ))
+            })
+            .transpose()
+    }
+    fn contents(&self, id: Uuid) -> Result<(Stored, Vec<u8>, Option<Vec<u8>>)> {
         let directory = self.directory(false)?;
         let name = std::ffi::CString::new(id.to_string())?;
         let fd = unsafe {
@@ -392,13 +534,14 @@ impl Store {
             || before.uid() != unsafe { libc::geteuid() }
             || before.nlink() != 1
             || before.mode() & 0o377 != 0
-            || before.len() > (FILE_LIMIT + HEADER_LIMIT + 12) as u64
+            || before.len() > (FILE_LIMIT + TEXT_LIMIT + HEADER_LIMIT + 12) as u64
         {
             return Err("Invalid private attachment original.".into());
         }
         let mut prefix = [0; 12];
         file.read_exact(&mut prefix)?;
-        if &prefix[..8] != MAGIC {
+        let text = &prefix[..8] == TEXT_MAGIC;
+        if !text && &prefix[..8] != MAGIC {
             return Err("Invalid attachment original format.".into());
         }
         let length = u32::from_be_bytes(prefix[8..].try_into()?) as usize;
@@ -407,8 +550,30 @@ impl Store {
         }
         let mut header = vec![0; length];
         file.read_exact(&mut header)?;
-        let stored: Stored = serde_json::from_slice(&header)?;
-        let seal = self.seal(&stored.attachment, &stored.source)?;
+        let (stored, seal, original) = if text {
+            let header: TextHeader = serde_json::from_slice(&header)?;
+            if header.original_length > TEXT_LIMIT {
+                return Err("The pasted original exceeds 2 MiB.".into());
+            }
+            let seal = self.text_seal(&header)?;
+            if header.stored.attachment.id != id
+                || !bool::from(header.stored.seal.as_bytes().ct_eq(seal.as_bytes()))
+            {
+                return Err("Pasted text ownership verification failed.".into());
+            }
+            let mut original = vec![0; header.original_length];
+            file.read_exact(&mut original)?;
+            if hex(Sha256::digest(&original)) != header.original_sha256
+                || std::str::from_utf8(&original).is_err()
+            {
+                return Err("The pasted original changed.".into());
+            }
+            (header.stored, seal, Some(original))
+        } else {
+            let stored: Stored = serde_json::from_slice(&header)?;
+            let seal = self.seal(&stored.attachment, &stored.source)?;
+            (stored, seal, None)
+        };
         if stored.attachment.id != id || !bool::from(stored.seal.as_bytes().ct_eq(seal.as_bytes()))
         {
             return Err("Attachment ownership verification failed.".into());
@@ -424,15 +589,40 @@ impl Store {
         {
             return Err("The original attachment changed.".into());
         }
-        Ok((stored, bytes))
+        if bytes.len() > IMAGE_LIMIT && image::guess_format(&bytes).is_ok() {
+            return Err("This image exceeds the 10 MiB reference limit.".into());
+        }
+        if text && std::str::from_utf8(&bytes).is_err() {
+            return Err("The redacted text is not UTF-8.".into());
+        }
+        Ok((stored, bytes, original))
     }
     pub(crate) fn materialize(
         &self,
         workspace: &Workspace,
         attachments: &[Stored],
+        screened: &std::collections::BTreeMap<Uuid, Stored>,
+        input_ids: &[Uuid],
     ) -> Result<Vec<Reference>> {
         if attachments.is_empty() {
             return Ok(vec![]);
+        }
+        let total = attachments
+            .iter()
+            .filter(|original| input_ids.contains(&original.attachment.id))
+            .try_fold(0u64, |total, original| {
+                total
+                    .checked_add(
+                        screened
+                            .get(&original.attachment.id)
+                            .unwrap_or(original)
+                            .attachment
+                            .byte_len,
+                    )
+                    .ok_or("The reference sizes overflowed.")
+            })?;
+        if total > INPUT_LIMIT {
+            return Err("The screened references exceed 100 MiB in one request.".into());
         }
         crate::attachments::ensure(
             &workspace.path,
@@ -453,10 +643,16 @@ impl Store {
         let before = folder.metadata()?;
         let mut references = Vec::new();
         for expected in attachments {
-            let (stored, bytes) = self.load(expected.attachment.id)?;
-            if &stored != expected {
+            let (original, _) = self.load(expected.attachment.id)?;
+            if &original != expected {
                 return Err("The recorded attachment differs from its original.".into());
             }
+            let copy = screened.get(&expected.attachment.id).unwrap_or(expected);
+            let (stored, bytes) = self.load(copy.attachment.id)?;
+            if &stored != copy {
+                return Err("The screened attachment differs from its saved copy.".into());
+            }
+            let stored = original;
             let name = std::ffi::CString::new(copy_name(&stored.attachment))?;
             let temporary = std::ffi::CString::new(format!(".copy-{}", Uuid::now_v7()))?;
             let fd = unsafe {

@@ -114,6 +114,7 @@ print('SECRET_BOUNDARY_PROBE_COMPLETE')
     let check = checkout
         .run_check(
             &script,
+            &std::collections::BTreeMap::new(),
             tokio::sync::watch::channel(false).1,
             Duration::from_secs(15),
         )

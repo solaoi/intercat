@@ -30,6 +30,11 @@ pub(crate) fn read(db: &Connection, id: Uuid) -> Result<Run> {
 }
 
 pub(crate) fn save(db: &Connection, run: &Run) -> Result<()> {
+    if run.phase == Phase::Discarded
+        && let crate::repair_run::Purpose::Assumption { id, .. } = run.purpose
+    {
+        crate::integration_assumptions::finish_change(db, run.job_id, id, false)?;
+    }
     db.execute("INSERT INTO repair_runs VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET active=excluded.active,record=excluded.record",
         params![run.id.to_string(), run.job_id.to_string(), run.phase != Phase::Discarded && (run.phase != Phase::Done || run.refresh.as_ref().is_some_and(|r| r.error.is_none())), serde_json::to_string(run)?])?;
     Ok(())
@@ -118,6 +123,9 @@ pub(crate) fn start(db: &mut Connection, request: Request) -> Result<Run> {
         .ok_or("Missing frozen Check settings.")?;
     if job.candidate.as_ref().unwrap().settings_hash != settings.hash()? {
         return Err("The candidate settings changed.".into());
+    }
+    if let crate::repair_run::Purpose::Assumption { id, revision, .. } = &request.purpose {
+        crate::integration_assumptions::begin_change(&tx, &mut job, *id, *revision)?;
     }
     job.revision = job
         .revision
@@ -408,19 +416,27 @@ fn complete_refresh_in(db: &Connection, operation: Uuid, id: Uuid) -> Result<()>
 
 pub(crate) fn followup(db: &mut Connection, request: crate::repair_run::FollowUp) -> Result<Run> {
     let tx = db.transaction()?;
+    let run = followup_in(&tx, request)?;
+    tx.commit()?;
+    Ok(run)
+}
+pub(crate) fn followup_in(
+    tx: &rusqlite::Transaction<'_>,
+    request: crate::repair_run::FollowUp,
+) -> Result<Run> {
     let value = serde_json::to_value(&request)?;
-    if let Some(run) = replay(&tx, request.op_id, "repair.followup", &value)? {
+    if let Some(run) = replay(tx, request.op_id, "repair.followup", &value)? {
         return Ok(run);
     }
     crate::repair_run::validate_instruction(&request.text)?;
-    let mut run = read(&tx, request.id)?;
-    if crate::secret_input_store::repair_pending(&tx, run.id)? {
+    let mut run = read(tx, request.id)?;
+    if crate::secret_input_store::repair_pending(tx, run.id)? {
         return Err(
             "A secret is being prepared. Stop the repair before sending another instruction."
                 .into(),
         );
     }
-    let job = current(&tx, &run)?;
+    let job = current(tx, &run)?;
     if let Some(selection) = &request.selection {
         Run::validate_selection(&job, &run.track, selection)?;
     }
@@ -455,8 +471,7 @@ pub(crate) fn followup(db: &mut Connection, request: crate::repair_run::FollowUp
         .revision
         .checked_add(1)
         .ok_or("Repair revision overflow.")?;
-    operation(&tx, request.op_id, "repair.followup", value, &run)?;
-    tx.commit()?;
+    operation(tx, request.op_id, "repair.followup", value, &run)?;
     Ok(run)
 }
 
@@ -605,6 +620,9 @@ pub(crate) fn begin_apply(
     {
         return Err("The captured repair changed before rebuilding.".into());
     }
+    if !crate::integration_assumptions::current(&tx, &input)? {
+        return Err("Assumptions changed · Refresh to review them.".into());
+    }
     run.phase = Phase::Applying;
     run.revision = run
         .revision
@@ -655,6 +673,9 @@ pub(crate) fn applied(
     }
     let failed = result.is_err();
     integration_store::apply_candidate(&tx, &mut job, run.job_revision, result)?;
+    if !failed && let crate::repair_run::Purpose::Assumption { id, .. } = run.purpose {
+        crate::integration_assumptions::finish_change(&tx, run.job_id, id, true)?;
+    }
     run.phase = if failed { Phase::Failed } else { Phase::Done };
     run.failure = failed.then_some(crate::repair_run::Failure::Capture);
     run.revision = run

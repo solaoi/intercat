@@ -1022,6 +1022,7 @@ impl Preparer {
                 let result = checkout
                     .run_check(
                         &format!("{prefix} cache add {names} {flags} --ignore-scripts"),
+                        &std::collections::BTreeMap::new(),
                         cancel.clone(),
                         Duration::from_secs(300),
                     )
@@ -1037,6 +1038,7 @@ impl Preparer {
             let result = checkout
                 .run_check(
                     &format!("{prefix} ci {flags} --ignore-scripts=false"),
+                    &std::collections::BTreeMap::new(),
                     cancel.clone(),
                     Duration::from_secs(300),
                 )

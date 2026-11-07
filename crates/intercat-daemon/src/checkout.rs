@@ -443,15 +443,13 @@ impl Checkout {
         Ok(profile)
     }
 
-    async fn command(
+    fn command(
         &self,
         cwd: &Path,
         program: &Path,
         arguments: &[OsString],
         scope: Scope,
-        cancel: watch::Receiver<bool>,
-        timeout: Duration,
-    ) -> Result<Output> {
+    ) -> Result<tokio::process::Command> {
         let mut command = crate::command::gated_command("/usr/bin/sandbox-exec");
         command
             .args([OsStr::new("-p"), OsStr::new(&self.profile(scope)?)])
@@ -467,7 +465,7 @@ impl Checkout {
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_NO_REPLACE_OBJECTS", "1")
             .env("GIT_ATTR_NOSYSTEM", "1");
-        crate::command::run(&mut command, cancel, timeout).await
+        Ok(command)
     }
 
     async fn git_in(
@@ -499,7 +497,7 @@ impl Checkout {
             arguments.extend(["-c".into(), "core.attributesFile=/dev/null".into()]);
         }
         arguments.extend_from_slice(args);
-        self.command(
+        let mut command = self.command(
             cwd,
             self.tool.binary(),
             &arguments,
@@ -508,10 +506,8 @@ impl Checkout {
             } else {
                 Scope::Git
             },
-            cancel,
-            Duration::from_secs(60),
-        )
-        .await
+        )?;
+        crate::command::run(&mut command, cancel, Duration::from_secs(60)).await
     }
     pub async fn git(
         &self,
@@ -535,15 +531,9 @@ impl Checkout {
             .into(),
         ];
         arguments.extend_from_slice(args);
-        self.command(
-            &self.workdir,
-            self.tool.binary(),
-            &arguments,
-            Scope::Code,
-            cancel,
-            Duration::from_secs(60),
-        )
-        .await
+        let mut command =
+            self.command(&self.workdir, self.tool.binary(), &arguments, Scope::Code)?;
+        crate::command::run(&mut command, cancel, Duration::from_secs(60)).await
     }
     pub async fn deploy(&self, tree: ObjectId, cancel: watch::Receiver<bool>) -> Result<()> {
         self.verify_storage()?;
@@ -584,18 +574,24 @@ impl Checkout {
     pub async fn run_check(
         &self,
         script: &str,
+        environment: &BTreeMap<String, String>,
         cancel: watch::Receiver<bool>,
         timeout: Duration,
     ) -> Result<Output> {
-        self.command(
+        let mut command = self.command(
             &self.workdir,
             Path::new("/bin/sh"),
             &["-c".into(), script.into()],
             Scope::Code,
-            cancel,
-            timeout,
-        )
-        .await
+        )?;
+        if environment
+            .keys()
+            .any(|name| !crate::secrets::valid_environment_name(name))
+        {
+            return Err("Check environment contains a reserved or invalid variable.".into());
+        }
+        command.envs(environment);
+        crate::command::run(&mut command, cancel, timeout).await
     }
 
     /// Start from the candidate tree so force-added ignored files remain in
@@ -616,7 +612,7 @@ impl Checkout {
         );
         let result = async {
             let output = self
-                .run_check(&script, cancel, Duration::from_secs(60))
+                .run_check(&script, &BTreeMap::new(), cancel, Duration::from_secs(60))
                 .await?
                 .require_success("Compare checkout with candidate")?;
             if output.truncated {

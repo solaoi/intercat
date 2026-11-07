@@ -97,6 +97,53 @@ fn workspace_ready(tx: &Transaction<'_>, operation: Uuid, roots: Vec<String>) ->
     save(tx, &branch)?;
     Ok(branch)
 }
+pub(crate) struct Source {
+    pub session_id: String,
+    pub checkpoint: Checkpoint,
+    pub workspace: Workspace,
+}
+
+pub(crate) fn source(db: &Connection, track: &str, turn: Uuid) -> Result<Source> {
+    // A file recovery replaces the active session, not the saved branch point.
+    // Resolve the requested turn's recorded owner instead of the active worker.
+    let mut query=db.prepare("SELECT session FROM timeline_turns WHERE turn=?1 AND json_extract(record,'$.track')=?2 LIMIT 2")?;
+    let sessions = query
+        .query_map(params![turn.to_string(), track], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let [parent_session_id] = sessions.as_slice() else {
+        return Err("This turn has no unambiguous recorded parent session.".into());
+    };
+    let parent_session_id = parent_session_id.clone();
+    let checkpoint_id = Uuid::new_v5(&turn, b"checkpoint");
+    let raw: String = db.query_row("SELECT payload FROM operations WHERE id=?1 AND kind='checkpoint.save' AND state='complete'",[checkpoint_id.to_string()],|r|r.get(0))?;
+    let payload: Value = serde_json::from_str(&raw)?;
+    let checkpoint: Checkpoint = serde_json::from_value(payload["checkpoint"].clone())?;
+    if payload["trackId"] != track
+        || checkpoint.turn_id != turn
+        || !checkpoint.unmerged_paths.is_empty()
+    {
+        return Err("The branch needs this parent's saved, resolved checkpoint.".into());
+    }
+    let raw: String = db.query_row(
+        "SELECT record FROM workspaces WHERE track_id=?1",
+        [track],
+        |r| r.get(0),
+    )?;
+    let parent: Workspace = serde_json::from_str(&raw)?;
+    if parent.state != "ready" {
+        return Err("The parent workspace is unavailable.".into());
+    }
+    let expected = format!("{}-checkpoints/{}", parent.reference, turn);
+    if checkpoint.reference != expected {
+        return Err("The checkpoint reference does not belong to this workspace.".into());
+    }
+    Ok(Source {
+        session_id: parent_session_id,
+        checkpoint,
+        workspace: parent,
+    })
+}
+
 fn prepare(tx: &Transaction<'_>, request: Request) -> Result<Branch> {
     if request.op_id.get_version_num() != 7 {
         return Err("A branch needs a new operation ID.".into());
@@ -118,42 +165,11 @@ fn prepare(tx: &Transaction<'_>, request: Request) -> Result<Branch> {
     if before.current.revision > 0 && before.sealed.as_ref() != Some(&before.current) {
         return Err("Confirm the saved fingerprints before branching.".into());
     }
-    // A file recovery replaces the active session, not the saved branch point.
-    // Resolve the requested turn's recorded owner instead of the active worker.
-    let mut query=tx.prepare("SELECT session FROM timeline_turns WHERE turn=?1 AND json_extract(record,'$.track')=?2 LIMIT 2")?;
-    let sessions = query
-        .query_map(
-            params![request.turn_id.to_string(), request.parent_track_id],
-            |r| r.get::<_, String>(0),
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let [parent_session_id] = sessions.as_slice() else {
-        return Err("This turn has no unambiguous recorded parent session.".into());
-    };
-    let parent_session_id = parent_session_id.clone();
-    let checkpoint_id = Uuid::new_v5(&request.turn_id, b"checkpoint");
-    let raw: String = tx.query_row("SELECT payload FROM operations WHERE id=?1 AND kind='checkpoint.save' AND state='complete'",[checkpoint_id.to_string()],|r|r.get(0))?;
-    let payload: Value = serde_json::from_str(&raw)?;
-    let checkpoint: Checkpoint = serde_json::from_value(payload["checkpoint"].clone())?;
-    if payload["trackId"] != request.parent_track_id
-        || checkpoint.turn_id != request.turn_id
-        || !checkpoint.unmerged_paths.is_empty()
-    {
-        return Err("The branch needs this parent's saved, resolved checkpoint.".into());
-    }
-    let raw: String = tx.query_row(
-        "SELECT record FROM workspaces WHERE track_id=?1",
-        [&request.parent_track_id],
-        |r| r.get(0),
-    )?;
-    let parent: Workspace = serde_json::from_str(&raw)?;
-    if parent.state != "ready" {
-        return Err("The parent workspace is unavailable.".into());
-    }
-    let expected = format!("{}-checkpoints/{}", parent.reference, request.turn_id);
-    if checkpoint.reference != expected {
-        return Err("The checkpoint reference does not belong to this workspace.".into());
-    }
+    let Source {
+        session_id: parent_session_id,
+        checkpoint,
+        workspace: parent,
+    } = source(tx, &request.parent_track_id, request.turn_id)?;
     let parent_label: String = tx.query_row(
         "SELECT label FROM tracks WHERE id=?1",
         [&request.parent_track_id],

@@ -32,7 +32,7 @@ enum Input {
         id: Uuid,
         approval: String,
         requirement: Value,
-        allow: bool,
+        response: crate::approval::Response,
         reply: oneshot::Sender<Result<()>>,
     },
     Respond {
@@ -113,14 +113,14 @@ impl Port {
         id: Uuid,
         approval: String,
         requirement: Value,
-        allow: bool,
+        response: crate::approval::Response,
     ) -> Result<()> {
         let (reply, result) = oneshot::channel();
         self.sender.send(Input::Answer {
             id,
             approval,
             requirement,
-            allow,
+            response,
             reply,
         })?;
         result.await?
@@ -271,7 +271,9 @@ async fn present(
 }
 
 async fn stop(journal: &Journal, run: &mut Run, port: &Port, id: Uuid) -> Result<()> {
-    port.interrupt();
+    if !port.stopped.load(Ordering::Acquire) {
+        port.interrupt();
+    }
     record_stop(journal, run, id).await
 }
 async fn record_stop(journal: &Journal, run: &mut Run, id: Uuid) -> Result<()> {
@@ -387,7 +389,7 @@ fn request_hash(value: &Value) -> Result<String> {
         .collect())
 }
 
-async fn completed_request(
+pub(crate) async fn completed_request(
     journal: &Journal,
     id: Uuid,
     method: &str,
@@ -415,6 +417,11 @@ async fn send(
     params: Value,
     control: Value,
 ) -> Result<Option<Value>> {
+    let screened = if method == "approval/decide" {
+        Some(journal.screen_start(params.clone()).await?)
+    } else {
+        None
+    };
     let saved = json!({"requestHash":request_hash(&params)?,"controlHash":request_hash(&control)?,"request":crate::recording::redact(scanner,params.clone()).await?});
     match journal.intent(&id.to_string(), method, saved).await? {
         Admission::Replay(state) if state == "complete" => return Ok(None),
@@ -427,7 +434,10 @@ async fn send(
         journal.finish(&id.to_string(), "superseded").await?;
         return Err("The repair Run is stopping.".into());
     }
-    let response = port.client.request(method, params.clone()).await?;
+    let response = match screened {
+        Some(screened) => port.client.decide(screened).await?,
+        None => port.client.request(method, params.clone()).await?,
+    };
     if response["commandId"] != id.to_string() || response["status"] != "accepted" {
         return Err("The host did not confirm this repair action.".into());
     }
@@ -458,7 +468,7 @@ impl Runner {
         let prepared = async {
             let (run, job, settings) = journal.repair_input(hosted.run_id()).await?;
             workspace.validate(&job, &run.track, &settings)?;
-            let scanner = settings.scanner.start(&[])?;
+            let scanner = settings.scanner()?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((run, scanner))
         }
         .await;
@@ -571,8 +581,10 @@ impl Runner {
         {
             return Ok(Outcome::Reconfigure);
         }
-        let instruction = safe(scanner, &task.instruction).await?;
+        let instruction = task.instruction.clone();
         let params = json!({"commandId":command,"sessionId":self.port.session,"reasoningEffort":"minimal","input":[{"type":"skill","source":"user","selector":"intercat-report","arguments":instruction}]});
+        let prepared = journal.screen_start(params).await?;
+        let params = prepared.params().clone();
         if let Err(error) = update(journal, run, Event::ReserveStart { command }).await {
             if error.is::<crate::journal::StartSuperseded>() {
                 return Ok(Outcome::Reconfigure);
@@ -598,8 +610,9 @@ impl Runner {
         let client = self.port.client.clone();
         self.submitted = Some(command);
         let (started_tx, mut started_rx) = oneshot::channel();
+        let guard = crate::msp::StartGuard::Stopped(self.port.stopped.clone());
         tokio::spawn(async move {
-            let _ = started_tx.send(client.request("turn/start", params).await);
+            let _ = started_tx.send(client.start(prepared, guard).await);
         });
         let mut starting = true;
         let mut terminals = HashMap::new();
@@ -682,21 +695,31 @@ impl Runner {
                             let _=reply.send(Ok(()));
                         }
                     },
-                    Some(Input::Answer{id,approval,requirement,allow,reply})=>{
-                        let control=json!({"approval":approval,"requirement":requirement,"allow":allow});
+                    Some(Input::Answer{id,approval,requirement,response,reply})=>{
+                        let scope=crate::secret_input::Owner::Repair{run_id:run.id}.key(&run.track);
+                        let control=json!({"scope":scope,"approval":approval,"requirement":requirement,"response":response});
                         let mut sent=false;
                         let result=async {
-                            let replay=completed_request(journal,id,"approval/decide",&control).await;
+                            let replay=if journal.operation(id).await?.is_some_and(|saved|saved["kind"]=="approval.reply") {crate::approval::replay(journal,id,&scope,&approval,&requirement,&response).await} else {completed_request(journal,id,"approval/decide",&control).await};
                             if replay.is_err(){sent=true;}
                             if replay? {return Ok(());}
                             if self.port.stopped.load(Ordering::Acquire){return Err("The repair Run is stopping.".into());}
                             let request=approval_stages.get(&approval).filter(|r|r["currentRequirementId"]==requirement).ok_or("The repair approval changed.")?;
                             let card=run.approvals.iter().find(|card|card.id==approval&&card.requirement==requirement).ok_or("The repair approval is not open.")?;
-                            if allow&&!card.can_allow || !allow&&!card.can_deny {return Err("This repair action is unavailable.".into());}
-                            let choice=crate::execution::offered(request,allow).ok_or("Approval choice is unavailable.")?;
+                            if matches!(response,crate::approval::Response::Allow) && !card.can_allow
+                                || matches!(response,crate::approval::Response::Deny) && !card.can_deny {return Err("This repair action is unavailable.".into());}
+                            let (choice,feedback)=match response.prepare(request)? {
+                                crate::approval::Prepared::Decision{choice,feedback}=>(choice,feedback),
+                                crate::approval::Prepared::Restart{text}=>{
+                                    let request=crate::approval_reply::Request{op_id:id,owner:crate::secret_input::Owner::Repair{run_id:run.id},track_id:run.track.clone(),session_id:self.port.session.clone(),turn_id:run.turn.ok_or("The approval turn has already ended.")?,approval_id:approval.clone(),requirement:requirement.clone(),text};
+                                    self.port.stop(request.stop_id())?;
+                                    journal.queue_approval_reply(request).await?;
+                                    return Ok(());
+                                }
+                            };
                             sent=true;
                             if !approval_stages.begin(&approval,&requirement) {return Err("The repair approval was already answered.".into());}
-                            let ack=send(journal,&self.port,scanner,id,"approval/decide",json!({"commandId":id,"sessionId":self.port.session,"approvalId":approval,"requirementId":requirement,"choiceId":choice}),control).await?.ok_or("Missing new repair approval acknowledgement")?;
+                            let ack=send(journal,&self.port,scanner,id,"approval/decide",json!({"commandId":id,"sessionId":self.port.session,"approvalId":approval,"requirementId":requirement,"choiceId":choice,"feedback":feedback}),control).await?.ok_or("Missing new repair approval acknowledgement")?;
                             if let Some(request)=approval_stages.acknowledged(&approval,ack["terminal"]==true)? {approval_queue.push_back(request);}
                             run.approvals.retain(|card|card.id!=approval);
                             present(journal,run,&self.port,&prompts).await
@@ -754,13 +777,13 @@ impl Runner {
                     if !approval_stages.current(&request){continue;}
                     let requested=crate::deletion::requested(&request,&workspace.checkout.workdir);
                     let missing=requested&&deletion.is_none();
-                    let review=if missing {Some(crate::policy::Reason{kind:"delete".into(),message:"Deletion snapshot could not be saved. Stop this repair and retry after fixing the workspace.".into()})}else{verdict.review.or_else(||crate::execution::offered(&request,true).is_none().then(||crate::policy::Reason{kind:"unknown".into(),message:"Review this repair action.".into()}))};
+                    let review=if missing {Some(crate::policy::Reason{kind:"delete".into(),message:"Deletion snapshot could not be saved. Stop this repair and retry after fixing the workspace.".into()})}else{verdict.review.or_else(||crate::approval::offered(&request,true).is_none().then(||crate::policy::Reason{kind:"unknown".into(),message:"Review this repair action.".into()}))};
                     if let Some(reason)=review {
                         let subject=safe(scanner,&request["subject"].to_string()).await?;
                         run.approvals.retain(|card|card.id!=id);
-                        run.approvals.push(Approval{id:id.clone(),requirement:request["currentRequirementId"].clone(),subject,reason,can_allow:!missing&&verdict.allow_once&&crate::execution::offered(&request,true).is_some(),can_deny:crate::execution::offered(&request,false).is_some(),deletion:deletion.as_ref().map(|s|s.summary())});
+                        run.approvals.push(Approval{id:id.clone(),requirement:request["currentRequirementId"].clone(),subject,reason,can_allow:!missing&&verdict.allow_once&&crate::approval::offered(&request,true).is_some(),can_deny:crate::approval::offered(&request,false).is_some(),reply_mode:Some(crate::approval::reply_mode(&request)),deletion:deletion.as_ref().map(|s|s.summary())});
                         present(journal,run,&self.port,&prompts).await?;
-                    } else if let Some(choice)=crate::execution::offered(&request,true)
+                    } else if let Some(choice)=crate::approval::offered(&request,true)
                         && approval_stages.begin(&id,&request["currentRequirementId"]) {
                         let op=Uuid::now_v7();let ack=send(journal,&self.port,scanner,op,"approval/decide",json!({"commandId":op,"sessionId":self.port.session,"approvalId":id,"requirementId":request["currentRequirementId"],"choiceId":choice}),Value::Null).await?.ok_or("Missing new repair approval acknowledgement")?;
                         if let Some(request)=approval_stages.acknowledged(&id,ack["terminal"]==true)? {approval_queue.push_back(request);}

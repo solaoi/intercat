@@ -95,9 +95,17 @@ async fn main() -> Result<()> {
         let submitted = if with_turn {
             let command=Uuid::now_v7();
             let params=json!({"commandId":command,"sessionId":session,"input":[{"type":"text","text":"This is a disposable protocol test. Do not use tools or inspect any files. Reply exactly: snapshot recovery probe."}]});
-            journal.intent(&command.to_string(),"turn.start",params.clone()).await?;
-            std::fs::write(output.join("model-turn.json"),serde_json::to_vec_pretty(&json!({"attempted":1,"params":params}))?)?;
-            let ack=exchange(&host,&mut calls,"turn/start",params).await?;
+            let prepared = journal.screen_start(params).await?;
+            let params = prepared.params().clone();
+            journal.intent(&command.to_string(), "turn.start", params.clone()).await?;
+            std::fs::write(output.join("model-turn.json"), serde_json::to_vec_pretty(&json!({"attempted":1,"params":params}))?)?;
+            let ack = host.connection.client.start(
+                prepared,
+                intercat_daemon::msp::StartGuard::Stopped(std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                )),
+            ).await?;
+            calls.push(json!({"method":"turn/start","params":params,"result":ack}));
             let turn=ack["turnId"].as_str().ok_or("Missing submitted turn")?.to_owned();
             tokio::time::timeout(Duration::from_secs(120),async {
                 loop {

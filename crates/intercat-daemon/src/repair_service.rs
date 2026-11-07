@@ -240,6 +240,10 @@ impl Service {
                 .await?;
             self.validate_text(job.id, job.revision, text).await?;
         }
+        if let repair_run::Purpose::Assumption { text, .. } = &request.purpose {
+            self.validate_text(request.job_id, request.revision, text)
+                .await?;
+        }
         self.journal.repair_start(request).await
     }
     async fn validate_text(&self, id: Uuid, revision: u64, text: &str) -> Result<()> {
@@ -388,11 +392,29 @@ impl Service {
         id: Uuid,
         approval: String,
         requirement: Value,
-        allow: bool,
+        response: crate::approval::Response,
     ) -> Result<()> {
+        if let Some(saved) = self.journal.operation(op).await? {
+            if saved["kind"] == "approval.reply" {
+                crate::approval::replay(
+                    &self.journal,
+                    op,
+                    &crate::secret_input::Owner::Repair { run_id: id }.key(""),
+                    &approval,
+                    &requirement,
+                    &response,
+                )
+                .await?;
+            } else {
+                crate::repair_execution::completed_request(&self.journal, op, "approval/decide", &serde_json::json!({"scope":crate::secret_input::Owner::Repair{run_id:id}.key(""),"approval":approval,"requirement":requirement,"response":response})).await?;
+            }
+            return crate::approval_reply::confirm(&self.journal, op).await;
+        }
+        response.screen(&self.journal).await?;
         self.port(id)?
-            .answer(op, approval, requirement, allow)
-            .await
+            .answer(op, approval, requirement, response)
+            .await?;
+        crate::approval_reply::confirm(&self.journal, op).await
     }
     pub async fn respond(
         &self,
@@ -976,6 +998,14 @@ fn instruction(run: &Run, job: &Job) -> Result<String> {
                 .ok_or("The secret finding changed.")?;
             serde_json::json!({"task":"Remove the detected secret from this integration candidate without disclosing its value in your response", "finding":item})
         }
+        repair_run::Purpose::Assumption { id, .. } => {
+            let assumption = job
+                .assumptions
+                .iter()
+                .find(|review| review.assumption.id == id.to_string())
+                .ok_or("Missing assumption for the repair instruction.")?;
+            serde_json::json!({"task":"Apply the user's correction to this assumption in the integration candidate", "assumption":assumption.assumption})
+        }
         repair_run::Purpose::Edit { .. } => {
             serde_json::json!({"task":"Apply the user's requested change to the selected lines in this integration candidate"})
         }
@@ -987,7 +1017,8 @@ fn instruction(run: &Run, job: &Job) -> Result<String> {
         run.instruction
             .as_deref()
             .unwrap_or_else(|| match &run.purpose {
-                repair_run::Purpose::Edit { text, .. } => text,
+                repair_run::Purpose::Edit { text, .. }
+                | repair_run::Purpose::Assumption { text, .. } => text,
                 _ => "No additional instruction.",
             })
     ))

@@ -50,13 +50,15 @@ async fn global_pause_holds_inputs_and_replays_never_reverse_a_newer_control() {
     let pause = uuid::Uuid::now_v7();
     let resume = uuid::Uuid::now_v7();
     let input = uuid::Uuid::now_v7();
+    let editor =
+        intercat_daemon::editor::Manager::new(root.path(), &root.path().join("editor.log"))
+            .unwrap();
     for restart in 0..2 {
         let server = Server::bind(
             root.path(),
             Token::parse(&token).unwrap(),
             journal.clone(),
-            intercat_daemon::editor::Manager::new(root.path(), &root.path().join("editor.log"))
-                .unwrap(),
+            editor.clone(),
             &root.path().join("workspaces"),
         )
         .unwrap();
@@ -347,7 +349,15 @@ async fn authenticates_before_any_method_and_persists_effect_once_for_multiple_c
     assert_eq!(mismatch["error"]["code"], -32002);
     let state = call(&mut two, "system.status", json!({})).await;
     assert_eq!(state["result"]["utterances"].as_array().unwrap().len(), 1);
-    assert_eq!(state["result"]["sequence"], 1);
+    let recorded: i64 = rusqlite::Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM events WHERE kind='utterance.staged' AND json_extract(payload,'$.id')=?1",
+            [op.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
     assert_eq!(
         call(
             &mut one,
@@ -408,16 +418,17 @@ async fn refuses_symlink_socket_and_oversized_unauthenticated_frames() {
     .unwrap();
     let path = directory.path().join("rpc.sock");
     std::os::unix::fs::symlink("events.sqlite", &path).unwrap();
+    let editor = intercat_daemon::editor::Manager::new(
+        directory.path(),
+        &directory.path().join("editor.log"),
+    )
+    .unwrap();
     assert!(
         Server::bind(
             directory.path(),
             Token::parse(&"12".repeat(32)).unwrap(),
             journal.clone(),
-            intercat_daemon::editor::Manager::new(
-                directory.path(),
-                &directory.path().join("editor.log")
-            )
-            .unwrap(),
+            editor.clone(),
             &directory.path().join("workspaces"),
         )
         .is_err()
@@ -427,11 +438,7 @@ async fn refuses_symlink_socket_and_oversized_unauthenticated_frames() {
         directory.path(),
         Token::parse(&"12".repeat(32)).unwrap(),
         journal,
-        intercat_daemon::editor::Manager::new(
-            directory.path(),
-            &directory.path().join("editor.log"),
-        )
-        .unwrap(),
+        editor,
         &directory.path().join("workspaces"),
     )
     .unwrap();

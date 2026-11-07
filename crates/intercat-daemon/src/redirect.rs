@@ -10,6 +10,7 @@ use uuid::Uuid;
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
     Stopping,
+    Interrupting,
     Ready,
     Sent,
     Done,
@@ -31,7 +32,7 @@ pub fn install(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE redirects(input TEXT PRIMARY KEY REFERENCES utterances(id),record TEXT NOT NULL);")?;
     Ok(())
 }
-fn read(db: &Connection, input: &str) -> Result<Option<Redirect>> {
+pub(crate) fn read(db: &Connection, input: &str) -> Result<Option<Redirect>> {
     db.query_row(
         "SELECT record FROM redirects WHERE input=?1",
         [input],
@@ -51,6 +52,56 @@ fn save(db: &Connection, redirect: &Redirect) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+pub(crate) fn queue_reply(db: &Connection, redirect: Redirect) -> Result<()> {
+    save(db, &redirect)?;
+    let state: String = db.query_row(
+        "SELECT record FROM workers WHERE track_id=?1",
+        [&redirect.track_id],
+        |row| row.get(0),
+    )?;
+    worker_changed(db, &serde_json::from_str(&state)?)
+}
+pub fn revise(db: &Connection, input: &str, revision: i64) -> Result<()> {
+    if let Some(mut redirect) = read(db, input)? {
+        redirect.revision = revision;
+        save(db, &redirect)?;
+    }
+    Ok(())
+}
+pub fn interrupt_started(db: &Connection, input: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE kind='redirect.state' AND json_extract(payload,'$.phase')='interrupting' AND json_extract(payload,'$.inputId')=?1)",
+        [input], |row| row.get(0),
+    )?)
+}
+pub fn claim_interrupt(
+    db: &mut Connection,
+    input: &str,
+    revision: i64,
+) -> Result<Option<Redirect>> {
+    db.pragma_update(None, "synchronous", "FULL")?;
+    let tx = db.transaction()?;
+    if crate::edit_hold::active(&tx, input)? {
+        return Ok(None);
+    }
+    let Some(mut redirect) = read(&tx, input)?
+        .filter(|redirect| redirect.phase == Phase::Stopping && redirect.revision == revision)
+    else {
+        return Ok(None);
+    };
+    let current: (String, i64) = tx.query_row(
+        "SELECT state,revision FROM utterances WHERE id=?1",
+        [input],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if current != ("redirecting".into(), revision) {
+        return Ok(None);
+    }
+    redirect.phase = Phase::Interrupting;
+    save(&tx, &redirect)?;
+    tx.commit()?;
+    Ok(Some(redirect))
 }
 pub fn snapshot(db: &Connection) -> Result<Vec<Redirect>> {
     db.prepare("SELECT record FROM redirects ORDER BY rowid")?
@@ -95,6 +146,32 @@ pub fn forget(db: &Connection, input: &str) -> Result<()> {
     db.execute("DELETE FROM redirects WHERE input=?1", [input])?;
     Ok(())
 }
+pub(crate) fn restore_history(
+    db: &Connection,
+    mut redirect: Redirect,
+    revision: i64,
+    held: bool,
+) -> Result<()> {
+    if matches!(
+        redirect.phase,
+        Phase::Interrupting | Phase::Sent | Phase::Done
+    ) {
+        return Err("This correction already started.".into());
+    }
+    redirect.revision = revision;
+    redirect.phase = Phase::Held;
+    save(db, &redirect)?;
+    if !held
+        && !retry(
+            db,
+            &redirect.input_id,
+            &Target::Lock(redirect.track_id.clone()),
+        )?
+    {
+        return Err("The correction's original worker is unavailable.".into());
+    }
+    Ok(())
+}
 fn hold(db: &Connection, redirect: &mut Redirect, reason: &str) -> Result<()> {
     redirect.phase = Phase::Held;
     db.execute("UPDATE utterances SET state='held',reason=?2 WHERE id=?1 AND state IN ('redirecting','placed','starting')", params![redirect.input_id, reason])?;
@@ -112,7 +189,11 @@ fn checkpoint_ready(db: &Connection, redirect: &Redirect) -> Result<bool> {
 }
 pub fn worker_changed(db: &Connection, worker: &WorkerState) -> Result<()> {
     for mut redirect in snapshot(db)?.into_iter().filter(|r| {
-        r.track_id == worker.track_id && matches!(r.phase, Phase::Stopping | Phase::Ready)
+        r.track_id == worker.track_id
+            && matches!(
+                r.phase,
+                Phase::Stopping | Phase::Interrupting | Phase::Ready
+            )
     }) {
         if worker.session_id.as_deref() != Some(&redirect.session_id)
             || ["held", "stopped", "failed", "lost", "needs-recovery"]
@@ -123,7 +204,7 @@ pub fn worker_changed(db: &Connection, worker: &WorkerState) -> Result<()> {
                 &mut redirect,
                 "Correction held. Review the worker before sending it.",
             )?;
-        } else if redirect.phase == Phase::Stopping
+        } else if matches!(redirect.phase, Phase::Stopping | Phase::Interrupting)
             && worker.active_turn.is_none()
             && !worker.checkpoint_pending
         {
@@ -133,6 +214,7 @@ pub fn worker_changed(db: &Connection, worker: &WorkerState) -> Result<()> {
                 .is_some_and(|c| c.turn_id == redirect.turn_id)
                 && checkpoint_ready(db, &redirect)?
             {
+                crate::editor_log::trim(db, &redirect)?;
                 redirect.phase = Phase::Ready;
                 db.execute("UPDATE utterances SET state='placed',reason=NULL WHERE id=?1 AND revision=?2 AND state='redirecting'", params![redirect.input_id, redirect.revision])?;
                 save(db, &redirect)?;
@@ -143,7 +225,7 @@ pub fn worker_changed(db: &Connection, worker: &WorkerState) -> Result<()> {
                     "The interrupted turn has no verified checkpoint. Review before sending the correction.",
                 )?;
             }
-        } else if redirect.phase == Phase::Stopping
+        } else if matches!(redirect.phase, Phase::Stopping | Phase::Interrupting)
             && worker
                 .active_turn
                 .is_some_and(|turn| turn != redirect.turn_id)
@@ -207,18 +289,29 @@ pub fn retry(db: &Connection, input: &str, target: &Target) -> Result<bool> {
     if !matches!(target, Target::Lock(track) if *track == redirect.track_id) {
         return Ok(false);
     }
-    let session: Option<String> = db
+    let worker: Option<String> = db
         .query_row(
-            "SELECT json_extract(record,'$.sessionId') FROM workers WHERE track_id=?1",
+            "SELECT record FROM workers WHERE track_id=?1",
             [&redirect.track_id],
             |r| r.get(0),
         )
-        .optional()?
-        .flatten();
-    if session.as_deref() != Some(&redirect.session_id) {
+        .optional()?;
+    let worker = worker
+        .map(|text| serde_json::from_str::<WorkerState>(&text))
+        .transpose()?;
+    if worker
+        .as_ref()
+        .and_then(|worker| worker.session_id.as_deref())
+        != Some(&redirect.session_id)
+    {
         return Ok(false);
     }
-    if !checkpoint_ready(db, &redirect)? {
+    let resume_interrupt = worker.as_ref().is_some_and(|worker| {
+        worker.active_turn == Some(redirect.turn_id)
+            && ["working", "approval", "question"].contains(&worker.phase.as_str())
+            && !worker.checkpoint_pending
+    });
+    if !resume_interrupt && !checkpoint_ready(db, &redirect)? {
         return Err("Finish checkpoint recovery before resuming this correction.".into());
     }
     let current: i64 = db.query_row(
@@ -227,13 +320,22 @@ pub fn retry(db: &Connection, input: &str, target: &Target) -> Result<bool> {
         |r| r.get(0),
     )?;
     redirect.revision = current + 1;
-    redirect.phase = Phase::Ready;
+    redirect.phase = if resume_interrupt {
+        Phase::Stopping
+    } else {
+        Phase::Ready
+    };
     db.execute(
-        "UPDATE utterances SET state='placed',revision=?2,target=?3,reason=NULL WHERE id=?1",
+        "UPDATE utterances SET state=?4,revision=?2,target=?3,reason=NULL WHERE id=?1",
         params![
             input,
             redirect.revision,
-            serde_json::to_string(&Target::Lock(redirect.track_id.clone()))?
+            serde_json::to_string(&Target::Lock(redirect.track_id.clone()))?,
+            if resume_interrupt {
+                "redirecting"
+            } else {
+                "placed"
+            }
         ],
     )?;
     save(db, &redirect)?;
@@ -241,10 +343,12 @@ pub fn retry(db: &Connection, input: &str, target: &Target) -> Result<bool> {
 }
 pub fn interrupt(db: &mut Connection) -> Result<()> {
     let tx = db.transaction()?;
-    for mut redirect in snapshot(&tx)?
-        .into_iter()
-        .filter(|r| matches!(r.phase, Phase::Stopping | Phase::Ready))
-    {
+    for mut redirect in snapshot(&tx)?.into_iter().filter(|r| {
+        matches!(
+            r.phase,
+            Phase::Stopping | Phase::Interrupting | Phase::Ready
+        )
+    }) {
         hold(
             &tx,
             &mut redirect,
@@ -261,6 +365,6 @@ pub fn stopping(snapshot: &Value, track: &str) -> Vec<Redirect> {
         .into_iter()
         .flatten()
         .filter_map(|value| serde_json::from_value::<Redirect>(value.clone()).ok())
-        .filter(|r| r.track_id == track && r.phase == Phase::Stopping)
+        .filter(|r| r.track_id == track && matches!(r.phase, Phase::Stopping | Phase::Interrupting))
         .collect()
 }

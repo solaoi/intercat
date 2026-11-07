@@ -330,7 +330,12 @@ async fn project_code_cannot_read_history_source_or_neighbor_files_write_outside
         server.local_addr()?.port()
     );
     let result = checkout
-        .run_check(&script, no_cancel(), Duration::from_secs(10))
+        .run_check(
+            &script,
+            &std::collections::BTreeMap::new(),
+            no_cancel(),
+            Duration::from_secs(10),
+        )
         .await?;
     assert!(
         result.success(),
@@ -351,7 +356,12 @@ async fn command_cancellation_timeout_and_background_children_are_reaped_with_bo
     let f = Fixture::new()?;
     let checkout = f.checkout(Configuration::capture(&f.source)?).await?;
     let background = checkout
-        .run_check("sleep 30 & echo $!", no_cancel(), Duration::from_secs(5))
+        .run_check(
+            "sleep 30 & echo $!",
+            &std::collections::BTreeMap::new(),
+            no_cancel(),
+            Duration::from_secs(5),
+        )
         .await?;
     assert!(background.success());
     let pid: u32 = String::from_utf8(background.stdout)?.trim().parse()?;
@@ -361,11 +371,17 @@ async fn command_cancellation_timeout_and_background_children_are_reaped_with_bo
         Err(_) => true,
     });
     let expired = checkout
-        .run_check("sleep 30", no_cancel(), Duration::from_millis(100))
+        .run_check(
+            "sleep 30",
+            &std::collections::BTreeMap::new(),
+            no_cancel(),
+            Duration::from_millis(100),
+        )
         .await?;
     assert!(expired.timed_out && !expired.success());
     let (cancel, receive) = watch::channel(false);
-    let stopped = checkout.run_check("sleep 30", receive, Duration::from_secs(5));
+    let environment = std::collections::BTreeMap::new();
+    let stopped = checkout.run_check("sleep 30", &environment, receive, Duration::from_secs(5));
     let change = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         cancel.send(true).unwrap();
@@ -375,6 +391,7 @@ async fn command_cancellation_timeout_and_background_children_are_reaped_with_bo
     let noisy = checkout
         .run_check(
             "yes x | head -c 2097152",
+            &std::collections::BTreeMap::new(),
             no_cancel(),
             Duration::from_secs(5),
         )
@@ -518,6 +535,7 @@ async fn dropping_a_running_check_stops_its_observed_processes() -> Result<()> {
             checkout
                 .run_check(
                     "sleep 30 & echo $! > child.pid; wait",
+                    &std::collections::BTreeMap::new(),
                     no_cancel(),
                     Duration::from_secs(40),
                 )
@@ -597,7 +615,12 @@ async fn runs_npm_test_with_the_selected_node_toolchain_inside_the_isolated_chec
         )
         .await?;
     let result = checkout
-        .run_check("npm test", no_cancel(), Duration::from_secs(15))
+        .run_check(
+            "npm test",
+            &std::collections::BTreeMap::new(),
+            no_cancel(),
+            Duration::from_secs(15),
+        )
         .await?;
     assert!(
         result.success(),

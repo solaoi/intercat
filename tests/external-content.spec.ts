@@ -1,3 +1,4 @@
+import { mockDrafts } from './support/drafts';
 import { closeWindow } from './support/close';
 import { _electron as electron, expect, test, type ElectronApplication, type Page } from '@playwright/test';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
@@ -42,6 +43,7 @@ test.afterAll(async () => {
 });
 test.beforeEach(async () => {
   app = await electron.launch({ args: ['.', '--preview', `--user-data-dir=${path.join(data, randomBytes(8).toString('hex'))}`] });
+  await mockDrafts(app);
   await app.firstWindow();
 });
 test.afterEach(async () => { if (app) await closeWindow(app); });

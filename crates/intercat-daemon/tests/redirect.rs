@@ -133,6 +133,7 @@ async fn correction_waits_for_its_exact_checkpoint_and_a_wrong_session_cannot_di
     let saved = journal.snapshot().await?;
     assert_eq!(word(&saved, &id)["state"], "redirecting");
     assert_eq!(saved["redirects"][0]["turnId"], turn.to_string());
+    assert!(journal.claim_redirect(id.clone(), 1).await?.is_some());
     assert!(journal.cut_input(Uuid::now_v7(), id.clone()).await.is_err());
     assert!(
         journal
@@ -154,10 +155,38 @@ async fn correction_waits_for_its_exact_checkpoint_and_a_wrong_session_cannot_di
         word(&journal.snapshot().await?, &id)["state"],
         "redirecting"
     );
+    assert!(
+        journal.snapshot().await?["editorEntries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["scene"] != "trim")
+    );
     checkpoint(&mut worker, turn);
     saved_checkpoint(&journal, &worker, turn).await?;
     journal.worker_state(worker.clone()).await?;
     assert_eq!(word(&journal.snapshot().await?, &id)["state"], "placed");
+    let editor_log = journal
+        .editor_log(intercat_daemon::editor_log::Query {
+            track_id: worker.track_id.clone(),
+            before: None,
+        })
+        .await?;
+    let trim = editor_log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["scene"] == "trim")
+        .collect::<Vec<_>>();
+    assert_eq!(trim.len(), 1);
+    assert_eq!(trim[0]["inputId"], id);
+    assert!(
+        trim[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("checkpoint was saved")
+    );
+
     assert!(
         journal
             .reserve_turn(
@@ -442,5 +471,131 @@ async fn a_queued_start_of_a_held_correction_cannot_override_a_newer_stop() -> R
         let _ = shutdown.send(true);
         running.await??;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn undo_take_back_keeps_the_original_stop_boundary_and_redo_stops_after_interrupt()
+-> Result<()> {
+    for changed_turn in [false, true] {
+        let (_root, journal, mut worker) = fixture().await?;
+        let input = correction(&journal, &worker).await?;
+        journal.cut_input(Uuid::now_v7(), input.clone()).await?;
+        let cut = journal.snapshot().await?;
+        let entry = cut["editHistory"]["undo"]["entryId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        if changed_turn {
+            worker.active_turn = Some(Uuid::now_v7());
+            journal.worker_state(worker.clone()).await?;
+        }
+        let result = journal
+            .edit_history(intercat_daemon::timeline_history::Request {
+                op_id: Uuid::now_v7(),
+                action: intercat_daemon::timeline_history::Action::Undo { entry },
+            })
+            .await;
+        if changed_turn {
+            assert!(result.is_err());
+            assert_eq!(word(&journal.snapshot().await?, &input)["state"], "cut");
+            let draft = journal
+                .edit_history(intercat_daemon::timeline_history::Request {
+                    op_id: Uuid::now_v7(),
+                    action: intercat_daemon::timeline_history::Action::RestoreDraft {
+                        input: input.clone(),
+                        revision: 2,
+                    },
+                })
+                .await?;
+            assert_eq!(word(&draft, &input)["state"], "held");
+            assert!(word(&draft, &input)["decision"].is_null());
+            assert!(journal.claim_redirect(input, 3).await?.is_none());
+        } else {
+            let restored = result?;
+            let revision = word(&restored, &input)["revision"].as_i64().unwrap();
+            let redirect = journal
+                .claim_redirect(input.clone(), revision)
+                .await?
+                .unwrap();
+            assert_eq!(redirect.turn_id, worker.active_turn.unwrap());
+            assert!(
+                journal
+                    .edit_history(intercat_daemon::timeline_history::Request {
+                        op_id: Uuid::now_v7(),
+                        action: intercat_daemon::timeline_history::Action::Redo {
+                            entry: restored["editHistory"]["redo"]["entryId"]
+                                .as_str()
+                                .unwrap()
+                                .into()
+                        },
+                    })
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn holding_an_interrupted_correction_does_not_make_its_stop_reversible() -> Result<()> {
+    let (root, journal, worker) = fixture().await?;
+    let input = correction(&journal, &worker).await?;
+    journal.claim_redirect(input.clone(), 1).await?.unwrap();
+    journal
+        .resolve_input(Uuid::now_v7(), input.clone(), 1, Resolution::Hold)
+        .await?;
+    let held = journal.snapshot().await?;
+    assert_eq!(word(&held, &input)["state"], "held");
+    assert!(
+        held["editHistory"]["undo"]["blocked"]
+            .as_str()
+            .unwrap()
+            .contains("has started")
+    );
+    assert!(
+        journal
+            .edit_history(intercat_daemon::timeline_history::Request {
+                op_id: Uuid::now_v7(),
+                action: intercat_daemon::timeline_history::Action::Undo {
+                    entry: held["editHistory"]["undo"]["entryId"]
+                        .as_str()
+                        .unwrap()
+                        .into()
+                },
+            })
+            .await
+            .is_err()
+    );
+    drop(journal);
+    let journal = Journal::open(
+        root.path().join("db"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await?;
+    assert_eq!(
+        word(&journal.snapshot().await?, &input)["interruptStarted"],
+        true
+    );
+    assert!(
+        journal
+            .cut_input(Uuid::now_v7(), input.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        journal
+            .edit_input(intercat_daemon::edit_hold::Request {
+                owner: Uuid::now_v7(),
+                action: intercat_daemon::edit_hold::Action::Begin {
+                    token: Uuid::now_v7(),
+                    input,
+                    revision: 2
+                },
+            })
+            .await
+            .is_err()
+    );
     Ok(())
 }

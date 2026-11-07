@@ -1,0 +1,166 @@
+{
+  "format": 1,
+  "datasetHash": "ae6c5d81c35b25f0caf251ba8f9319af9985bf291ebb1fd19127785c2b531105",
+  "profiles": {
+    "126cd1a4b41952ce8956d1e2f7c9fe5e569bd6a21245e3acf035f884cbcf63a2": {
+      "identity": {
+        "backend": "GlimmerLogits(local)",
+        "modelRevision": "3e7677d7a40d348a3daba263a2b1c0aa41910710",
+        "promptVersion": "c9a2fa49fdc0e7975b8066951bec1910cae8a069ed02264a219aed012b19ae72",
+        "cachePrefix": false
+      },
+      "fit": {
+        "temperature": 0.05,
+        "bounds": [
+          0.05,
+          20.0
+        ],
+        "atBound": true,
+        "observations": 8,
+        "groups": 8,
+        "nllBefore": 0.3279530260895813,
+        "nllAfter": 6.583641275072092e-09
+      },
+      "calibrationHash": "e4bf24c9312dc5aad4659cc27ac214b149db5f40a3051463e4aa601214aee404",
+      "evaluationHash": "325868e129e65bc1f07ccf360aa091e36fb6322e9bbd7f713093c8a23b217dde",
+      "evaluationBefore": {
+        "observations": 4,
+        "groups": 4,
+        "nll": 0.19650189623311115,
+        "accuracy": 1.0,
+        "ece": 0.1760274015365648,
+        "stageErrors": {
+          "boundary": {
+            "samples": 4,
+            "errors": 0
+          }
+        }
+      },
+      "evaluationAfter": {
+        "observations": 4,
+        "groups": 4,
+        "nll": 3.3306690738754686e-16,
+        "accuracy": 1.0,
+        "ece": 3.3306690738754696e-16,
+        "stageErrors": {
+          "boundary": {
+            "samples": 4,
+            "errors": 0
+          }
+        }
+      }
+    },
+    "57a883ba1ec6a430943cf5978606aee4ce337e4a54fe5d33694707ade922c872": {
+      "identity": {
+        "backend": "GlimmerLogits(local)",
+        "modelRevision": "3e7677d7a40d348a3daba263a2b1c0aa41910710",
+        "promptVersion": "8b5ec0db83853056d0cfd423884f52b9c4790b80a7fa128ba8a15b52551d4f96",
+        "cachePrefix": false
+      },
+      "fit": {
+        "temperature": 1.499375444140567,
+        "bounds": [
+          0.05,
+          20.0
+        ],
+        "atBound": false,
+        "observations": 30,
+        "groups": 20,
+        "nllBefore": 1.5383616104119642,
+        "nllAfter": 1.459659857340322
+      },
+      "calibrationHash": "73128826c182e9a52c0261fbc4ada18b200ba29c692108810ab811a18a84e7b6",
+      "evaluationHash": "c02b17ee4b90ddc2a5a9e5a5957dc772dbae1111444bfffa313e5d22966e301a",
+      "evaluationBefore": {
+        "observations": 16,
+        "groups": 10,
+        "nll": 1.373376922907536,
+        "accuracy": 0.4,
+        "ece": 0.2927250021966865,
+        "stageErrors": {
+          "decision": {
+            "samples": 10,
+            "errors": 5
+          },
+          "lane": {
+            "samples": 6,
+            "errors": 4
+          }
+        }
+      },
+      "evaluationAfter": {
+        "observations": 16,
+        "groups": 10,
+        "nll": 1.3544218955601122,
+        "accuracy": 0.4,
+        "ece": 0.2162241882725461,
+        "stageErrors": {
+          "decision": {
+            "samples": 10,
+            "errors": 5
+          },
+          "lane": {
+            "samples": 6,
+            "errors": 4
+          }
+        }
+      }
+    },
+    "baa06ec01cef4a48b73b127847e37c9089da0f96e10f98452984ae5b63de5271": {
+      "identity": {
+        "backend": "GlimmerLogits(local)",
+        "modelRevision": "3e7677d7a40d348a3daba263a2b1c0aa41910710",
+        "promptVersion": "9e96ce121f75cb9733d5283b3da1c38adb504f79e0aa32f0f72d09a06c8ef6f7",
+        "cachePrefix": false
+      },
+      "fit": {
+        "temperature": 1.183213230563778,
+        "bounds": [
+          0.05,
+          20.0
+        ],
+        "atBound": false,
+        "observations": 13,
+        "groups": 8,
+        "nllBefore": 1.211880888829546,
+        "nllAfter": 1.1980830947156438
+      },
+      "calibrationHash": "18d16172b79c9300e02cf5e42717c0d4fe44fc57c3de364c698f1e491ade9a2a",
+      "evaluationHash": "781e1dc8a2351e8bab83ee1ad2035df452cb5ead4007ea9ed489f65082c39af6",
+      "evaluationBefore": {
+        "observations": 7,
+        "groups": 4,
+        "nll": 1.3453834292958384,
+        "accuracy": 0.5,
+        "ece": 0.43655762709794504,
+        "stageErrors": {
+          "decision": {
+            "samples": 4,
+            "errors": 2
+          },
+          "lane": {
+            "samples": 3,
+            "errors": 1
+          }
+        }
+      },
+      "evaluationAfter": {
+        "observations": 7,
+        "groups": 4,
+        "nll": 1.3208479999129181,
+        "accuracy": 0.5,
+        "ece": 0.33651905821041694,
+        "stageErrors": {
+          "decision": {
+            "samples": 4,
+            "errors": 2
+          },
+          "lane": {
+            "samples": 3,
+            "errors": 1
+          }
+        }
+      }
+    }
+  }
+}

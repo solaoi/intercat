@@ -196,6 +196,10 @@ async fn execute_inner(
     let start_id = Uuid::now_v7();
     let mut run = Run::new();
     let params = json!({"commandId":start_id,"sessionId":session,"reasoningEffort":"minimal","input":[{"type":"skill","source":"user","selector":"intercat-report","arguments":request.instruction}]});
+    let prepared = journal.screen_start(params).await?;
+    let params = prepared.params().clone();
+    let mut prepared = Some(prepared);
+    let stop_guard = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     assert_eq!(
         run.request_start(start_id),
         Some(Effect::PersistStart(start_id))
@@ -232,6 +236,7 @@ async fn execute_inner(
             }
             _ = tokio::signal::ctrl_c(), if !stopping => {
                 stopping = true;
+                stop_guard.store(true, std::sync::atomic::Ordering::Release);
                 if let Some(Effect::Interrupt(id)) = run.stop() {
                     let interrupt = json!({"commandId":Uuid::now_v7(),"sessionId":session,"turnId":id});
                     send_command(&tx, &client, "turn/interrupt", interrupt, false);
@@ -247,8 +252,13 @@ async fn execute_inner(
                     if result? != Admission::New { return Err(std::io::Error::other("diagnostic operation was already accepted").into()); }
                     match run.start_persisted(start_id) {
                         Some(Effect::SendStart(_)) => {
-                            let client = client.clone(); let start_tx = tx.clone(); let params = params.clone();
-                            tokio::spawn(async move { let _ = start_tx.send(Work::Started(client.request("turn/start",params).await)); });
+                            let client = client.clone();
+                            let start_tx = tx.clone();
+                            let prepared = prepared.take().ok_or("The diagnostic start was already consumed.")?;
+                            let guard = crate::msp::StartGuard::Stopped(stop_guard.clone());
+                            tokio::spawn(async move {
+                                let _ = start_tx.send(Work::Started(client.start(prepared, guard).await));
+                            });
                         }
                         _ => { journal.finish(&start_id.to_string(),"superseded").await?; return Err(std::io::Error::other("turn stopped before dispatch").into()); }
                     }

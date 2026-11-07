@@ -6,7 +6,7 @@ export function useTimelineWindow(bounds: TimelineBounds | null, status: DaemonS
   const cache = useRef({ key: '', revision: null as number | null, clips: new Map<string, TimelineClip>(), marks: new Map<string, TimelineMark>() });
   const [value, setWindow] = useState<{ clips: TimelineClip[]; marks: TimelineMark[] }>({ clips: [], marks: [] });
   useEffect(() => {
-    if (!bounds || !bounds.tracks.length || !status.connected || status.mode === 'preview') return;
+    if (!bounds || !status.connected || status.mode === 'preview') return;
     let disposed = false;
     // A held arrow or wheel can cross dozens of rows before the next paint.
     // Fetch the settled viewport instead of serializing every intermediate row.

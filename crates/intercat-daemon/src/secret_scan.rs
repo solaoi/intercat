@@ -87,6 +87,16 @@ impl Engine {
         let root = tempfile::Builder::new()
             .prefix("intercat-scan-")
             .tempdir()?;
+        self.prepare(root, known_values)
+    }
+    pub(crate) fn start_in(&self, parent: &Path, known_values: &[String]) -> Result<Scanner> {
+        let root = tempfile::Builder::new()
+            .prefix("intercat-scan-")
+            .tempdir_in(parent)?;
+        self.prepare(root, known_values)
+    }
+    fn prepare(&self, root: tempfile::TempDir, known_values: &[String]) -> Result<Scanner> {
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
         let executable = root.path().join("gitleaks");
         fs::copy(&self.executable, &executable)?;
         verify(&executable)?;
@@ -168,6 +178,10 @@ struct Detected {
     file: String,
     start_line: u32,
     end_line: u32,
+    start_column: usize,
+    end_column: usize,
+    #[serde(rename = "Match")]
+    redacted_match: String,
     #[serde(rename = "RuleID")]
     rule: String,
 }
@@ -186,11 +200,11 @@ impl Scanner {
     fn ruleset(&self) -> String {
         ruleset()
     }
-    async fn fragments(
+    async fn detect(
         &self,
         fragments: &[Fragment],
         cancel: watch::Receiver<bool>,
-    ) -> Result<Vec<Finding>> {
+    ) -> Result<Vec<(usize, Detected)>> {
         if fragments.is_empty() {
             return Ok(vec![]);
         }
@@ -254,6 +268,7 @@ impl Scanner {
             .current_dir(&root)
             .env("HOME", &root)
             .env("TMPDIR", &root);
+        let started = std::time::Instant::now();
         let output = command::run(&mut command, cancel, Duration::from_secs(35)).await?;
         if output.cancelled {
             return Err("Secret scan cancelled.".into());
@@ -265,22 +280,39 @@ impl Scanner {
             || ![Some(0), Some(10)].contains(&output.code)
             || !output.stderr.is_empty()
         {
-            return Err("Secret scan did not complete. No scan result was accepted.".into());
+            return Err(format!(
+                "Secret scan did not complete. No scan result was accepted. elapsedMs={} timeout={} truncated={} exit={:?} diagnostics={}",
+                started.elapsed().as_millis(), output.timed_out, output.truncated,
+                output.code, !output.stderr.is_empty(),
+            ).into());
         }
         let detected: Vec<Detected> =
             serde_json::from_slice(&output.stdout).map_err(|_| "Invalid secret scan report.")?;
-        let mut findings = Vec::new();
         if detected.len() > FINDING_LIMIT {
             return Err("Too many secret findings; no partial result was accepted.".into());
         }
-        for item in detected {
-            let index = mapping
-                .get(&item.file)
-                .ok_or("Secret scanner reported an unknown path.")?;
-            let fragment = &fragments[*index];
-            if item.start_line == 0 || item.end_line < item.start_line {
-                return Err("Invalid secret scan location.".into());
-            }
+        detected
+            .into_iter()
+            .map(|item| {
+                let index = *mapping
+                    .get(&item.file)
+                    .ok_or("Secret scanner reported an unknown path.")?;
+                if item.start_line == 0 || item.end_line < item.start_line {
+                    return Err("Invalid secret scan location.".into());
+                }
+                Ok((index, item))
+            })
+            .collect()
+    }
+
+    async fn fragments(
+        &self,
+        fragments: &[Fragment],
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Vec<Finding>> {
+        let mut findings = Vec::new();
+        for (index, item) in self.detect(fragments, cancel).await? {
+            let fragment = &fragments[index];
             if fragment.touches(item.start_line, item.end_line) {
                 findings.push(Finding {
                     id: String::new(),
@@ -426,6 +458,57 @@ impl Scanner {
         Ok(Scan { binding, findings })
     }
 
+    pub(crate) async fn private_spans(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<Vec<crate::privacy::Span>>> {
+        let fragments = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| Fragment::all(format!("{index}.txt"), text.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let mut spans = vec![Vec::new(); texts.len()];
+        let mut lines = BTreeMap::<usize, Vec<usize>>::new();
+        for (index, item) in self.detect(&fragments, watch::channel(false).1).await? {
+            let text = &texts[index];
+            // Gitleaks columns count bytes from the preceding newline, not after it.
+            let offsets = lines.entry(index).or_insert_with(|| {
+                std::iter::once(0)
+                    .chain(text.match_indices('\n').map(|(offset, _)| offset))
+                    .collect()
+            });
+            let base = |line: u32| -> Result<usize> {
+                offsets
+                    .get(line as usize - 1)
+                    .copied()
+                    .ok_or_else(|| "Invalid secret scan line.".into())
+            };
+            let start = base(item.start_line)?
+                .checked_add(
+                    item.start_column
+                        .checked_sub(1)
+                        .ok_or("Invalid secret scan column.")?,
+                )
+                .ok_or("Invalid secret scan column.")?;
+            let end = base(item.end_line)?
+                .checked_add(item.end_column)
+                .ok_or("Invalid secret scan column.")?;
+            let matched = text.get(start..end).ok_or("Invalid secret scan span.")?;
+            for range in private_ranges(matched, &item.redacted_match)? {
+                spans[index].push(crate::privacy::Span {
+                    start: start + range.start,
+                    end: start + range.end,
+                    kind: if item.rule.contains("token") {
+                        crate::privacy::Kind::Token
+                    } else {
+                        crate::privacy::Kind::ApiKey
+                    },
+                });
+            }
+        }
+        Ok(spans)
+    }
+
     /// Hide complete matching lines, including multiline matches, before a
     /// message or subprocess output can enter the journal or reach a worker.
     pub async fn redact(
@@ -464,5 +547,86 @@ impl Scanner {
                     .collect()
             })
             .collect())
+    }
+}
+
+// Reconstruct only the captured value from a report that has already hidden it.
+// Literal occurrences of the word REDACTED in a field name are kept intact.
+fn private_ranges(raw: &str, masked: &str) -> Result<Vec<Range<usize>>> {
+    let markers = masked
+        .match_indices("REDACTED")
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    if markers.is_empty() || markers.len() > 256 || raw == masked {
+        return Err("Invalid redacted secret match.".into());
+    }
+    for at in &markers {
+        if !raw.starts_with(&masked[..*at]) {
+            continue;
+        }
+        for count in 1..=markers.len() {
+            let Some(bytes) = raw
+                .len()
+                .checked_add(count * "REDACTED".len())
+                .and_then(|size| size.checked_sub(masked.len()))
+            else {
+                continue;
+            };
+            if bytes == 0 || bytes % count != 0 {
+                continue;
+            }
+            let Some(value) = raw.get(*at..*at + bytes / count) else {
+                continue;
+            };
+            if raw.replace(value, "REDACTED") != masked {
+                continue;
+            }
+            let spans = raw
+                .match_indices(value)
+                .map(|(offset, found)| offset..offset + found.len())
+                .collect::<Vec<_>>();
+            if spans.len() == count {
+                return Ok(spans);
+            }
+        }
+    }
+    Err("Secret scan match changed.".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captured_values_preserve_literal_redacted_words_and_repeated_matches() -> Result<()> {
+        assert_eq!(
+            private_ranges("REDACTED_TOKEN=private-value", "REDACTED_TOKEN=REDACTED")?,
+            vec![15..28]
+        );
+        assert_eq!(
+            private_ranges("key=value:value", "key=REDACTED:REDACTED")?,
+            vec![4..9, 10..15]
+        );
+        assert!(private_ranges("changed value", "key=REDACTED").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pasted_text_scan_files_stay_in_the_private_data_directory() -> Result<()> {
+        let data = tempfile::tempdir()?;
+        let scanner = Engine::capture()?.start_in(data.path(), &[])?;
+        assert!(scanner.root.path().starts_with(data.path()));
+        assert_eq!(
+            fs::metadata(scanner.root.path())?.permissions().mode() & 0o777,
+            0o700
+        );
+        let texts = vec!["A private pasted document.".to_owned()];
+        assert_eq!(
+            scanner.redact(&texts, watch::channel(false).1).await?,
+            texts
+        );
+        drop(scanner);
+        assert_eq!(fs::read_dir(data.path())?.count(), 0);
+        Ok(())
     }
 }

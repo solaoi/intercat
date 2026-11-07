@@ -598,6 +598,15 @@ async fn keep_secret_resumes_the_exact_candidate_without_rerunning_hooks() -> Re
     f.action(commit_action(&resumed)).await?;
     assert_eq!(finished(&f.journal).await?.status, Status::Done);
     assert!(
+        f.journal.snapshot().await?["editorEntries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["scene"] == "commit"
+                && entry["line"] == "Committed. Push when you like.")
+    );
+
+    assert!(
         git(
             &f.source,
             &["show", &format!("{}:fixture.txt", candidate.head)]
@@ -1933,12 +1942,29 @@ impl Fixture {
         .await
     }
     async fn action(&self, action: Action) -> Result<Job> {
-        self.service
+        let job = self
+            .service
             .command(IntegrationCommand {
                 op_id: Uuid::now_v7(),
                 action,
             })
-            .await
+            .await?;
+        // These existing merge tests choose the displayed order. Dedicated
+        // proposal tests below drive the unconfirmed state directly.
+        if job.status == Status::Ordering {
+            self.service
+                .command(IntegrationCommand {
+                    op_id: Uuid::now_v7(),
+                    action: Action::Order {
+                        id: job.id,
+                        revision: job.revision,
+                        tracks: job.order_review.as_ref().unwrap().order.clone(),
+                    },
+                })
+                .await
+        } else {
+            Ok(job)
+        }
     }
     async fn open(&self) -> Result<Job> {
         self.action(Action::Open { tracks: None }).await
@@ -2436,7 +2462,10 @@ async fn authenticated_rpc_clients_share_the_job_and_reject_stale_actions() -> R
 }
 
 async fn finished(journal: &Journal) -> Result<Job> {
-    tokio::time::timeout(Duration::from_secs(20), async {
+    // A candidate can perform multiple secret scans, each bounded at 35 s.
+    // Let those operations return their own failure instead of cancelling the
+    // fixture first when macOS delays a fresh scanner process at startup.
+    tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let job: Job =
                 serde_json::from_value(journal.snapshot().await?["integration"].clone())?;
@@ -2775,6 +2804,859 @@ async fn secret_scan_is_persisted_without_its_value_and_cannot_become_checked_on
         candidate.secret_scans
     );
     assert!(!serde_json::to_string(&snapshot)?.contains(token));
+    f.source_unchanged()?;
+    Ok(())
+}
+
+async fn recorded_assumption(f: &Fixture, track: usize, turn: Uuid, item: &str) -> Result<()> {
+    use intercat_daemon::assumptions::{Extracted, Finish};
+    let track = &f.workspaces[track].track_id;
+    let session = format!("assumption-session-{track}");
+    f.journal
+        .try_msp(
+            track.clone(),
+            session.clone(),
+            intercat_daemon::clock::Stamp::now(),
+            json!({"method":"item/updated","params":{"sessionId":session,"item":{
+            "itemId":item,"turnId":turn,"kind":"agentMessage","revision":1,
+            "status":"completed","text":"I assumed SQLite for local storage."}}}),
+            None,
+            None,
+        )?
+        .await??;
+    let ticket = f.journal.claim_assumptions().await?.unwrap();
+    let result = ticket
+        .sources
+        .iter()
+        .map(|source| Extracted {
+            source: source.id.clone(),
+            question: "Which database should store the cache?".into(),
+            options: ["SQLite".into(), "PostgreSQL".into()],
+            assumed: "SQLite".into(),
+            evidence: "I assumed SQLite".into(),
+        })
+        .collect();
+    f.journal
+        .finish_assumptions(ticket, Finish::Complete(result))
+        .await?;
+    Ok(())
+}
+
+async fn checked_assumptions(f: &Fixture) -> Result<Job> {
+    let job = f.open().await?;
+    f.action(Action::Prepare {
+        id: job.id,
+        revision: job.revision,
+    })
+    .await?;
+    assert_eq!(finished(&f.journal).await?.status, Status::Checked);
+    f.open().await
+}
+
+#[tokio::test]
+async fn commit_assumptions_follow_frozen_clips_and_are_kept_only_for_published_tracks()
+-> Result<()> {
+    let f = Fixture::new(2).await?;
+    fs::write(f.workspaces[0].path.join("file.txt"), "first\n")?;
+    fs::write(f.workspaces[1].path.join("other.txt"), "second\n")?;
+    for track in 0..2 {
+        let saved = f.save(track, None).await?;
+        recorded_assumption(&f, track, saved.turn_id, "saved").await?;
+    }
+    recorded_assumption(&f, 0, Uuid::now_v7(), "still-running").await?;
+    let checked = checked_assumptions(&f).await?;
+    let view = f.journal.snapshot().await?["integration"].clone();
+    assert_eq!(
+        view["assumptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|value| value["included"] == true)
+            .count(),
+        2
+    );
+    assert_eq!(
+        view["assumptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|value| value["included"] == false)
+            .count(),
+        1
+    );
+    assert!(
+        checked
+            .candidate
+            .as_ref()
+            .unwrap()
+            .commits
+            .iter()
+            .all(|commit| commit.message.contains("Assumptions kept\n")
+                && commit.message.matches("Which database").count() == 1)
+    );
+    let selected = f
+        .action(Action::Select {
+            id: checked.id,
+            revision: checked.revision,
+            track: f.workspaces[1].track_id.clone(),
+            included: false,
+        })
+        .await?;
+    f.action(Action::Prepare {
+        id: selected.id,
+        revision: selected.revision,
+    })
+    .await?;
+    assert_eq!(finished(&f.journal).await?.status, Status::Checked);
+    let checked = f.open().await?;
+    assert_eq!(checked.candidate.as_ref().unwrap().commits.len(), 1);
+    let chosen = checked
+        .assumptions
+        .iter()
+        .find(|review| review.eligible && review.assumption.track_id == f.workspaces[0].track_id)
+        .unwrap();
+    let command = IntegrationCommand {
+        op_id: Uuid::now_v7(),
+        action: Action::KeepAssumption {
+            id: checked.id,
+            revision: checked.revision,
+            assumption: chosen.assumption.id.parse()?,
+        },
+    };
+    let kept = f.service.command(command.clone()).await?;
+    assert_eq!(
+        kept.candidate.as_ref().unwrap().head,
+        checked.candidate.as_ref().unwrap().head
+    );
+    assert_eq!(f.service.command(command).await?.revision, kept.revision);
+    assert!(
+        f.action(Action::Commit {
+            id: checked.id,
+            revision: checked.revision,
+            head: checked.candidate.as_ref().unwrap().head.clone(),
+            tree: checked.candidate.as_ref().unwrap().tree.clone(),
+            settings_hash: checked.candidate.as_ref().unwrap().settings_hash.clone()
+        })
+        .await
+        .is_err()
+    );
+    let candidate = kept.candidate.as_ref().unwrap();
+    f.action(Action::Commit {
+        id: kept.id,
+        revision: kept.revision,
+        head: candidate.head.clone(),
+        tree: candidate.tree.clone(),
+        settings_hash: candidate.settings_hash.clone(),
+    })
+    .await?;
+    assert_eq!(finished(&f.journal).await?.status, Status::Done);
+    let open = f.journal.snapshot().await?["assumptions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(open.len(), 2);
+    assert!(open.iter().any(|value| {
+        value["sourceId"]
+            .as_str()
+            .unwrap()
+            .contains("still-running")
+    }));
+    assert!(
+        open.iter()
+            .any(|value| value["trackId"] == f.workspaces[1].track_id)
+    );
+    let next = f.open().await?;
+    assert_eq!(next.assumptions.len(), 2);
+    f.service.shutdown().await;
+    f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn late_or_changed_assumptions_require_a_new_review_and_keep_rolls_back_with_the_job()
+-> Result<()> {
+    let f = Fixture::new(1).await?;
+    fs::write(f.workspaces[0].path.join("file.txt"), "first\n")?;
+    let saved = f.save(0, None).await?;
+    recorded_assumption(&f, 0, saved.turn_id, "first").await?;
+    let old = checked_assumptions(&f).await?;
+    recorded_assumption(&f, 0, saved.turn_id, "late").await?;
+    assert_eq!(
+        f.journal.snapshot().await?["integration"]["assumptionsChanged"],
+        true
+    );
+    let candidate = old.candidate.as_ref().unwrap();
+    assert!(
+        f.action(Action::Commit {
+            id: old.id,
+            revision: old.revision,
+            head: candidate.head.clone(),
+            tree: candidate.tree.clone(),
+            settings_hash: candidate.settings_hash.clone()
+        })
+        .await
+        .is_err()
+    );
+    let refreshed = f
+        .action(Action::Refresh {
+            id: old.id,
+            revision: old.revision,
+        })
+        .await?;
+    f.action(Action::Prepare {
+        id: refreshed.id,
+        revision: refreshed.revision,
+    })
+    .await?;
+    finished(&f.journal).await?;
+    let current = f.open().await?;
+    assert_eq!(current.assumptions.len(), 2);
+    let operation = IntegrationCommand {
+        op_id: Uuid::now_v7(),
+        action: Action::KeepAssumption {
+            id: current.id,
+            revision: current.revision,
+            assumption: current.assumptions[0].assumption.id.parse()?,
+        },
+    };
+    let db = rusqlite::Connection::open(f._root.path().join("events.sqlite"))?;
+    db.execute_batch("CREATE TRIGGER fail_commit_answer BEFORE INSERT ON operations WHEN NEW.kind='integration.command' BEGIN SELECT RAISE(FAIL,'test write failure'); END;")?;
+    assert!(f.service.command(operation.clone()).await.is_err());
+    assert_eq!(
+        f.journal.snapshot().await?["assumptions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        f.open().await.err().unwrap().to_string(),
+        "test write failure"
+    );
+    db.execute_batch("DROP TRIGGER fail_commit_answer")?;
+    let kept = f.service.command(operation).await?;
+    assert_eq!(kept.revision, current.revision + 1);
+    let reopened = Journal::open(
+        f._root.path().join("events.sqlite"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await?;
+    assert_eq!(
+        reopened.snapshot().await?["integration"]["assumptions"][0]["state"],
+        "kept"
+    );
+    let other = &kept.assumptions[1].assumption;
+    f.journal
+        .answer_assumption(intercat_daemon::assumptions::Command {
+            op_id: Uuid::now_v7(),
+            assumption_id: other.id.parse()?,
+            revision: other.revision,
+            answer: intercat_daemon::assumptions::Answer::Keep,
+        })
+        .await?;
+    assert_eq!(
+        f.journal.snapshot().await?["integration"]["assumptionsChanged"],
+        true
+    );
+    f.service.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn changing_a_commit_assumption_repairs_the_reviewed_tree_without_refresh() -> Result<()> {
+    use intercat_daemon::{
+        repair, repair_application,
+        repair_run::{Event, Outcome, Phase, Purpose, Request},
+    };
+    let f = Fixture::new(1).await?;
+    fs::write(f.workspaces[0].path.join("file.txt"), "SQLite\n")?;
+    let saved = f.save(0, None).await?;
+    recorded_assumption(&f, 0, saved.turn_id, "saved").await?;
+    let checked = checked_assumptions(&f).await?;
+    let assumption = &checked.assumptions[0].assumption;
+    let request = Request {
+        op_id: Uuid::now_v7(),
+        job_id: checked.id,
+        revision: checked.revision,
+        track: assumption.track_id.clone(),
+        purpose: Purpose::Assumption {
+            id: assumption.id.parse()?,
+            revision: assumption.revision,
+            text: "Use PostgreSQL.".into(),
+        },
+    };
+    let run = f.journal.repair_start(request.clone()).await?;
+    assert_eq!(f.journal.repair_start(request).await?.id, run.id);
+    let log = f
+        .journal
+        .editor_log(intercat_daemon::editor_log::Query {
+            track_id: assumption.track_id.clone(),
+            before: None,
+        })
+        .await?;
+    let changes: Vec<_> = log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["scene"] == "assumption-change")
+        .collect();
+    assert_eq!(changes.len(), 1);
+    assert!(
+        changes[0]["line"]
+            .as_str()
+            .unwrap()
+            .contains("Commit waits")
+    );
+
+    assert!(
+        f.journal.snapshot().await?["assumptions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let (_, input, settings) = f.journal.repair_input(run.id).await?;
+    let parent = f
+        ._root
+        .path()
+        .join("integration")
+        .join(input.id.to_string());
+    let source = parent.join(input.candidate.as_ref().unwrap().generation.to_string());
+    let workspace = repair::Workspace::prepare(
+        &input,
+        &source,
+        &parent.join(format!("repair-{}", run.id)),
+        &run.track,
+        &settings,
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    fs::write(workspace.checkout.workdir.join("file.txt"), "PostgreSQL\n")?;
+    let mut captured = run;
+    let command = Uuid::now_v7();
+    for event in [
+        Event::Prepare,
+        Event::WorkspaceReady,
+        Event::HostStarted {
+            secret_revision: Some(0),
+            host: intercat_daemon::process::Identity {
+                pid: 42,
+                started_seconds: 1,
+                started_micros: 1,
+            },
+            nonce: Uuid::now_v7(),
+        },
+        Event::SessionReady {
+            session: "assumption-fix".into(),
+        },
+        Event::ReserveStart { command },
+        Event::Started {
+            command,
+            turn: Uuid::now_v7(),
+        },
+        Event::HostClosed {
+            outcome: Outcome::Completed,
+        },
+    ] {
+        captured = f
+            .journal
+            .repair_transition(Uuid::now_v7(), captured.id, captured.revision, event)
+            .await?;
+    }
+    let done = repair_application::apply(
+        &f.journal,
+        &captured,
+        std::sync::Arc::new(workspace),
+        source,
+        parent.join(input.revision.to_string()),
+        f._root.path().join("integration/downloads"),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    assert_eq!(done.phase, Phase::Done);
+    let repaired = f.open().await?;
+    assert_eq!(repaired.id, checked.id);
+    assert_eq!(repaired.status, Status::Checked);
+    let candidate = repaired.candidate.as_ref().unwrap();
+    assert_eq!(
+        git(
+            &f.source,
+            &["show", &format!("{}:file.txt", candidate.head)]
+        ),
+        "PostgreSQL"
+    );
+    assert!(!candidate.commits[0].message.contains("Assumptions kept"));
+    assert_eq!(
+        fs::read_to_string(f.workspaces[0].path.join("file.txt"))?,
+        "SQLite\n"
+    );
+    assert_eq!(repaired.assumptions[0].assumption.state, "changed");
+    f.action(Action::Refresh {
+        id: repaired.id,
+        revision: repaired.revision,
+    })
+    .await?;
+    assert_eq!(
+        f.journal.snapshot().await?["assumptions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    f.service.shutdown().await;
+    f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_waits_for_assumption_reading_and_can_retry_an_exhausted_extraction() -> Result<()> {
+    let f = Fixture::new(1).await?;
+    fs::write(f.workspaces[0].path.join("file.txt"), "new\n")?;
+    let saved = f.save(0, None).await?;
+    let track = &f.workspaces[0].track_id;
+    f.journal
+        .try_msp(
+            track.clone(),
+            "reading-session".into(),
+            intercat_daemon::clock::Stamp::now(),
+            json!({"method":"item/updated","params":{"sessionId":"reading-session","item":{
+            "itemId":"pending","turnId":saved.turn_id,"kind":"agentMessage","revision":1,
+            "status":"completed","text":"Inspecting the cache implementation."}}}),
+            None,
+            None,
+        )?
+        .await??;
+    let checked = checked_assumptions(&f).await?;
+    assert_eq!(
+        f.journal.snapshot().await?["integration"]["assumptionsPending"],
+        1
+    );
+    let candidate = checked.candidate.as_ref().unwrap();
+    assert!(
+        f.action(Action::Commit {
+            id: checked.id,
+            revision: checked.revision,
+            head: candidate.head.clone(),
+            tree: candidate.tree.clone(),
+            settings_hash: candidate.settings_hash.clone()
+        })
+        .await
+        .is_err()
+    );
+    for _ in 0..2 {
+        let ticket = f.journal.claim_assumptions().await?.unwrap();
+        f.journal
+            .finish_assumptions(ticket, intercat_daemon::assumptions::Finish::Failed)
+            .await?;
+    }
+    assert_eq!(
+        f.journal.snapshot().await?["integration"]["assumptionsFailed"],
+        1
+    );
+    let retry = f
+        .action(Action::RetryAssumptions {
+            id: checked.id,
+            revision: checked.revision,
+        })
+        .await?;
+    assert_eq!(retry.assumptions_failed, 0);
+    assert_eq!(retry.assumptions_pending, 1);
+    let ticket = f.journal.claim_assumptions().await?.unwrap();
+    f.journal
+        .finish_assumptions(
+            ticket,
+            intercat_daemon::assumptions::Finish::Complete(vec![]),
+        )
+        .await?;
+    let ready = f.open().await?;
+    assert_eq!(ready.assumptions_pending, 0);
+    let candidate = ready.candidate.as_ref().unwrap();
+    f.action(Action::Commit {
+        id: ready.id,
+        revision: ready.revision,
+        head: candidate.head.clone(),
+        tree: candidate.tree.clone(),
+        settings_hash: candidate.settings_hash.clone(),
+    })
+    .await?;
+    assert_eq!(finished(&f.journal).await?.status, Status::Done);
+    f.service.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn check_environment_selection_is_frozen_and_recheck_keeps_the_saved_tracks() -> Result<()> {
+    use intercat_daemon::check_environment::Change;
+    let f = Fixture::new(1).await?;
+    let file = f.source.join(".env.test");
+    fs::write(&file, "CHECK_VALUE=original-check-value\n")?;
+    let choose = Change {
+        op_id: Uuid::now_v7(),
+        revision: 0,
+        file: Some(file.clone()),
+    };
+    let selected = f.journal.change_check_environment(choose.clone()).await?;
+    assert_eq!(selected.revision, 1);
+    fs::remove_file(&file)?;
+    assert_eq!(f.journal.change_check_environment(choose).await?, selected);
+    fs::write(&file, "CHECK_VALUE=original-check-value\n")?;
+    let checked = checked_for_edit(&f).await?;
+    let original_settings = f
+        .journal
+        .integration_settings(checked.id, checked.revision)
+        .await?
+        .unwrap();
+    assert_eq!(
+        original_settings.environment_values()?["CHECK_VALUE"],
+        "original-check-value"
+    );
+    let command = Change {
+        op_id: Uuid::now_v7(),
+        revision: 1,
+        file: None,
+    };
+    f.journal.change_check_environment(command.clone()).await?;
+    assert_eq!(
+        f.journal.change_check_environment(command).await?.revision,
+        2
+    );
+    assert_eq!(
+        f.journal.snapshot().await?["integration"]["settingsChanged"],
+        true
+    );
+    assert_eq!(
+        f.journal
+            .integration_settings(checked.id, checked.revision)
+            .await?
+            .unwrap()
+            .hash()?,
+        original_settings.hash()?
+    );
+    fs::write(f.workspaces[0].path.join("file.txt"), "later work\n")?;
+    f.save(0, checked.tracks[0].checkpoint.clone()).await?;
+    let request = IntegrationCommand {
+        op_id: Uuid::now_v7(),
+        action: Action::Recheck {
+            id: checked.id,
+            revision: checked.revision,
+        },
+    };
+    f.service.command(request.clone()).await?;
+    let updated = finished(&f.journal).await?;
+    assert_eq!(updated.status, Status::Checked);
+    assert_eq!(updated.revision, checked.revision + 1);
+    assert_eq!(
+        updated.candidate.as_ref().unwrap().tree,
+        checked.candidate.as_ref().unwrap().tree
+    );
+    assert_eq!(
+        updated.tracks[0].checkpoint.as_ref().unwrap().sha,
+        checked.tracks[0].checkpoint.as_ref().unwrap().sha
+    );
+    assert!(
+        f.journal
+            .integration_settings(updated.id, updated.revision)
+            .await?
+            .unwrap()
+            .environment_values()?
+            .is_empty()
+    );
+    assert_eq!(f.service.command(request).await?.revision, updated.revision);
+    assert_eq!(
+        f.journal.snapshot().await?["integration"]["settingsChanged"],
+        false
+    );
+    f.service.shutdown().await;
+    let reopened = Journal::open(
+        f._root.path().join("events.sqlite"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await?;
+    assert_eq!(reopened.check_environment().await?.revision, 2);
+    assert!(reopened.check_environment().await?.file.is_none());
+    Ok(())
+}
+#[tokio::test]
+async fn commit_order_proposal_freezes_inputs_and_replays_the_confirmed_order() -> Result<()> {
+    let f = Fixture::new(2).await?;
+    for index in 0..2 {
+        fs::write(
+            f.workspaces[index].path.join("file.txt"),
+            if index == 0 { "base\nA\n" } else { "B\nbase\n" },
+        )?;
+        f.save(index, None).await?;
+    }
+    let open = IntegrationCommand {
+        op_id: Uuid::now_v7(),
+        action: Action::Open { tracks: None },
+    };
+    let proposed = f.service.command(open.clone()).await?;
+    assert_eq!(proposed.status, Status::Ordering);
+    assert!(proposed.candidate.is_none());
+    assert!(proposed.plan.as_ref().unwrap().tree.is_none());
+    let review = proposed.order_review.as_ref().unwrap();
+    assert_eq!(review.overlaps.len(), 1);
+    assert_eq!(review.overlaps[0].path, "file.txt");
+    assert!(!review.confirmed);
+    assert!(
+        f.service
+            .command(IntegrationCommand {
+                op_id: Uuid::now_v7(),
+                action: Action::Open {
+                    tracks: Some(vec![review.order[0].clone()]),
+                }
+            })
+            .await
+            .is_err()
+    );
+    let mut reverse = review.order.clone();
+    reverse.reverse();
+    // New in-flight edits must not enter the captured order or preview.
+    fs::write(f.workspaces[0].path.join("file.txt"), "not saved\n")?;
+    assert!(
+        f.service
+            .command(IntegrationCommand {
+                op_id: Uuid::now_v7(),
+                action: Action::Prepare {
+                    id: proposed.id,
+                    revision: proposed.revision,
+                }
+            })
+            .await
+            .is_err()
+    );
+    let confirm = IntegrationCommand {
+        op_id: Uuid::now_v7(),
+        action: Action::Order {
+            id: proposed.id,
+            revision: proposed.revision,
+            tracks: reverse.clone(),
+        },
+    };
+    let ordered = f.service.command(confirm.clone()).await?;
+    assert_eq!(ordered.status, Status::Open);
+    assert_eq!(ordered.plan.as_ref().unwrap().rows[0].track, reverse[0]);
+    assert_eq!(ordered.tracks[0].id, reverse[0]);
+    assert!(ordered.order_review.as_ref().unwrap().confirmed);
+    assert_eq!(
+        git(
+            &f.source,
+            &[
+                "show",
+                &format!(
+                    "{}:file.txt",
+                    ordered.plan.as_ref().unwrap().tree.as_ref().unwrap()
+                )
+            ]
+        ),
+        "B\nbase\nA"
+    );
+    let repeated = f.service.command(confirm).await?;
+    assert_eq!(repeated.revision, ordered.revision);
+    let reloaded = Journal::open(
+        f._root.path().join("events.sqlite"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await?;
+    let reopened = Service::new(reloaded, f._root.path().join("reopened-review"))
+        .command(open)
+        .await?;
+    assert_eq!(reopened.revision, ordered.revision);
+    assert_eq!(reopened.tracks[0].id, reverse[0]);
+    assert_eq!(
+        f.journal.snapshot().await?["integration"]["orderReview"]["confirmed"],
+        true
+    );
+    f.action(Action::Prepare {
+        id: ordered.id,
+        revision: ordered.revision,
+    })
+    .await?;
+    let checked = finished(&f.journal).await?;
+    assert_eq!(checked.status, Status::Checked, "{:?}", checked.error);
+    assert_eq!(
+        checked
+            .candidate
+            .as_ref()
+            .unwrap()
+            .commits
+            .iter()
+            .map(|commit| &commit.track)
+            .collect::<Vec<_>>(),
+        reverse.iter().collect::<Vec<_>>()
+    );
+    let refreshed = f
+        .service
+        .command(IntegrationCommand {
+            op_id: Uuid::now_v7(),
+            action: Action::Refresh {
+                id: ordered.id,
+                revision: ordered.revision,
+            },
+        })
+        .await?;
+    assert_eq!(refreshed.order_review.as_ref().unwrap().order, reverse);
+    f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_order_proposal_rejects_stale_and_invalid_orders_and_refreshes_explicitly()
+-> Result<()> {
+    let f = Fixture::new(2).await?;
+    let mut checkpoints = Vec::new();
+    for index in 0..2 {
+        fs::write(f.workspaces[index].path.join("file.txt"), "shared change\n")?;
+        checkpoints.push(f.save(index, None).await?);
+    }
+    let proposed = f
+        .service
+        .command(IntegrationCommand {
+            op_id: Uuid::now_v7(),
+            action: Action::Open { tracks: None },
+        })
+        .await?;
+    let order = proposed.order_review.as_ref().unwrap().order.clone();
+    for invalid in [
+        vec![],
+        vec![order[0].clone(), order[0].clone()],
+        vec![order[0].clone(), Uuid::now_v7().to_string()],
+    ] {
+        assert!(
+            f.service
+                .command(IntegrationCommand {
+                    op_id: Uuid::now_v7(),
+                    action: Action::Order {
+                        id: proposed.id,
+                        revision: proposed.revision,
+                        tracks: invalid,
+                    }
+                })
+                .await
+                .is_err()
+        );
+    }
+    fs::write(f.workspaces[1].path.join("file.txt"), "base\n")?;
+    f.save(1, Some(checkpoints.pop().unwrap())).await?;
+    let same = f
+        .service
+        .command(IntegrationCommand {
+            op_id: Uuid::now_v7(),
+            action: Action::Open { tracks: None },
+        })
+        .await?;
+    assert_eq!(same.status, Status::Ordering);
+    assert_eq!(same.revision, proposed.revision);
+    let refreshed = f
+        .service
+        .command(IntegrationCommand {
+            op_id: Uuid::now_v7(),
+            action: Action::Refresh {
+                id: proposed.id,
+                revision: proposed.revision,
+            },
+        })
+        .await?;
+    assert_eq!(refreshed.status, Status::Open);
+    assert!(refreshed.order_review.as_ref().unwrap().overlaps.is_empty());
+    assert!(
+        f.service
+            .command(IntegrationCommand {
+                op_id: Uuid::now_v7(),
+                action: Action::Order {
+                    id: proposed.id,
+                    revision: proposed.revision,
+                    tracks: order,
+                }
+            })
+            .await
+            .is_err()
+    );
+    f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_order_uses_saved_changes_and_excludes_already_integrated_paths() -> Result<()> {
+    let f = Fixture::new(2).await?;
+    fs::write(f.workspaces[0].path.join("file.txt"), "shared change\n")?;
+    let saved = f.save(0, None).await?;
+    fs::write(f.workspaces[1].path.join("other.txt"), "different change\n")?;
+    let other = f.save(1, None).await?;
+    fs::write(f.workspaces[1].path.join("file.txt"), "in-flight overlap\n")?;
+    let opened = f
+        .service
+        .command(IntegrationCommand {
+            op_id: Uuid::now_v7(),
+            action: Action::Open { tracks: None },
+        })
+        .await?;
+    assert_eq!(opened.status, Status::Open);
+    assert!(opened.order_review.as_ref().unwrap().overlaps.is_empty());
+    fs::write(f.workspaces[1].path.join("file.txt"), "shared change\n")?;
+    f.save(1, Some(other)).await?;
+    let mut inspected = f
+        .service
+        .command(IntegrationCommand {
+            op_id: Uuid::now_v7(),
+            action: Action::Refresh {
+                id: opened.id,
+                revision: opened.revision,
+            },
+        })
+        .await?;
+    assert_eq!(inspected.status, Status::Ordering);
+    inspected.plan.as_mut().unwrap().rows[0].expected_integrated = Some(saved.sha);
+    let review = intercat_daemon::integration_order::inspect(&inspected)?;
+    assert!(review.overlaps.is_empty());
+    f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_order_write_failure_keeps_the_job_unmerged_and_can_retry() -> Result<()> {
+    let f = Fixture::new(2).await?;
+    for index in 0..2 {
+        fs::write(f.workspaces[index].path.join("file.txt"), "shared change\n")?;
+        f.save(index, None).await?;
+    }
+    let db = rusqlite::Connection::open(f._root.path().join("events.sqlite"))?;
+    db.execute_batch("CREATE TRIGGER fail_order BEFORE INSERT ON integration_order_reviews BEGIN SELECT RAISE(ABORT,'order storage full'); END;")?;
+    let request = IntegrationCommand {
+        op_id: Uuid::now_v7(),
+        action: Action::Open { tracks: None },
+    };
+    assert!(f.service.command(request.clone()).await.is_err());
+    let snapshot = f.journal.snapshot().await?;
+    assert_eq!(snapshot["integration"]["status"], "preparing");
+    assert!(snapshot["integration"]["plan"]["tree"].is_null());
+    assert!(snapshot["integration"]["candidate"].is_null());
+    db.execute_batch("DROP TRIGGER fail_order;")?;
+    let proposed = f.service.command(request).await?;
+    assert_eq!(proposed.status, Status::Ordering);
+    let confirm = IntegrationCommand {
+        op_id: Uuid::now_v7(),
+        action: Action::Order {
+            id: proposed.id,
+            revision: proposed.revision,
+            tracks: proposed
+                .order_review
+                .as_ref()
+                .unwrap()
+                .order
+                .iter()
+                .rev()
+                .cloned()
+                .collect(),
+        },
+    };
+    db.execute_batch("CREATE TRIGGER fail_order BEFORE INSERT ON integration_order_reviews BEGIN SELECT RAISE(ABORT,'order storage full'); END;")?;
+    assert!(f.service.command(confirm.clone()).await.is_err());
+    assert_eq!(
+        f.journal.snapshot().await?["integration"]["revision"],
+        proposed.revision
+    );
+    db.execute_batch("DROP TRIGGER fail_order;")?;
+    assert_eq!(f.service.command(confirm).await?.status, Status::Open);
     f.source_unchanged()?;
     Ok(())
 }

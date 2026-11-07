@@ -1,11 +1,12 @@
 import { Application, CanvasSource, Container, Graphics, NineSliceSprite, Sprite, Text, Texture } from 'pixi.js';
 import type { TimelineMark } from '../bridge';
+import { groupMarks, markLabel } from './inputMarkLayout';
 import { formatTime, geometry, LABEL_WIDTH, TOP_HEIGHT, type TimelineView } from './model';
 import type { Lane } from './viewport';
 
 interface SceneState {
   rows: Lane[]; visible: Lane[]; width: number; height: number; scroll: number; total: number;
-  selected: string; overview: boolean; view: TimelineView; marks: TimelineMark[];
+  selected: string; hovered: string | null; overview: boolean; view: TimelineView; marks: TimelineMark[];
 }
 interface ActiveBar { sprite: NineSliceSprite; start: number; end: number }
 interface RowScene { container: Container; background: Graphics; content: Container; row: Lane; signature: string; active: ActiveBar[]; texture?: Texture }
@@ -62,6 +63,7 @@ export class TimelineScene {
     return texture;
   }
   sync(state: SceneState) {
+    const previous = this.state;
     this.state = state;
     if (this.app.screen.width !== state.width || this.app.screen.height !== state.height || this.app.renderer.resolution !== window.devicePixelRatio) this.app.renderer.resize(state.width, state.height, window.devicePixelRatio);
     const { timeWidth, futureWidth } = geometry(state.width);
@@ -74,31 +76,42 @@ export class TimelineScene {
       this.grid.clear(); this.headings.removeChildren().forEach(child => child.destroy());
       segment(this.grid, right, 27, right, state.height, 0x25272f);
       segment(this.grid, LABEL_WIDTH, 67, right, 67, 0x272932);
+      let timeLabelEnd = LABEL_WIDTH - 12;
       for (let t = Math.ceil(state.view.start / 120) * 120; t < state.view.start + state.view.duration; t += 120) {
         const x = LABEL_WIDTH + (t - state.view.start) / state.view.duration * timeWidth;
         segment(this.grid, x, 28, x, state.height, 0x17191f);
         if (t + 120 < state.view.start + state.view.duration) {
           const tick = label(this.headings, formatTime(t).slice(0, 5), x + 5, 6, 0x82858f);
-          if (tick.x + tick.width > right - 8) tick.destroy();
+          if (tick.x < timeLabelEnd + 12 || tick.x + tick.width > right - 8) tick.destroy();
+          else timeLabelEnd = tick.x + tick.width;
         }
       }
       label(this.headings, 'WAITING TO RUN', right + 10, 7, 0x747984, 9);
     }
-    if (gridChanged || this.previousMarks !== state.marks) {
+    if (gridChanged || this.previousMarks !== state.marks || previous?.rows !== state.rows || previous?.scroll !== state.scroll) {
       this.previousMarks = state.marks;
       this.markTexture?.destroy(true); this.markTexture = undefined;
       this.marks.removeChildren().forEach(child => child.destroy());
       const drawing = new Container();
-      const tracks = new Map(state.rows.map(row => [row.track.id, row.track.label]));
+      const tracks = state.rows.map(row => row.track);
       let labelEnd = LABEL_WIDTH;
-      for (const mark of [...state.marks].sort((a, b) => a.at - b.at || a.id.localeCompare(b.id))) {
-        const x = LABEL_WIDTH + (mark.at / 1000 - state.view.start) / state.view.duration * timeWidth;
-        if (x < LABEL_WIDTH + 5 || x > right - 5) continue;
-        drawing.addChild(new Graphics().poly([x, 62, x + 5, 67, x, 72, x - 5, 67]).fill(0xd9a24a));
-        // Keep every diamond; close later inputs expose their text on focus/hover.
+      for (const group of groupMarks(state.marks, state.view, state.width)) {
+        const x = group.x;
+        const mark = group.marks[0];
+        const color = mark.operation === null ? 0x9299a6 : 0xd9a24a;
+        const glyph = new Graphics();
+        if (mark.attached) glyph.poly([x - 4, 61, x + 2, 61, x + 5, 64, x + 5, 73, x - 4, 73]).stroke({ color, width: 1.5 });
+        else if (mark.operation === 'park') glyph.poly([x, 62, x + 5, 67, x, 72, x - 5, 67]).stroke({ color, width: 1.5 });
+        else glyph.poly([x, 62, x + 5, 67, x, 72, x - 5, 67]).fill(color);
+        drawing.addChild(glyph);
+        const row = state.visible.find(row => row.track.id === mark.trackId && row.repairId === mark.repairRunId);
+        if (group.marks.length === 1 && row) {
+          const end = TOP_HEIGHT + row.top - state.scroll + 7;
+          if (end >= TOP_HEIGHT) segment(glyph, x, 96, x, end, color, 0.3);
+        }
         if (x - 8 < labelEnd) continue;
-        const text = new Text({ text: mark.text.slice(0, 25), style: { fontFamily: 'Inter', fontSize: 10, fill: 0xb6b8c1 } });
-        const target = new Text({ text: `to ${tracks.get(mark.trackId) ?? '?'}${mark.repairRunId ? ' · for the commit' : ''}`, style: { fontFamily: 'Inter', fontSize: 10, fill: 0x81858f } });
+        const text = new Text({ text: group.marks.length > 1 ? `${group.marks.length} requests` : Array.from(mark.text).slice(0, 25).join(''), style: { fontFamily: 'Inter', fontSize: 10, fill: 0xb6b8c1 } });
+        const target = new Text({ text: group.marks.length > 1 ? 'Choose a request' : markLabel(mark, tracks), style: { fontFamily: 'Inter', fontSize: 10, fontStyle: mark.operation === 'park' ? 'italic' : 'normal', fill: 0x9299a6 } });
         const width = Math.max(text.width, target.width);
         if (x - 8 + width > right - 5) { text.destroy(); target.destroy(); continue; }
         text.position.set(x - 8, 37); target.position.set(x - 8, 82);
@@ -127,7 +140,10 @@ export class TimelineScene {
         scene.row = row; scene.signature = signature; this.drawRow(scene);
       }
       scene.background.clear();
-      if (row.key === state.selected) scene.background.rect(0, 0, state.width - 8, row.height - 1).fill({ color: row.track.color, alpha: 0.07 });
+      if (row.key === state.selected || row.key === state.hovered) {
+        const alpha = row.key === state.hovered ? row.key === state.selected ? 0.11 : 0.045 : 0.07;
+        scene.background.rect(0, 0, state.width - 8, row.height - 1).fill({ color: row.track.color, alpha });
+      }
       segment(scene.background, 0, 0, state.width - 8, 0, 0x202229);
     }
     // Clip scrollable rows without allocating an off-screen render texture.
@@ -162,6 +178,14 @@ export class TimelineScene {
     const compact = row.repairId !== null;
     const top = state.overview ? 2 : compact ? 4 : 22;
     const height = state.overview ? 8 : compact ? 18 : 31;
+    if (!state.overview) for (const clip of row.clips) {
+      for (const at of clip.assumptionTimes ?? []) {
+        const x = toX(at), y = top - 9;
+        if (x >= LABEL_WIDTH + 5 && x <= right - 5) {
+          graphics.poly([x, y - 5, x + 5, y, x, y + 5, x - 5, y]).fill(0xd9a24a);
+        }
+      }
+    }
     for (const clip of row.clips) {
       const left = Math.max(LABEL_WIDTH, toX(clip.start)), end = Math.min(right, toX(clip.running ? Math.max(clip.end, state.view.now) : clip.end));
       if (end < LABEL_WIDTH || left >= right) continue;
@@ -173,6 +197,10 @@ export class TimelineScene {
         scene.active.push({ sprite, start: clip.start, end: clip.end });
       } else {
         graphics.roundRect(left, top, width, height, state.overview ? 0 : 3).fill({ color: row.track.color, alpha: clip.kind === 'think' ? 0.10 : 0.22 }).stroke({ color: row.track.color, alpha: 0.55, width: 1 });
+      }
+      if (clip.warnings?.length) {
+        const size = Math.min(state.overview ? 4 : 6, width);
+        graphics.poly([left + width - size, top, left + width, top, left + width, top + size]).fill(0xd9a24a);
       }
       if (state.overview) continue;
       if (clip.kind === 'edit') segment(graphics, left + 2, top + 1, left + Math.min(12, width - 2), top + 1, 0xd9a24a);

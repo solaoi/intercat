@@ -35,6 +35,15 @@ pub struct RawFrame {
 }
 
 enum Job {
+    ReadCheckEnvironment {
+        reply: oneshot::Sender<Result<crate::check_environment::Selection>>,
+    },
+    ChangeCheckEnvironment {
+        request: crate::check_environment::Change,
+        project_root: PathBuf,
+        file: Option<PathBuf>,
+        reply: oneshot::Sender<Result<crate::check_environment::Selection>>,
+    },
     #[cfg(all(feature = "fault-injection", debug_assertions))]
     TestFault {
         request: crate::fault_injection::Request,
@@ -192,6 +201,10 @@ enum Job {
         change: crate::branch::Change,
         reply: oneshot::Sender<Result<crate::branch::Branch>>,
     },
+    BranchPoints {
+        query: crate::branch_points::Query,
+        reply: oneshot::Sender<Result<crate::branch_points::Page>>,
+    },
     ConfirmFingerprints {
         seal: crate::secrets::Seal,
         reply: oneshot::Sender<Result<()>>,
@@ -204,6 +217,25 @@ enum Job {
     ReadFingerprints {
         track: String,
         session: String,
+        reply: oneshot::Sender<Result<Vec<crate::progress::Fingerprint>>>,
+    },
+    ApplyPrivacy {
+        prepared: crate::privacy::Prepared,
+        reply: oneshot::Sender<Result<Vec<crate::privacy::View>>>,
+    },
+    PrivacyState {
+        reply: oneshot::Sender<Result<crate::privacy_policy::State>>,
+    },
+    PrivacyChange {
+        request: crate::privacy_policy::Change,
+        local_ready: bool,
+        reply: oneshot::Sender<Result<crate::privacy_policy::State>>,
+    },
+    ReadPrivacy {
+        id: i64,
+        reply: oneshot::Sender<Result<String>>,
+    },
+    ReadAllFingerprints {
         reply: oneshot::Sender<Result<Vec<crate::progress::Fingerprint>>>,
     },
     RepairStart {
@@ -313,8 +345,15 @@ enum Job {
         plan: crate::integration::Plan,
         reply: oneshot::Sender<Result<crate::integration::Job>>,
     },
+    IntegrationOrderReview {
+        id: uuid::Uuid,
+        revision: u64,
+        review: crate::integration_order::Review,
+        reply: oneshot::Sender<Result<crate::integration::Job>>,
+    },
     IntegrationCommand {
         command: crate::integration::Command,
+        settings: Option<crate::candidate::Settings>,
         reply: oneshot::Sender<Result<crate::integration::Job>>,
     },
     IntegrationPlanned {
@@ -430,8 +469,40 @@ enum Job {
         turn: uuid::Uuid,
         reply: oneshot::Sender<Result<Vec<(Value, i64)>>>,
     },
+    ReadInput {
+        id: String,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    ReadInputOrigin {
+        input: uuid::Uuid,
+        reply: oneshot::Sender<Result<Option<crate::input_origin::Origin>>>,
+    },
+    MarkMisread {
+        request: crate::input_feedback::Misread,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    NextInferredCorrection {
+        reply: oneshot::Sender<Result<Option<crate::input_inference::Ticket>>>,
+    },
+    FinishInferredCorrection {
+        ticket: crate::input_inference::Ticket,
+        result: crate::input_inference::Evaluation,
+        reply: oneshot::Sender<Result<bool>>,
+    },
     ClipDetail {
         id: String,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    InputMasked {
+        ticket: crate::input_readings::Ticket,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    EditorLog {
+        query: crate::editor_log::Query,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    EditorAway {
+        query: crate::editor_away::Query,
         reply: oneshot::Sender<Result<Value>>,
     },
     TimelineWindow {
@@ -453,6 +524,10 @@ enum Job {
         id: String,
         revision: i64,
         analysis: crate::reports::Analysis,
+        reply: oneshot::Sender<Result<i64>>,
+    },
+    AnalyzeBackgroundReports {
+        results: Vec<(crate::reports::Report, crate::reports::Analysis)>,
         reply: oneshot::Sender<Result<i64>>,
     },
     RespondReport {
@@ -516,6 +591,13 @@ enum Job {
         id: String,
         reply: oneshot::Sender<Result<Option<Value>>>,
     },
+    QueueApprovalReply {
+        request: crate::approval_reply::Request,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    AdvanceApprovalReplies {
+        reply: oneshot::Sender<Result<()>>,
+    },
     ProjectConfig {
         id: String,
         project: crate::project::Project,
@@ -534,6 +616,18 @@ enum Job {
         config: Value,
         reply: oneshot::Sender<Result<Admission>>,
     },
+    ReadEditorCalibration {
+        prefix: String,
+        cache_prefix: bool,
+        reply: oneshot::Sender<Result<crate::editor_calibration::Applied>>,
+    },
+    EditorCalibrationState {
+        reply: oneshot::Sender<Result<crate::editor_calibration::State>>,
+    },
+    ApplyEditorCalibration {
+        change: crate::editor_calibration::Change,
+        reply: oneshot::Sender<Result<crate::editor_calibration::State>>,
+    },
     ReadEditorConfig {
         reply: oneshot::Sender<Result<Option<Value>>>,
     },
@@ -543,11 +637,54 @@ enum Job {
         target: Target,
         selected: Option<String>,
         attachments: Vec<uuid::Uuid>,
+        sources: Option<crate::request_sources::Record>,
         reply: oneshot::Sender<Result<Value>>,
+    },
+    ReviewPossible {
+        input: String,
+        revision: i64,
+        tracks: Vec<String>,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    ReadReasonReview {
+        input: String,
+        reply: oneshot::Sender<Result<Option<crate::reason_review::Review>>>,
+    },
+    ReadRequestSources {
+        input: String,
+        reply: oneshot::Sender<Result<(String, Option<crate::request_sources::Record>)>>,
+    },
+    InputCandidates {
+        input: String,
+        reading: i64,
+        text: String,
+        target: Target,
+        selected: Option<String>,
+        reply: oneshot::Sender<Result<(crate::routing::Selection, crate::input_context::Context)>>,
     },
     SaveAttachment {
         stored: crate::attachment_store::Stored,
+        masked: bool,
         reply: oneshot::Sender<Result<()>>,
+    },
+    PreviousAttachmentScreening {
+        request: crate::attachment_screening::Request,
+        reply: oneshot::Sender<Result<Option<crate::attachment_screening::Revision>>>,
+    },
+    ReadAttachmentScreening {
+        id: uuid::Uuid,
+        digest: String,
+        reply: oneshot::Sender<Result<Option<crate::attachment_screening::Revision>>>,
+    },
+    SaveAttachmentScreening {
+        request: crate::attachment_screening::Request,
+        revision: crate::attachment_screening::Revision,
+        reply: oneshot::Sender<Result<crate::attachment_screening::Revision>>,
+    },
+    PastedReferences {
+        track: String,
+        after: Option<uuid::Uuid>,
+        reply: oneshot::Sender<Result<Vec<crate::attachment_store::Stored>>>,
     },
     InputAttachments {
         input: String,
@@ -568,9 +705,128 @@ enum Job {
     ClaimInput {
         reply: oneshot::Sender<Result<Option<PendingInput>>>,
     },
+    SubmitRephrase {
+        request: crate::rephrases::Submission,
+        original: Option<crate::attachment_store::Stored>,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    ClaimRephrase {
+        reply: oneshot::Sender<Result<Option<crate::rephrases::Ticket>>>,
+    },
+    RephraseCurrent {
+        ticket: crate::rephrases::Ticket,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    FinishRephrase {
+        ticket: crate::rephrases::Ticket,
+        outcome: crate::rephrases::Finish,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    ClaimDescription {
+        reply: oneshot::Sender<Result<Option<crate::descriptions::Ticket>>>,
+    },
+    ClaimAssumptions {
+        reply: oneshot::Sender<Result<Option<crate::assumptions::Ticket>>>,
+    },
+    FinishAssumptions {
+        ticket: crate::assumptions::Ticket,
+        outcome: crate::assumptions::Finish,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    NextClipFiles {
+        reply: oneshot::Sender<Result<Option<crate::clip_files::Ticket>>>,
+    },
+    FinishClipFiles {
+        ticket: crate::clip_files::Ticket,
+        result: Result<crate::clip_files::Comparison>,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    CheckQuietProposal {
+        now: crate::clock::Stamp,
+        reply: oneshot::Sender<Result<Option<crate::quiet_proposals::Ticket>>>,
+    },
+    FinishQuietProposal {
+        ticket: crate::quiet_proposals::Ticket,
+        changes: Option<crate::quiet_proposals::Changes>,
+        now: crate::clock::Stamp,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    AnswerProposal {
+        command: crate::proposals::Command,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    AnswerAssumption {
+        command: crate::assumptions::Command,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    ClaimClipSummary {
+        reply: oneshot::Sender<Result<Option<crate::clip_summaries::Ticket>>>,
+    },
+    ObserveTimeline {
+        owner: uuid::Uuid,
+        revision: i64,
+        view: Option<crate::clip_summaries::View>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ClipSummaryCurrent {
+        ticket: crate::clip_summaries::Ticket,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    FinishClipSummary {
+        ticket: crate::clip_summaries::Ticket,
+        outcome: crate::clip_summaries::Finish,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    DescriptionCurrent {
+        ticket: crate::descriptions::Ticket,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    FinishDescription {
+        ticket: crate::descriptions::Ticket,
+        outcome: crate::descriptions::Finish,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    ClaimReread {
+        reply: oneshot::Sender<Result<Option<crate::input_readings::Pending>>>,
+    },
+    RereadCurrent {
+        ticket: crate::input_readings::Ticket,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    ReleaseReread {
+        ticket: crate::input_readings::Ticket,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    ApplyReread {
+        ticket: crate::input_readings::Ticket,
+        outcome: Outcome,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    TimelineHistory {
+        request: crate::timeline_history::Request,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    EditInput {
+        request: crate::edit_hold::Request,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    ClaimRedirect {
+        input: String,
+        revision: i64,
+        reply: oneshot::Sender<Result<Option<crate::redirect::Redirect>>>,
+    },
     ApplyInput {
         id: String,
         revision: i64,
+        outcome: Outcome,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ExpireInput {
+        ticket: crate::input_readings::Ticket,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    FinishReading {
+        ticket: crate::input_readings::Ticket,
         outcome: Outcome,
         reply: oneshot::Sender<Result<()>>,
     },
@@ -594,11 +850,27 @@ enum Job {
     RecoverInputs {
         reply: oneshot::Sender<Result<()>>,
     },
+    ConfirmationChange {
+        request: crate::confirmation::Change,
+        reply: oneshot::Sender<Result<crate::confirmation::Status>>,
+    },
+    ConfirmInput {
+        request: crate::confirmation::Accept,
+        reply: oneshot::Sender<Result<Value>>,
+    },
     ResolveInput {
         id: String,
         input: String,
         revision: i64,
         resolution: Resolution,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    DraftRead {
+        session: String,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    DraftSave {
+        request: crate::drafts::Save,
         reply: oneshot::Sender<Result<Value>>,
     },
     Snapshot {
@@ -633,16 +905,34 @@ impl Job {
             Self::HoldInputs { .. }
                 | Self::DispatchPause { .. }
                 | Self::Snapshot { .. }
+                | Self::DraftRead { .. }
                 | Self::PauseHistory { .. }
                 | Self::ReadOperation { .. }
+                | Self::RereadCurrent { .. }
+                | Self::DescriptionCurrent { .. }
+                | Self::RephraseCurrent { .. }
+                | Self::ClipSummaryCurrent { .. }
+                | Self::ObserveTimeline { .. }
                 | Self::ReadWorkerConfig { .. }
                 | Self::ReadEditorConfig { .. }
+                | Self::ReadEditorCalibration { .. }
+                | Self::EditorCalibrationState { .. }
                 | Self::ReadWorkspace { .. }
                 | Self::ReadDeletion { .. }
                 | Self::PendingProject { .. }
                 | Self::ProjectUses { .. }
                 | Self::FingerprintCatalog { .. }
                 | Self::ReadFingerprints { .. }
+                | Self::ReadAllFingerprints { .. }
+                | Self::ReadPrivacy { .. }
+                | Self::PrivacyState { .. }
+                | Self::ReviewPossible { .. }
+                | Self::ReadReasonReview { .. }
+                | Self::ReadRequestSources { .. }
+                | Self::PreviousAttachmentScreening { .. }
+                | Self::ReadAttachmentScreening { .. }
+                | Self::PastedReferences { .. }
+                | Self::InputCandidates { .. }
                 | Self::FingerprintRecovery { .. }
                 | Self::BackupReview { .. }
                 | Self::BackupApplyRead { .. }
@@ -659,7 +949,12 @@ impl Job {
                 | Self::ReconcileLocal { .. }
                 | Self::ReconcileReplay { .. }
                 | Self::ClipDetail { .. }
+                | Self::ReadInput { .. }
+                | Self::ReadInputOrigin { .. }
                 | Self::TimelineWindow { .. }
+                | Self::EditorLog { .. }
+                | Self::EditorAway { .. }
+                | Self::BranchPoints { .. }
         )
     }
 }
@@ -701,10 +996,21 @@ fn flush_controls(connection: &mut Connection, pending: &mut std::collections::V
 
 #[derive(Clone)]
 pub struct Journal {
+    full_privacy: crate::full_privacy::Runtime,
+    fingerprint_gate: std::sync::Arc<tokio::sync::RwLock<()>>,
     secret_key: std::sync::Arc<crate::secrets::Key>,
     attachment_root: std::sync::Arc<PathBuf>,
     jobs: mpsc::Sender<Job>,
     changes: watch::Receiver<i64>,
+}
+
+// The mask and its read lease travel together through inspection and delivery.
+#[derive(Clone)]
+struct Screening {
+    policy: crate::privacy_policy::State,
+    seal: crate::secrets::Seal,
+    mask: crate::progress::Mask,
+    _permit: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
 impl Journal {
@@ -729,18 +1035,192 @@ impl Journal {
         let attachment = stored.attachment.clone();
         let (reply, result) = oneshot::channel();
         self.jobs
-            .send(Job::SaveAttachment { stored, reply })
+            .send(Job::SaveAttachment {
+                stored,
+                masked: false,
+                reply,
+            })
             .await?;
         result.await??;
         Ok(attachment)
     }
-    pub async fn materialize_input_attachments(
+    pub async fn import_pasted_text(
+        &self,
+        id: uuid::Uuid,
+        path: PathBuf,
+    ) -> Result<crate::attachment_store::Attachment> {
+        if id.get_version_num() != 7 || !path.is_absolute() {
+            return Err("Invalid pasted text operation.".into());
+        }
+        let store = crate::attachment_store::Store {
+            root: (*self.attachment_root).clone(),
+            key: self.secret_key.clone(),
+        };
+        let reader = store.clone();
+        let source = path.clone();
+        let (original, saved) = tokio::task::spawn_blocking(move || {
+            if reader.root.join(id.to_string()).try_exists()? {
+                let (stored, original, _) = reader
+                    .text(id)?
+                    .ok_or("This operation already names a file reference.")?;
+                if stored.source != source {
+                    return Err("Pasted text operation ID reused.".into());
+                }
+                return Ok((original, Some(stored)));
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                crate::attachment_store::Store::read_text_source(&source)?,
+                None,
+            ))
+        })
+        .await??;
+        let original_digest = crate::attachment_store::digest(original.as_bytes());
+        let stored = if let Some(saved) = saved {
+            saved
+        } else {
+            let directory = store
+                .root
+                .parent()
+                .ok_or("Missing pasted text directory.")?;
+            let screening = self.screening().await?;
+            let safe = self.redact_text(&original, &screening, directory).await?;
+            tokio::task::spawn_blocking(move || {
+                let _screening = screening;
+                store.import_text(id, &path, &original, &safe)
+            })
+            .await??
+        };
+        let attachment = stored.attachment.clone();
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::SaveAttachment {
+                masked: original_digest != stored.attachment.sha256,
+                stored,
+                reply,
+            })
+            .await?;
+        result.await??;
+        Ok(attachment)
+    }
+    pub async fn read_pasted_text(&self, id: uuid::Uuid) -> Result<String> {
+        let store = crate::attachment_store::Store {
+            root: (*self.attachment_root).clone(),
+            key: self.secret_key.clone(),
+        };
+        tokio::task::spawn_blocking(move || {
+            store
+                .text(id)?
+                .map(|(_, original, _)| original)
+                .ok_or_else(|| "This reference is not pasted text.".into())
+        })
+        .await?
+    }
+    pub async fn refresh_pasted_text(
+        &self,
+        request: crate::attachment_screening::Request,
+    ) -> Result<crate::attachment_screening::Receipt> {
+        if request.op_id.get_version_num() != 7 || request.attachment_id.get_version_num() != 7 {
+            return Err("Invalid reference screening operation.".into());
+        }
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::PreviousAttachmentScreening {
+                request: request.clone(),
+                reply,
+            })
+            .await?;
+        if let Some(previous) = result.await?? {
+            let store = self.attachment_store();
+            return tokio::task::spawn_blocking(move || {
+                if store.load(previous.original.attachment.id)?.0 != previous.original
+                    || store.load(previous.copy.attachment.id)?.0 != previous.copy
+                {
+                    return Err("The screened reference changed.".into());
+                }
+                Ok(previous.receipt())
+            })
+            .await?;
+        }
+        let store = self.attachment_store();
+        let id = request.attachment_id;
+        let (original, _, text) = tokio::task::spawn_blocking(move || -> Result<_> {
+            store
+                .text(id)?
+                .ok_or_else(|| "Only pasted references can be screened again.".into())
+        })
+        .await??;
+        let screening = self.screening().await?;
+        let directory = self
+            .attachment_root
+            .parent()
+            .ok_or("Missing screening directory.")?;
+        let text = self.redact_text(&text, &screening, directory).await?;
+        let store = self.attachment_store();
+        let revision = tokio::task::spawn_blocking(move || {
+            let _screening = screening;
+            let copy =
+                if original.attachment.sha256 == crate::attachment_store::digest(text.as_bytes()) {
+                    original.clone()
+                } else {
+                    store.screened_copy(&original, &text)?
+                };
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                crate::attachment_screening::Revision { original, copy },
+            )
+        })
+        .await??;
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::SaveAttachmentScreening {
+                request,
+                revision,
+                reply,
+            })
+            .await?;
+        Ok(result.await??.receipt())
+    }
+    pub async fn pasted_references(
+        &self,
+        track: String,
+        after: Option<uuid::Uuid>,
+    ) -> Result<crate::attachment_screening::Page> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::PastedReferences {
+                track,
+                after,
+                reply,
+            })
+            .await?;
+        let mut records = result.await??;
+        let more = records.len() > 50;
+        records.truncate(50);
+        let next = if more {
+            records.last().map(|stored| stored.attachment.id)
+        } else {
+            None
+        };
+        let store = self.attachment_store();
+        tokio::task::spawn_blocking(move || {
+            let mut items = Vec::new();
+            for expected in records {
+                if let Some((stored, _, _)) = store.text(expected.attachment.id)? {
+                    if stored != expected {
+                        return Err("The pasted reference changed.".into());
+                    }
+                    items.push(stored.attachment);
+                }
+            }
+            Ok(crate::attachment_screening::Page { items, next })
+        })
+        .await?
+    }
+    async fn input_attachment_plan(
         &self,
         input: String,
         track: String,
         session: String,
-        path: PathBuf,
-    ) -> Result<crate::attachment_store::ReferenceContext> {
+    ) -> Result<Option<crate::attachment_store::CopyPlan>> {
         let (reply, result) = oneshot::channel();
         self.jobs
             .send(Job::InputAttachments {
@@ -750,27 +1230,30 @@ impl Journal {
                 reply,
             })
             .await?;
-        let Some(plan) = result.await?? else {
-            return Ok(crate::attachment_store::ReferenceContext {
-                files: vec![],
-                directory: None,
-            });
-        };
-        let crate::attachment_store::CopyPlan {
-            workspace,
-            originals: records,
-        } = plan;
+        result.await?
+    }
+    async fn copy_input_plan(
+        &self,
+        plan: crate::attachment_store::CopyPlan,
+        path: PathBuf,
+        screening: Screening,
+    ) -> Result<crate::attachment_store::ReferenceContext> {
         let store = crate::attachment_store::Store {
             root: (*self.attachment_root).clone(),
             key: self.secret_key.clone(),
         };
+        let copies = self
+            .verify_pasted_references(&store, &plan.originals, &screening)
+            .await?;
         tokio::task::spawn_blocking(move || {
+            let _screening = screening;
+            let workspace = plan.workspace;
             if workspace.path.canonicalize()? != path.canonicalize()? {
                 return Err("The worker has a different attachment workspace.".into());
             }
-            let references = store.materialize(&workspace, &records)?;
+            let files = store.materialize(&workspace, &plan.originals, &copies, &plan.input_ids)?;
             Ok(crate::attachment_store::ReferenceContext {
-                files: references,
+                files,
                 directory: workspace
                     .attachment_roots
                     .first()
@@ -778,6 +1261,383 @@ impl Journal {
             })
         })
         .await?
+    }
+    pub async fn materialize_input_attachments(
+        &self,
+        input: String,
+        track: String,
+        session: String,
+        path: PathBuf,
+    ) -> Result<crate::attachment_store::ReferenceContext> {
+        let Some(plan) = self.input_attachment_plan(input, track, session).await? else {
+            return Ok(crate::attachment_store::ReferenceContext {
+                files: vec![],
+                directory: None,
+            });
+        };
+        self.copy_input_plan(plan, path, self.screening().await?)
+            .await
+    }
+    pub async fn reason_review_possible(
+        &self,
+        input: String,
+        revision: i64,
+        tracks: Vec<String>,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ReviewPossible {
+                input,
+                revision,
+                tracks,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn reason_review(
+        &self,
+        input: String,
+    ) -> Result<Option<crate::reason_review::Review>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ReadReasonReview { input, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn prepare_turn(
+        &self,
+        input: String,
+        track: String,
+        session: String,
+        path: PathBuf,
+        mut params: Value,
+    ) -> Result<crate::screening::Command> {
+        let (mut instructions, workspace) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let workspace = path.canonicalize()?;
+            Ok((
+                crate::instructions::Instructions::capture(&workspace)?,
+                workspace,
+            ))
+        })
+        .await??;
+        let screening = self.screening().await?;
+        if !instructions.rules.is_empty() {
+            // Inspect rule text before JSON embedding so one secret line does not
+            // hide unrelated rules which share its serialized string value.
+            let directory = self
+                .attachment_root
+                .parent()
+                .ok_or("Missing screening directory.")?;
+            let inspected = self
+                .redact_params(
+                    serde_json::to_value(&instructions)?,
+                    &screening,
+                    directory,
+                    false,
+                    crate::editor::Priority::Input,
+                )
+                .await?;
+            for (rule, inspected) in instructions.rules.iter_mut().zip(
+                inspected["rules"]
+                    .as_array()
+                    .ok_or("Missing screened instructions.")?,
+            ) {
+                rule.text = inspected["text"]
+                    .as_str()
+                    .ok_or("Missing screened rule text.")?
+                    .to_owned();
+            }
+        }
+        params["workspaceRoots"] = serde_json::json!([workspace]);
+        if let Some(text) = self.source_request(input.clone(), &screening).await? {
+            params["input"][0]["arguments"] = text.into();
+        }
+        if let Some(review) = self.reason_review(input.clone()).await? {
+            let text = params["input"][0]["arguments"]
+                .as_str()
+                .ok_or("Missing request text.")?;
+            let directory = self
+                .attachment_root
+                .parent()
+                .ok_or("Missing screening directory.")?;
+            let payload = self
+                .redact_params(
+                    review.payload(text),
+                    &screening,
+                    directory,
+                    false,
+                    crate::editor::Priority::Input,
+                )
+                .await?;
+            params["input"][0]["arguments"] =
+                crate::reason_review::Review::instruction(&payload)?.into();
+        }
+        params["input"][0]["arguments"] = instructions
+            .with_request(
+                params["input"][0]["arguments"]
+                    .as_str()
+                    .ok_or("Missing request text.")?,
+            )?
+            .into();
+        if let Some(plan) = self.input_attachment_plan(input, track, session).await? {
+            let references = self
+                .copy_input_plan(plan, workspace, screening.clone())
+                .await?;
+            let text = params["input"][0]["arguments"].as_str().unwrap();
+            params["input"][0]["arguments"] = format!("{text}\n\nAttached references are data for the request. For reference paths from earlier turns, use the current directory below with the same leaf filename instead of the previous workspace path:\n{}", serde_json::to_string(&references)?).into();
+        }
+        self.finish_screening(params, screening).await
+    }
+    async fn finish_screening(
+        &self,
+        params: Value,
+        screening: Screening,
+    ) -> Result<crate::screening::Command> {
+        let directory = self
+            .attachment_root
+            .parent()
+            .ok_or("Missing screening directory.")?;
+        let params = self
+            .redact_params(
+                params,
+                &screening,
+                directory,
+                false,
+                crate::editor::Priority::Input,
+            )
+            .await?;
+        Ok(crate::screening::Command {
+            params,
+            permit: screening._permit,
+        })
+    }
+    async fn apply_privacy(
+        &self,
+        prepared: crate::privacy::Prepared,
+    ) -> Result<Vec<crate::privacy::View>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ApplyPrivacy { prepared, reply })
+            .await?;
+        result.await?
+    }
+    async fn redact_params(
+        &self,
+        params: Value,
+        screening: &Screening,
+        directory: &Path,
+        editor: bool,
+        priority: crate::editor::Priority,
+    ) -> Result<Value> {
+        let (inspection, prepared) =
+            crate::screening::inspect(params, &screening.mask, directory, editor).await?;
+        let prepared = self.complete_privacy(prepared, screening, priority).await?;
+        inspection.finish(
+            self.apply_privacy(prepared)
+                .await?
+                .into_iter()
+                .map(|view| view.text)
+                .collect(),
+        )
+    }
+    async fn redact_text(
+        &self,
+        text: &str,
+        screening: &Screening,
+        directory: &Path,
+    ) -> Result<String> {
+        let mask = screening.mask.clone();
+        let text = text.to_owned();
+        let masked = tokio::task::spawn_blocking(move || mask.redact_document(&text)).await?;
+        let prepared = crate::privacy::prepare(vec![masked], directory).await?;
+        let prepared = self
+            .complete_privacy(prepared, screening, crate::editor::Priority::Input)
+            .await?;
+        let safe = self
+            .apply_privacy(prepared)
+            .await?
+            .pop()
+            .ok_or("The pasted text could not be inspected.")?;
+        if safe.text.len() > crate::attachment_store::FILE_LIMIT {
+            return Err("The redacted reference exceeds the attachment limit.".into());
+        }
+        Ok(safe.text)
+    }
+    pub fn attach_privacy_editor(&self, editor: crate::editor::Manager) -> Result<()> {
+        self.full_privacy.attach(editor)
+    }
+    pub async fn privacy_state(&self) -> Result<crate::privacy_policy::State> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::PrivacyState { reply }).await?;
+        result.await?
+    }
+    pub async fn change_privacy(
+        &self,
+        request: crate::privacy_policy::Change,
+    ) -> Result<crate::privacy_policy::State> {
+        let _permit = self.fingerprint_gate.write().await;
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::PrivacyChange {
+                request,
+                local_ready: self.full_privacy.ready(),
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    async fn complete_privacy(
+        &self,
+        mut prepared: crate::privacy::Prepared,
+        screening: &Screening,
+        priority: crate::editor::Priority,
+    ) -> Result<crate::privacy::Prepared> {
+        if screening.policy.mode == crate::privacy_policy::Mode::Full {
+            let extra = self
+                .full_privacy
+                .inspect(
+                    prepared.full_texts(),
+                    &self.secret_key,
+                    screening.seal.clone(),
+                    screening._permit.clone(),
+                    priority,
+                )
+                .await?;
+            prepared.extend(extra)?;
+        }
+        Ok(prepared)
+    }
+    pub async fn preview_privacy_file(&self, id: String) -> Result<Value> {
+        let root = self
+            .attachment_root
+            .parent()
+            .ok_or("Missing privacy directory.")?
+            .join("privacy-previews");
+        let texts = tokio::task::spawn_blocking(move || crate::privacy_transport::read(&root, &id))
+            .await??;
+        Ok(crate::privacy_transport::wire(
+            self.preview_privacy(texts).await?,
+        ))
+    }
+    pub async fn preview_privacy(&self, texts: Vec<String>) -> Result<Vec<crate::privacy::View>> {
+        if texts.len() > 64
+            || texts.iter().any(|text| text.len() > 2 * 1024 * 1024)
+            || texts.iter().map(String::len).sum::<usize>() > 2 * 1024 * 1024
+        {
+            return Err("Privacy preview is too large.".into());
+        }
+        let screening = self.screening().await?;
+        let mask = screening.mask.clone();
+        let masked = tokio::task::spawn_blocking(move || {
+            texts
+                .iter()
+                .map(|text| mask.redact_document(text))
+                .collect()
+        })
+        .await?;
+        let directory = self
+            .attachment_root
+            .parent()
+            .ok_or("Missing screening directory.")?;
+        let prepared = crate::privacy::prepare(masked, directory).await?;
+        let prepared = self
+            .complete_privacy(prepared, &screening, crate::editor::Priority::Background)
+            .await?;
+        self.apply_privacy(prepared).await
+    }
+    pub async fn privacy_original(&self, id: i64) -> Result<String> {
+        let screening = self.screening().await?;
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ReadPrivacy { id, reply }).await?;
+        let original = result.await??;
+        if screening.mask.redact_document(&original) != original {
+            return Err("This privacy value is now a protected credential.".into());
+        }
+        Ok(original)
+    }
+    pub async fn screen_start(&self, params: Value) -> Result<crate::screening::Command> {
+        self.finish_screening(params, self.screening().await?).await
+    }
+    pub async fn screen_input(
+        &self,
+        ticket: crate::input_readings::Ticket,
+        params: Value,
+        priority: crate::editor::Priority,
+    ) -> Result<crate::screening::EditorRequest> {
+        let before: Value =
+            serde_json::from_str(params["tail"].as_str().ok_or("Missing input context.")?)?;
+        let screened = self.screen_editor(params, priority).await?;
+        let after: Value = serde_json::from_str(
+            screened.params()["tail"]
+                .as_str()
+                .ok_or("Missing screened input context.")?,
+        )?;
+        if before["request"].is_string() && before["request"] != after["request"] {
+            let (reply, result) = oneshot::channel();
+            self.jobs.send(Job::InputMasked { ticket, reply }).await?;
+            result.await??;
+        }
+        Ok(screened)
+    }
+    pub async fn screen_editor(
+        &self,
+        params: Value,
+        priority: crate::editor::Priority,
+    ) -> Result<crate::screening::EditorRequest> {
+        let screening = self.screening().await?;
+        let directory = self
+            .attachment_root
+            .parent()
+            .ok_or("Missing screening directory.")?;
+        let params = self
+            .redact_params(params, &screening, directory, true, priority)
+            .await?;
+        Ok(crate::screening::EditorRequest {
+            params,
+            seal: screening.seal,
+            permit: screening._permit,
+        })
+    }
+    pub(crate) async fn lease_editor(
+        &self,
+        prepared: &crate::screening::PreparedEditorRequest,
+    ) -> Result<Option<crate::screening::EditorRequest>> {
+        let permit = self.fingerprint_gate.clone().read_owned().await;
+        if self.fingerprint_catalog().await?.current != prepared.seal {
+            return Ok(None);
+        }
+        Ok(Some(crate::screening::EditorRequest {
+            params: prepared.params.clone(),
+            seal: prepared.seal.clone(),
+            permit: std::sync::Arc::new(permit),
+        }))
+    }
+    pub(crate) async fn screen_replay(
+        &self,
+        params: Value,
+        track: String,
+        session: String,
+    ) -> Result<crate::screening::Command> {
+        let screening = self.screening().await?;
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::SessionAttachments {
+                session,
+                track,
+                reply,
+            })
+            .await?;
+        if let Some(plan) = result.await?? {
+            let path = plan.workspace.path.clone();
+            self.copy_input_plan(plan, path, screening.clone()).await?;
+        }
+        let expected = params.clone();
+        let prepared = self.finish_screening(params, screening).await?;
+        if prepared.params != expected {
+            return Err("The saved start needs review after the privacy rules changed.".into());
+        }
+        Ok(prepared)
     }
     pub async fn restore_frozen_attachments(
         &self,
@@ -823,16 +1683,92 @@ impl Journal {
             root: (*self.attachment_root).clone(),
             key: self.secret_key.clone(),
         };
+        let (screening, copies) = self
+            .check_pasted_references(&store, &plan.originals)
+            .await?;
         tokio::task::spawn_blocking(move || -> Result<()> {
+            let _screening = screening;
             if let Some(path) = path
                 && plan.workspace.path.canonicalize()? != path.canonicalize()?
             {
                 return Err("The attachment workspace changed.".into());
             }
-            store.materialize(&plan.workspace, &plan.originals)?;
+            store.materialize(&plan.workspace, &plan.originals, &copies, &plan.input_ids)?;
             Ok(())
         })
         .await?
+    }
+    async fn check_pasted_references(
+        &self,
+        store: &crate::attachment_store::Store,
+        records: &[crate::attachment_store::Stored],
+    ) -> Result<(
+        Screening,
+        std::collections::BTreeMap<uuid::Uuid, crate::attachment_store::Stored>,
+    )> {
+        let screening = self.screening().await?;
+        let copies = self
+            .verify_pasted_references(store, records, &screening)
+            .await?;
+        Ok((screening, copies))
+    }
+    async fn verify_pasted_references(
+        &self,
+        store: &crate::attachment_store::Store,
+        records: &[crate::attachment_store::Stored],
+        screening: &Screening,
+    ) -> Result<std::collections::BTreeMap<uuid::Uuid, crate::attachment_store::Stored>> {
+        let store = store.clone();
+        let directory = store
+            .root
+            .parent()
+            .ok_or("Missing pasted text directory.")?
+            .to_path_buf();
+        let records = records.to_vec();
+        let texts = tokio::task::spawn_blocking(move || {
+            let mut texts = Vec::new();
+            for expected in records {
+                if let Some((stored, _, safe)) = store.text(expected.attachment.id)? {
+                    if stored != expected {
+                        return Err("The pasted reference changed.".into());
+                    }
+                    texts.push((stored, safe));
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(texts)
+        })
+        .await??;
+        let mut copies = std::collections::BTreeMap::new();
+        for (original, text) in texts {
+            let safe = self.redact_text(&text, screening, &directory).await?;
+            if safe != text {
+                let (reply, result) = oneshot::channel();
+                self.jobs
+                    .send(Job::ReadAttachmentScreening {
+                        id: original.attachment.id,
+                        digest: crate::attachment_store::digest(safe.as_bytes()),
+                        reply,
+                    })
+                    .await?;
+                let revision = result
+                    .await??
+                    .ok_or(crate::attachment_screening::ReviewRequired)?;
+                if revision.original != original {
+                    return Err("The screened reference has a different original.".into());
+                }
+                let reader = self.attachment_store();
+                let expected = revision.copy.clone();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    if reader.load(expected.attachment.id)?.0 != expected {
+                        return Err("The screened reference changed.".into());
+                    }
+                    Ok(())
+                })
+                .await??;
+                copies.insert(original.attachment.id, revision.copy);
+            }
+        }
+        Ok(copies)
     }
     pub(crate) async fn backup_apply(
         &self,
@@ -846,6 +1782,7 @@ impl Journal {
         &self,
         change: crate::backup_apply::Change,
     ) -> Result<crate::backup_apply::State> {
+        let _permit = self.fingerprint_gate.write().await;
         let (reply, result) = oneshot::channel();
         self.jobs
             .send(Job::BackupApplyChange { change, reply })
@@ -967,6 +1904,7 @@ impl Journal {
         result.await?
     }
     pub async fn pickup(&self, change: crate::pickup::Change) -> Result<crate::pickup::Recovery> {
+        let _permit = self.fingerprint_gate.write().await;
         let (reply, result) = oneshot::channel();
         self.jobs.send(Job::Pickup { change, reply }).await?;
         result.await?
@@ -1039,6 +1977,7 @@ impl Journal {
         &self,
         request: crate::project_secrets::Prepare,
     ) -> Result<crate::secrets::Catalog> {
+        let _permit = self.fingerprint_gate.write().await;
         let (id, manifest) = request.metadata(&self.secret_key)?;
         let (reply, result) = oneshot::channel();
         self.jobs
@@ -1145,6 +2084,7 @@ impl Journal {
         &self,
         request: crate::fingerprint_recovery::Request,
     ) -> Result<Value> {
+        let _permit = self.fingerprint_gate.write().await;
         let (reply, result) = oneshot::channel();
         self.jobs
             .send(Job::RebuildFingerprints { request, reply })
@@ -1162,6 +2102,7 @@ impl Journal {
         result.await?
     }
     pub async fn branch(&self, change: crate::branch::Change) -> Result<crate::branch::Branch> {
+        let _permit = self.fingerprint_gate.write().await;
         let (reply, result) = oneshot::channel();
         self.jobs.send(Job::Branch { change, reply }).await?;
         result.await?
@@ -1178,6 +2119,7 @@ impl Journal {
         &self,
         request: crate::secrets::Registration,
     ) -> Result<crate::secrets::Catalog> {
+        let _permit = self.fingerprint_gate.write().await;
         let fingerprint = request.fingerprint(&self.secret_key)?;
         let (reply, result) = oneshot::channel();
         self.jobs
@@ -1199,6 +2141,17 @@ impl Journal {
             })
             .await?;
         self.secret_key.mask(result.await??)
+    }
+    async fn screening(&self) -> Result<Screening> {
+        let permit = self.fingerprint_gate.clone().read_owned().await;
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ReadAllFingerprints { reply }).await?;
+        Ok(Screening {
+            mask: self.secret_key.mask(result.await??)?,
+            policy: self.privacy_state().await?,
+            seal: self.fingerprint_catalog().await?.current,
+            _permit: std::sync::Arc::new(permit),
+        })
     }
 
     pub async fn pending_publications(&self) -> Result<Vec<crate::integration::Job>> {
@@ -1390,6 +2343,50 @@ impl Journal {
             .await?;
         result.await?
     }
+    pub async fn check_environment(&self) -> Result<crate::check_environment::Selection> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ReadCheckEnvironment { reply }).await?;
+        result.await?
+    }
+    pub async fn change_check_environment(
+        &self,
+        request: crate::check_environment::Change,
+    ) -> Result<crate::check_environment::Selection> {
+        if let Some(saved) = self.operation(request.op_id).await? {
+            if saved["kind"] != "check-environment.change"
+                || saved["payload"] != serde_json::to_value(&request)?
+            {
+                return Err(
+                    "Operation ID was used for a different Check environment change.".into(),
+                );
+            }
+            return self.check_environment().await;
+        }
+        let project: crate::project::Project =
+            serde_json::from_value(self.snapshot().await?["project"].clone())
+                .map_err(|_| "Choose a project before setting Check environment.")?;
+        let project_root = project.root.clone();
+        let file = if let Some(file) = request.file.clone() {
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::check_environment::validate_file(&file, &project)
+                })
+                .await??,
+            )
+        } else {
+            None
+        };
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangeCheckEnvironment {
+                request,
+                project_root,
+                file,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
     pub async fn integration_settings(
         &self,
         id: uuid::Uuid,
@@ -1456,13 +2453,49 @@ impl Journal {
             .await?;
         received.await?
     }
+    pub async fn integration_order_review(
+        &self,
+        id: uuid::Uuid,
+        revision: u64,
+        review: crate::integration_order::Review,
+    ) -> Result<crate::integration::Job> {
+        let (reply, received) = oneshot::channel();
+        self.jobs
+            .send(Job::IntegrationOrderReview {
+                id,
+                revision,
+                review,
+                reply,
+            })
+            .await?;
+        received.await?
+    }
     pub async fn integration_command(
         &self,
         command: crate::integration::Command,
     ) -> Result<crate::integration::Job> {
         let (reply, result) = oneshot::channel();
         self.jobs
-            .send(Job::IntegrationCommand { command, reply })
+            .send(Job::IntegrationCommand {
+                command,
+                settings: None,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn recheck_integration(
+        &self,
+        command: crate::integration::Command,
+        settings: crate::candidate::Settings,
+    ) -> Result<crate::integration::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::IntegrationCommand {
+                command,
+                settings: Some(settings),
+                reply,
+            })
             .await?;
         result.await?
     }
@@ -1751,6 +2784,48 @@ impl Journal {
             .await?;
         result.await?
     }
+    pub async fn read_utterance(&self, id: String) -> Result<Value> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ReadInput { id, reply }).await?;
+        result.await?
+    }
+    pub async fn read_input_origin(
+        &self,
+        input: uuid::Uuid,
+    ) -> Result<Option<crate::input_origin::Origin>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ReadInputOrigin { input, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn mark_misread(&self, request: crate::input_feedback::Misread) -> Result<Value> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::MarkMisread { request, reply }).await?;
+        result.await?
+    }
+    pub async fn next_inferred_correction(&self) -> Result<Option<crate::input_inference::Ticket>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::NextInferredCorrection { reply })
+            .await?;
+        result.await?
+    }
+    pub async fn finish_inferred_correction(
+        &self,
+        ticket: crate::input_inference::Ticket,
+        outcome: crate::input_inference::Evaluation,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::FinishInferredCorrection {
+                ticket,
+                result: outcome,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
     pub async fn clip_detail(&self, id: String) -> Result<Value> {
         let (reply, result) = oneshot::channel();
         self.jobs.send(Job::ClipDetail { id, reply }).await?;
@@ -1804,6 +2879,16 @@ impl Journal {
                 analysis,
                 reply,
             })
+            .await?;
+        result.await?
+    }
+    pub async fn analyze_background_reports(
+        &self,
+        results: Vec<(crate::reports::Report, crate::reports::Analysis)>,
+    ) -> Result<i64> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::AnalyzeBackgroundReports { results, reply })
             .await?;
         result.await?
     }
@@ -1978,6 +3063,23 @@ impl Journal {
             .await?;
         result.await?
     }
+    pub async fn queue_approval_reply(
+        &self,
+        request: crate::approval_reply::Request,
+    ) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::QueueApprovalReply { request, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn advance_approval_replies(&self) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::AdvanceApprovalReplies { reply })
+            .await?;
+        result.await?
+    }
     pub async fn configure_project(
         &self,
         id: uuid::Uuid,
@@ -2020,6 +3122,38 @@ impl Journal {
         self.jobs.send(Job::PendingProject { reply }).await?;
         result.await?
     }
+    pub async fn editor_calibration(
+        &self,
+        prefix: String,
+        cache_prefix: bool,
+    ) -> Result<crate::editor_calibration::Applied> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ReadEditorCalibration {
+                prefix,
+                cache_prefix,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn editor_calibration_state(&self) -> Result<crate::editor_calibration::State> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::EditorCalibrationState { reply })
+            .await?;
+        result.await?
+    }
+    pub async fn apply_editor_calibration(
+        &self,
+        change: crate::editor_calibration::Change,
+    ) -> Result<crate::editor_calibration::State> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ApplyEditorCalibration { change, reply })
+            .await?;
+        result.await?
+    }
     pub async fn editor_config(&self) -> Result<Option<Value>> {
         let (reply, result) = oneshot::channel();
         self.jobs.send(Job::ReadEditorConfig { reply }).await?;
@@ -2044,22 +3178,505 @@ impl Journal {
         selected: Option<String>,
         attachments: Vec<uuid::Uuid>,
     ) -> Result<Value> {
+        self.stage_document(crate::request_sources::Submission {
+            op_id: id,
+            text,
+            target,
+            selected_track_id: selected,
+            attachment_ids: attachments,
+            sources: None,
+        })
+        .await
+    }
+    pub async fn stage_document(
+        &self,
+        request: crate::request_sources::Submission,
+    ) -> Result<Value> {
+        let crate::request_sources::Submission {
+            op_id,
+            text,
+            target,
+            selected_track_id,
+            mut attachment_ids,
+            sources,
+        } = request;
+        let sources = sources.unwrap_or_default();
+        crate::request_sources::validate(&text, &attachment_ids, &sources)?;
+        if text.trim().is_empty() && sources.is_empty() {
+            return Err("Write a request before sending.".into());
+        }
+        let record = if sources.is_empty() {
+            None
+        } else {
+            let store = crate::attachment_store::Store {
+                root: (*self.attachment_root).clone(),
+                key: self.secret_key.clone(),
+            };
+            let leading = text.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    let mut preview = leading.trim().lines().next().unwrap_or("").to_owned();
+                    let mut reference_preview = String::new();
+                    for source in &sources {
+                        let (_, _, safe) = store
+                            .text(source.attachment_id)?
+                            .ok_or("A request source must be pasted text.")?;
+                        let first = safe
+                            .lines()
+                            .find(|line| !line.trim().is_empty())
+                            .unwrap_or("Pasted text");
+                        if reference_preview.is_empty() {
+                            reference_preview = first.to_owned();
+                        }
+                        if preview.is_empty()
+                            && source.role == crate::request_sources::Role::Request
+                        {
+                            preview = first.to_owned();
+                        }
+                        if preview.is_empty() {
+                            preview = source.after.trim().lines().next().unwrap_or("").to_owned();
+                        }
+                    }
+                    if preview.is_empty() {
+                        preview = reference_preview;
+                    }
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                        crate::request_sources::Record { sources, preview },
+                    )
+                })
+                .await??,
+            )
+        };
+        if let Some(record) = &record {
+            attachment_ids.extend(record.sources.iter().map(|source| source.attachment_id));
+        }
         let (reply, result) = oneshot::channel();
         self.jobs
             .send(Job::StageUtterance {
-                id: id.to_string(),
+                id: op_id.to_string(),
                 text,
                 target,
-                selected,
-                attachments,
+                selected: selected_track_id,
+                attachments: attachment_ids,
+                sources: record,
                 reply,
             })
             .await?;
         result.await?
     }
+    pub(crate) async fn prepare_input(&self, mut input: PendingInput) -> Result<PendingInput> {
+        if input.sources.is_empty() && input.context.is_none() {
+            return Ok(input);
+        }
+        if !input.sources.is_empty() {
+            let screening = self.screening().await?;
+            input.text = self
+                .assemble_request(&input.text, &input.sources, &screening)
+                .await?;
+        }
+        let text = match &input.context {
+            Some(context) => format!("{}\n{}", input.text, context),
+            None => input.text.clone(),
+        };
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::InputCandidates {
+                input: input.id.clone(),
+                reading: input.reading_index,
+                text,
+                target: input.target.clone(),
+                selected: input.selected.clone(),
+                reply,
+            })
+            .await?;
+        let (candidates, history) = result.await??;
+        input.tracks = candidates.first;
+        input.expanded_tracks = candidates.expanded;
+        input.history = history;
+        Ok(input)
+    }
+    async fn assemble_request(
+        &self,
+        leading: &str,
+        sources: &[crate::request_sources::Source],
+        screening: &Screening,
+    ) -> Result<String> {
+        let store = crate::attachment_store::Store {
+            root: (*self.attachment_root).clone(),
+            key: self.secret_key.clone(),
+        };
+        let sources = sources.to_vec();
+        let leading = leading.to_owned();
+        let (text, records) = tokio::task::spawn_blocking(move || {
+            let mut text = leading;
+            let mut records = Vec::new();
+            for source in sources {
+                let (stored, _, safe) = store
+                    .text(source.attachment_id)?
+                    .ok_or("A request source must be pasted text.")?;
+                if source.role == crate::request_sources::Role::Request {
+                    text.push_str(&safe);
+                }
+                text.push_str(&source.after);
+                records.push(stored);
+                if text.len() > crate::attachment_store::FILE_LIMIT {
+                    return Err(crate::input::InputTooLong.into());
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((text, records))
+        })
+        .await??;
+        let store = crate::attachment_store::Store {
+            root: (*self.attachment_root).clone(),
+            key: self.secret_key.clone(),
+        };
+        self.verify_pasted_references(&store, &records, screening)
+            .await?;
+        let directory = store
+            .root
+            .parent()
+            .ok_or("Missing pasted text directory.")?;
+        self.redact_text(&text, screening, directory).await
+    }
+    async fn source_request(&self, input: String, screening: &Screening) -> Result<Option<String>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ReadRequestSources { input, reply })
+            .await?;
+        let (text, record) = result.await??;
+        match record {
+            Some(record) => self
+                .assemble_request(&text, &record.sources, screening)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
     pub async fn claim_input(&self) -> Result<Option<PendingInput>> {
         let (reply, result) = oneshot::channel();
         self.jobs.send(Job::ClaimInput { reply }).await?;
+        result.await?
+    }
+    pub async fn submit_rephrase(&self, request: crate::rephrases::Submission) -> Result<Value> {
+        request.validate()?;
+        if let Some(previous) = self.operation(request.op_id).await? {
+            if previous["kind"] != "utterance.rephrase"
+                || previous["payload"] != serde_json::to_value(&request)?
+            {
+                return Err("Operation ID reused.".into());
+            }
+            return self.read_utterance(request.utterance_id).await;
+        }
+        let word = self.read_utterance(request.utterance_id.clone()).await?;
+        if word["revision"] != request.revision || word["rephrase"].is_null() {
+            return Err("The original request changed. Refresh before sending.".into());
+        }
+        let mut text = word["sourceText"]
+            .as_str()
+            .or_else(|| word["text"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        if let Some(sources) = word["sources"].as_array() {
+            let attachments: Vec<crate::attachment_store::Attachment> =
+                serde_json::from_value(word["attachments"].clone())?;
+            for (index, source) in sources.iter().enumerate() {
+                let attachment = attachments
+                    .iter()
+                    .find(|attachment| source["attachmentId"] == attachment.id.to_string())
+                    .ok_or("The original pasted block is unavailable.")?;
+                text.push_str(&format!(
+                    "\n\n[Original {} block {}: {}]\n",
+                    source["role"].as_str().unwrap_or("text"),
+                    index + 1,
+                    crate::attachment_store::copy_name(attachment)
+                ));
+                text.push_str(source["after"].as_str().unwrap_or_default());
+            }
+        }
+        let store = crate::attachment_store::Store {
+            root: (*self.attachment_root).clone(),
+            key: self.secret_key.clone(),
+        };
+        let screening = self.screening().await?;
+        let original = if text.trim().is_empty() {
+            None
+        } else {
+            let directory = store.root.parent().ok_or("Missing attachment directory.")?;
+            let safe = self.redact_text(&text, &screening, directory).await?;
+            let id = request.op_id;
+            let source = store
+                .root
+                .join(format!("original-request-{}", request.utterance_id));
+            Some(
+                tokio::task::spawn_blocking(move || -> Result<_> {
+                    if store.root.join(id.to_string()).try_exists()? {
+                        let (saved, original, _) = store
+                            .text(id)?
+                            .ok_or("Invalid original request attachment.")?;
+                        if original != text || saved.source != source {
+                            return Err("Operation ID reused.".into());
+                        }
+                        Ok(saved)
+                    } else {
+                        store.import_text(id, &source, &text, &safe)
+                    }
+                })
+                .await??,
+            )
+        };
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::SubmitRephrase {
+                request,
+                original,
+                reply,
+            })
+            .await?;
+        let result = result.await?;
+        drop(screening);
+        result
+    }
+    pub async fn claim_rephrase(&self) -> Result<Option<crate::rephrases::Ticket>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ClaimRephrase { reply }).await?;
+        result.await?
+    }
+    pub async fn rephrase_current(&self, ticket: crate::rephrases::Ticket) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::RephraseCurrent { ticket, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn finish_rephrase(
+        &self,
+        ticket: crate::rephrases::Ticket,
+        outcome: crate::rephrases::Finish,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::FinishRephrase {
+                ticket,
+                outcome,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn claim_description(&self) -> Result<Option<crate::descriptions::Ticket>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ClaimDescription { reply }).await?;
+        result.await?
+    }
+    pub async fn claim_assumptions(&self) -> Result<Option<crate::assumptions::Ticket>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ClaimAssumptions { reply }).await?;
+        result.await?
+    }
+    pub async fn finish_assumptions(
+        &self,
+        ticket: crate::assumptions::Ticket,
+        outcome: crate::assumptions::Finish,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::FinishAssumptions {
+                ticket,
+                outcome,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn next_clip_files(&self) -> Result<Option<crate::clip_files::Ticket>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::NextClipFiles { reply }).await?;
+        result.await?
+    }
+    pub async fn finish_clip_files(
+        &self,
+        ticket: crate::clip_files::Ticket,
+        comparison: Result<crate::clip_files::Comparison>,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::FinishClipFiles {
+                ticket,
+                result: comparison,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn check_quiet_proposal(
+        &self,
+        now: crate::clock::Stamp,
+    ) -> Result<Option<crate::quiet_proposals::Ticket>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::CheckQuietProposal { now, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn finish_quiet_proposal(
+        &self,
+        ticket: crate::quiet_proposals::Ticket,
+        changes: Option<crate::quiet_proposals::Changes>,
+        now: crate::clock::Stamp,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::FinishQuietProposal {
+                ticket,
+                changes,
+                now,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn answer_proposal(&self, command: crate::proposals::Command) -> Result<Value> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::AnswerProposal { command, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn answer_assumption(&self, command: crate::assumptions::Command) -> Result<Value> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::AnswerAssumption { command, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn claim_clip_summary(&self) -> Result<Option<crate::clip_summaries::Ticket>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ClaimClipSummary { reply }).await?;
+        result.await?
+    }
+    pub async fn observe_timeline(
+        &self,
+        owner: uuid::Uuid,
+        revision: i64,
+        view: Option<crate::clip_summaries::View>,
+    ) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ObserveTimeline {
+                owner,
+                revision,
+                view,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn editor_log(&self, query: crate::editor_log::Query) -> Result<Value> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::EditorLog { query, reply }).await?;
+        result.await?
+    }
+
+    pub async fn editor_away(&self, query: crate::editor_away::Query) -> Result<Value> {
+        let (reply, receive) = oneshot::channel();
+        self.jobs.send(Job::EditorAway { query, reply }).await?;
+        receive.await?
+    }
+    pub async fn clip_summary_current(
+        &self,
+        ticket: crate::clip_summaries::Ticket,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ClipSummaryCurrent { ticket, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn finish_clip_summary(
+        &self,
+        ticket: crate::clip_summaries::Ticket,
+        outcome: crate::clip_summaries::Finish,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::FinishClipSummary {
+                ticket,
+                outcome,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn description_current(&self, ticket: crate::descriptions::Ticket) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::DescriptionCurrent { ticket, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn finish_description(
+        &self,
+        ticket: crate::descriptions::Ticket,
+        outcome: crate::descriptions::Finish,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::FinishDescription {
+                ticket,
+                outcome,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn claim_reread(&self) -> Result<Option<crate::input_readings::Pending>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ClaimReread { reply }).await?;
+        result.await?
+    }
+    pub async fn reread_current(&self, ticket: crate::input_readings::Ticket) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::RereadCurrent { ticket, reply }).await?;
+        result.await?
+    }
+    pub async fn release_reread(&self, ticket: crate::input_readings::Ticket) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ReleaseReread { ticket, reply }).await?;
+        result.await?
+    }
+    pub async fn apply_reread(
+        &self,
+        ticket: crate::input_readings::Ticket,
+        outcome: Outcome,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ApplyReread {
+                ticket,
+                outcome,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn edit_input(&self, request: crate::edit_hold::Request) -> Result<Value> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::EditInput { request, reply }).await?;
+        result.await?
+    }
+    pub async fn claim_redirect(
+        &self,
+        input: String,
+        revision: i64,
+    ) -> Result<Option<crate::redirect::Redirect>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ClaimRedirect {
+                input,
+                revision,
+                reply,
+            })
+            .await?;
         result.await?
     }
     pub async fn apply_input(&self, id: String, revision: i64, outcome: Outcome) -> Result<()> {
@@ -2068,6 +3685,26 @@ impl Journal {
             .send(Job::ApplyInput {
                 id,
                 revision,
+                outcome,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn expire_input(&self, ticket: crate::input_readings::Ticket) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ExpireInput { ticket, reply }).await?;
+        result.await?
+    }
+    pub async fn finish_reading(
+        &self,
+        ticket: crate::input_readings::Ticket,
+        outcome: Outcome,
+    ) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::FinishReading {
+                ticket,
                 outcome,
                 reply,
             })
@@ -2114,9 +3751,31 @@ impl Journal {
             .await?;
         result.await?
     }
+    pub async fn edit_history(&self, request: crate::timeline_history::Request) -> Result<Value> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::TimelineHistory { request, reply })
+            .await?;
+        result.await?
+    }
     pub async fn recover_inputs(&self) -> Result<()> {
         let (reply, result) = oneshot::channel();
         self.jobs.send(Job::RecoverInputs { reply }).await?;
+        result.await?
+    }
+    pub async fn change_confirmation(
+        &self,
+        request: crate::confirmation::Change,
+    ) -> Result<crate::confirmation::Status> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ConfirmationChange { request, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn confirm_input(&self, request: crate::confirmation::Accept) -> Result<Value> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ConfirmInput { request, reply }).await?;
         result.await?
     }
     pub async fn resolve_input(
@@ -2136,6 +3795,24 @@ impl Journal {
                 reply,
             })
             .await?;
+        result.await?
+    }
+    pub async fn read_drafts(&self, session: String) -> Result<Value> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::DraftRead { session, reply }).await?;
+        result.await?
+    }
+    pub async fn save_drafts(&self, request: crate::drafts::Save) -> Result<Value> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::DraftSave { request, reply }).await?;
+        result.await?
+    }
+    pub async fn branch_points(
+        &self,
+        query: crate::branch_points::Query,
+    ) -> Result<crate::branch_points::Page> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::BranchPoints { query, reply }).await?;
         result.await?
     }
     pub async fn snapshot(&self) -> Result<Value> {
@@ -2217,7 +3894,17 @@ impl Journal {
                         // mutation can be accepted. Reads and recovery stay responsive.
                         match job {
                             Job::ClaimInput{reply} => {let _=reply.send(Ok(None));},
+                            Job::ClaimRephrase{reply} => {let _=reply.send(Ok(None));},
+                            Job::FinishRephrase{reply,..} => {let _=reply.send(Ok(false));},
+                            Job::ClaimDescription{reply} => {let _=reply.send(Ok(None));},
+                            Job::ClaimClipSummary{reply} => {let _=reply.send(Ok(None));},
+                            Job::FinishClipSummary{reply,..} => {let _=reply.send(Ok(false));},
+                            Job::FinishDescription{reply,..} => {let _=reply.send(Ok(false));},
+                            Job::ClaimReread{reply} => {let _=reply.send(Ok(None));},
                             Job::ApplyInput{reply,..} => {let _=reply.send(Ok(()));},
+                            Job::ExpireInput{reply,..} | Job::FinishReading{reply,..} => {let _=reply.send(Ok(()));},
+                            Job::ApplyReread{reply,..} => {let _=reply.send(Ok(false));},
+                            Job::ReleaseReread{reply,..} => {let _=reply.send(Ok(false));},
                             _ => drop(job),
                         }
                         continue;
@@ -2257,9 +3944,15 @@ impl Journal {
                         Job::FingerprintRecovery{receipt,reply}=>{let _=reply.send(crate::fingerprint_recovery::status(&connection,receipt.as_ref()));},
                         Job::FingerprintCatalog{reply}=>{let _=reply.send(crate::secret_store::catalog(&connection));},
                         Job::Branch{change,reply}=>{let _=reply.send(crate::branch::change(&mut connection,change));},
+                        Job::BranchPoints{query,reply}=>{let _=reply.send(crate::branch_points::read(&connection,&query));},
                         Job::ConfirmFingerprints{seal,reply}=>{let _=reply.send(crate::secret_store::confirm(&mut connection,&seal));},
                         Job::RegisterFingerprint{request,fingerprint,reply}=>{let _=reply.send(crate::secret_store::register(&mut connection,&request,&fingerprint));},
                         Job::ReadFingerprints{track,session,reply}=>{let _=reply.send(crate::secret_store::read(&connection,&track,&session));},
+                        Job::ApplyPrivacy{prepared,reply}=>{let _=reply.send(crate::privacy::apply(&mut connection,&pickup_key,prepared));},
+                        Job::ReadPrivacy{id,reply}=>{let _=reply.send(crate::privacy::original(&connection,id));},
+                        Job::PrivacyState{reply}=>{let _=reply.send(crate::privacy_policy::state(&connection));},
+                        Job::PrivacyChange{request,local_ready,reply}=>{let _=reply.send(crate::privacy_policy::change(&mut connection,&request,local_ready));},
+                        Job::ReadAllFingerprints{reply}=>{let _=reply.send(crate::secret_store::all(&connection));},
                         Job::RepairStart{request,reply}=>{let _=reply.send(crate::repair_run_store::start(&mut connection,request));},
                         Job::RepairControl{command,reply}=>{let _=reply.send(crate::repair_run_store::control(&mut connection,command));},
                         Job::RepairFollowup{request,reply}=>{let _=reply.send(crate::repair_run_store::followup(&mut connection,request));},
@@ -2275,11 +3968,14 @@ impl Journal {
                         Job::PendingPublications{reply}=>{let _=reply.send(crate::integration_store::pending_publications(&connection));},
                         Job::IntegrationPublished{id,revision,outcome,reply}=>{let _=reply.send(crate::integration_store::published(&mut connection,id,revision,outcome));},
                         Job::IntegrationStageBegin{id,revision,reply}=>{let _=reply.send(crate::integration_store::stage_begin(&mut connection,id,revision));},
+                        Job::ReadCheckEnvironment{reply}=>{let _=reply.send(crate::check_environment::selection(&connection));},
+                        Job::ChangeCheckEnvironment{request,project_root,file,reply}=>{let _=reply.send(crate::check_environment::change(&mut connection,&request,&project_root,file));},
                         Job::IntegrationSettings{id,revision,reply}=>{let _=reply.send(crate::integration_store::settings(&connection,id,revision));},
                         Job::SaveIntegrationSettings{id,revision,settings,reply}=>{let _=reply.send(crate::integration_store::save_settings(&mut connection,id,revision,settings));},
                         Job::IntegrationCandidate{id,revision,result,reply}=>{let _=reply.send(crate::integration_store::candidate(&mut connection,id,revision,*result));},
                         Job::IntegrationFrozen{id,revision,plan,reply}=>{let _=reply.send(crate::integration_store::frozen(&mut connection,id,revision,plan));},
-                        Job::IntegrationCommand{command,reply}=>{let _=reply.send(crate::integration_store::command(&mut connection,&command));},
+                        Job::IntegrationOrderReview{id,revision,review,reply}=>{let _=reply.send(crate::integration_order::prepared(&mut connection,id,revision,review));},
+                        Job::IntegrationCommand{command,settings,reply}=>{let _=reply.send(crate::integration_store::command(&mut connection,&command,settings));},
                         Job::IntegrationPlanned{id,revision,result,reply}=>{let _=reply.send(crate::integration_store::planned(&mut connection,id,revision,result));},
                         Job::RebuildEffects{reply}=>{let _=reply.send(crate::effects::rebuild(&mut connection));},
                         Job::InterruptEffects{session,reply}=>{let _=reply.send(crate::effects::interrupt(&mut connection,Some(&session)));},
@@ -2301,11 +3997,24 @@ impl Journal {
                         Job::ReconcileLocal{session,reply}=>{let _=reply.send(crate::reconcile_store::local(&connection,&session));},
                         Job::ReconcileRecord{session,summary,retired,reply}=>{let _=reply.send(crate::reconcile_store::record(&mut connection,&session,&summary,&retired));},
                         Job::ReconcileReplay{session,turn,reply}=>{let _=reply.send(crate::reconcile_store::replay(&connection,&session,turn));},
+                        Job::ReadInput{id,reply}=>{let _=reply.send(read_input(&connection,&id));},
+                        Job::ReadInputOrigin{input,reply}=>{let _=reply.send(crate::input_origin::read(&connection,input));},
+                        Job::MarkMisread{request,reply}=>{
+                            let result=crate::input_feedback::mark(&mut connection,&request)
+                                .and_then(|()|read_input(&connection,&request.utterance_id.to_string()));
+                            let _=reply.send(result);
+                        },
+                        Job::NextInferredCorrection{reply}=>{let _=reply.send(crate::inference_store::next(&connection));},
+                        Job::FinishInferredCorrection{ticket,result,reply}=>{let _=reply.send(crate::inference_store::finish(&mut connection,&ticket,result));},
                         Job::ClipDetail{id,reply}=>{let _=reply.send(crate::timeline::detail(&connection,&id));},
+                        Job::InputMasked{ticket,reply}=>{let _=reply.send(crate::editor_log::input_masked(&mut connection,&ticket));},
+                        Job::EditorLog{query,reply}=>{let _=reply.send(crate::editor_log::read(&connection,query));},
+                        Job::EditorAway{query,reply}=>{let _=reply.send(crate::editor_away::read(&connection,query));},
                         Job::TimelineWindow{request,reply}=>{let _=reply.send(crate::timeline::window(&connection,request));},
                         Job::Output{session,item,reference,value,reply}=>{let _=reply.send(crate::timeline::cache_output(&mut connection,&session,&item,&reference,&value));},
                         Job::ObserveReport{report,reply}=>{let _=reply.send(crate::report_store::observe(&mut connection,report));},
                         Job::AnalyzeReport{id,revision,analysis,reply}=>{let _=reply.send(crate::report_store::analyzed(&mut connection,&id,revision,analysis));},
+                        Job::AnalyzeBackgroundReports{results,reply}=>{let _=reply.send(crate::report_store::analyzed_background(&mut connection,&results));},
                         Job::RespondReport{id,question,revision,answer,reply}=>{let result=crate::report_store::respond(&mut connection,id,&question,revision,answer).and_then(|input|input.map(|input|read_input(&connection,&input)).transpose().map(|v|v.unwrap_or(Value::Null)));let _=reply.send(result);},
                         Job::ReserveTurn{id,input,revision,track,params,reply}=>{let _=reply.send(reserve_turn(&mut connection,&id,&input,revision,&track,&params));}
                         Job::InputExecution{input,revision,state,reply}=>{let _=reply.send(input_execution(&mut connection,&input,revision,&state));}
@@ -2330,6 +4039,12 @@ impl Journal {
                         Job::BindSession { id, slug, reply } => { let _ = reply.send(bind_session(&mut connection, &id, &slug)); }
                         Job::WorkspaceResult { workspace, reply } => { let _ = reply.send(workspace_result(&mut connection, &workspace)); }
                         Job::RetryPreparation { id, reply } => { let _ = reply.send(retry_preparation(&mut connection, &id)); }
+                        Job::QueueApprovalReply { request, reply } => {
+                            let _ = reply.send(crate::approval_reply::queue(&mut connection, request));
+                        }
+                        Job::AdvanceApprovalReplies { reply } => {
+                            let _ = reply.send(crate::approval_reply::advance(&mut connection));
+                        }
                         Job::ReadOperation { id, reply } => {
                             let result = (|| -> Result<Option<Value>> {
                                 let row: Option<(String,String,String)> = connection.query_row("SELECT kind,payload,state FROM operations WHERE id=?1", [&id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
@@ -2349,6 +4064,15 @@ impl Journal {
                                 row.map(|(id,payload)|Ok((id.parse()?,serde_json::from_str(&payload)?))).transpose()
                             })();
                             let _=reply.send(result);
+                        }
+                        Job::ReadEditorCalibration { prefix, cache_prefix, reply } => {
+                            let _ = reply.send(crate::editor_calibration::resolve(&connection, &prefix, cache_prefix));
+                        }
+                        Job::EditorCalibrationState { reply } => {
+                            let _ = reply.send(crate::editor_calibration::state(&connection));
+                        }
+                        Job::ApplyEditorCalibration { change, reply } => {
+                            let _ = reply.send(crate::editor_calibration::apply(&mut connection, change));
                         }
                         Job::ReadEditorConfig { reply } => {
                             let result = (|| -> Result<Option<Value>> {
@@ -2372,6 +4096,7 @@ impl Journal {
                             target,
                             selected,
                             attachments,
+                            sources,
                             reply,
                         } => {
                             let _ = reply.send(stage_utterance(
@@ -2381,14 +4106,73 @@ impl Journal {
                                 &target,
                                 selected.as_deref(),
                                 &attachments,
+                                sources.as_ref(),
                             ));
                         }
-                        Job::SaveAttachment {stored,reply}=>{let _=reply.send(crate::attachment_store::save(&mut connection,&stored));}
+                        Job::ReviewPossible {input,revision,tracks,reply}=>{let _=reply.send(crate::reason_review::possible(&connection,&input,revision,&tracks));},
+                        Job::ReadReasonReview {input,reply}=>{let _=reply.send(crate::reason_review::read(&connection,&input));},
+                        Job::ReadRequestSources {input,reply}=>{
+                            let result = (|| {
+                                let text = connection.query_row("SELECT text FROM utterances WHERE id=?1", [&input], |row| row.get(0))?;
+                                Ok((text, crate::request_sources::read(&connection, &input)?))
+                            })();
+                            let _ = reply.send(result);
+                        }
+                        Job::InputCandidates {input,reading,text,target,selected,reply}=>{
+                            let result = (|| Ok((input_candidates(&connection, &text, &target, selected.as_deref())?, crate::input_context::read(&connection,&input,reading)?)))();
+                            let _ = reply.send(result);
+                        }
+                        Job::SaveAttachment {stored,masked,reply}=>{let _=reply.send(crate::attachment_store::save(&mut connection,&stored,masked));}
+                        Job::PreviousAttachmentScreening {request,reply}=>{let _=reply.send(crate::attachment_screening::previous(&connection,&request));}
+                        Job::ReadAttachmentScreening {id,digest,reply}=>{let _=reply.send(crate::attachment_screening::read(&connection,id,&digest));}
+                        Job::SaveAttachmentScreening {request,revision,reply}=>{let _=reply.send(crate::attachment_screening::save(&mut connection,request,revision));}
+                        Job::PastedReferences {track,after,reply}=>{let _=reply.send(crate::attachment_screening::references(&connection,&track,after));}
                         Job::InputAttachments {input,track,session,reply}=>{let _=reply.send(crate::attachment_store::material(&connection,&input,&track,&session));}
                         Job::FrozenAttachments {owner,workspace,reply}=>{let _=reply.send(crate::attachment_store::frozen(&connection,owner,workspace));}
                         Job::SessionAttachments {session,track,reply}=>{let _=reply.send(crate::attachment_store::session(&connection,&session,&track));}
                         Job::ClaimInput { reply } => {
-                            let _ = reply.send(claim_input(&mut connection));
+                            let _ = reply.send(crate::edit_hold::expire(&mut connection, &crate::clock::Stamp::now()).and_then(|()| claim_input(&mut connection)));
+                        }
+                        Job::SubmitRephrase { request, original, reply } => {
+                            let result = crate::rephrases::submit(&mut connection, &request, original.as_ref())
+                                .and_then(|()| read_input(&connection, &request.utterance_id));
+                            let _ = reply.send(result);
+                        }
+                        Job::ClaimRephrase { reply } => { let _ = reply.send(crate::rephrases::claim(&mut connection)); }
+                        Job::RephraseCurrent { ticket, reply } => { let _ = reply.send(crate::rephrases::current(&connection, &ticket)); }
+                        Job::FinishRephrase { ticket, outcome, reply } => { let _ = reply.send(crate::rephrases::finish(&mut connection, &ticket, outcome)); }
+                        Job::ClaimDescription { reply } => { let _ = reply.send(crate::description_store::claim(&mut connection)); }
+                        Job::ClaimAssumptions { reply } => { let _ = reply.send(crate::assumption_store::claim(&mut connection)); }
+                        Job::FinishAssumptions { ticket, outcome, reply } => { let _ = reply.send(crate::assumption_store::finish(&mut connection, &ticket, outcome)); }
+                        Job::NextClipFiles { reply } => { let _ = reply.send(crate::clip_files::next(&mut connection)); }
+                        Job::FinishClipFiles { ticket, result, reply } => { let _ = reply.send(crate::clip_files::finish(&mut connection, &ticket, result)); }
+                        Job::CheckQuietProposal { now, reply } => { let _ = reply.send(crate::quiet_proposals::next(&mut connection, &now)); }
+                        Job::FinishQuietProposal { ticket, changes, now, reply } => { let _ = reply.send(crate::quiet_proposals::finish(&mut connection, &ticket, changes, &now)); }
+                        Job::AnswerProposal { command, reply } => { let _ = reply.send(crate::proposals::respond(&mut connection, &command)); }
+                        Job::AnswerAssumption { command, reply } => { let _ = reply.send(crate::assumption_store::respond(&mut connection, &command)); }
+                        Job::ClaimClipSummary { reply } => { let _ = reply.send(crate::clip_summary_store::claim(&mut connection)); }
+                        Job::ObserveTimeline { owner, revision, view, reply } => { let _ = reply.send(crate::clip_summary_store::observe(&connection,owner,revision,view)); }
+                        Job::ClipSummaryCurrent { ticket, reply } => { let _ = reply.send(crate::clip_summary_store::current(&connection, &ticket)); }
+                        Job::FinishClipSummary { ticket, outcome, reply } => { let _ = reply.send(crate::clip_summary_store::finish(&mut connection, &ticket, outcome)); }
+                        Job::DescriptionCurrent { ticket, reply } => { let _ = reply.send(crate::description_store::current(&connection, &ticket)); }
+                        Job::FinishDescription { ticket, outcome, reply } => { let _ = reply.send(crate::description_store::finish(&mut connection, &ticket, outcome)); }
+                        Job::ClaimReread { reply } => {
+                            let _ = reply.send(crate::input_readings::claim(&mut connection));
+                        }
+                        Job::RereadCurrent { ticket, reply } => { let _ = reply.send(crate::input_readings::current(&connection, &ticket)); }
+                        Job::ReleaseReread { ticket, reply } => { let _ = reply.send(crate::input_readings::release(&mut connection, &ticket).map(|()|true)); }
+                        Job::ApplyReread { ticket, outcome, reply } => { let _ = reply.send(crate::input_readings::apply(&mut connection, &ticket, outcome)); }
+                        Job::TimelineHistory { request, reply } => {
+                            let result = crate::timeline_history::change(&mut connection, request).and_then(|()| snapshot(&connection));
+                            let _ = reply.send(result);
+                        }
+                        Job::EditInput { request, reply } => {
+                            let result = crate::edit_hold::change(&mut connection, request, crate::clock::Stamp::now())
+                                .and_then(|input| input.map(|id| read_input(&connection, &id)).transpose().map(|value| value.unwrap_or(Value::Null)));
+                            let _ = reply.send(result);
+                        }
+                        Job::ClaimRedirect { input, revision, reply } => {
+                            let _ = reply.send(crate::redirect::claim_interrupt(&mut connection, &input, revision));
                         }
                         Job::ApplyInput {
                             id,
@@ -2398,6 +4182,16 @@ impl Journal {
                         } => {
                             let _ =
                                 reply.send(apply_input(&mut connection, &id, revision, outcome));
+                        }
+                        Job::ExpireInput { ticket, reply } => {
+                            let _ = reply.send(crate::input_readings::expire(&mut connection, &ticket));
+                        }
+                        Job::FinishReading { ticket, outcome, reply } => {
+                            let result = crate::input_readings::finish_late(&mut connection, &ticket, &outcome)
+                                .and_then(|consumed| if consumed { Ok(()) } else {
+                                    apply_input(&mut connection, &ticket.input, ticket.revision, outcome)
+                                });
+                            let _ = reply.send(result);
                         }
                         Job::CutInput { id, input, reply } => {
                             let _ = reply.send(cut_input(&mut connection, &id, &input));
@@ -2412,6 +4206,13 @@ impl Journal {
                         }
                         Job::RecoverInputs { reply } => {
                             let _ = reply.send(recover_inputs(&mut connection));
+                        }
+                        Job::ConfirmationChange { request, reply } => {
+                            let _ = reply.send(crate::confirmation::change(&mut connection, &request));
+                        }
+                        Job::ConfirmInput { request, reply } => {
+                            let result = crate::confirmation::accept(&mut connection, &request).and_then(|input| read_input(&connection, &input));
+                            let _ = reply.send(result);
                         }
                         Job::ResolveInput {
                             id,
@@ -2428,8 +4229,14 @@ impl Journal {
                                 &resolution,
                             ));
                         }
+                        Job::DraftRead { session, reply } => {
+                            let _ = reply.send(crate::drafts::read(&connection, &session).and_then(|value| serde_json::to_value(value).map_err(Into::into)));
+                        }
+                        Job::DraftSave { request, reply } => {
+                            let _ = reply.send(crate::drafts::save(&mut connection, request));
+                        }
                         Job::Snapshot { reply } => {
-                            let _ = reply.send(snapshot(&connection).map(|mut value|{value["logUnavailable"]=serde_json::json!(!pending_controls.is_empty());value}));
+                            let _ = reply.send(crate::edit_hold::expire(&mut connection, &crate::clock::Stamp::now()).and_then(|()| snapshot(&connection)).map(|mut value|{value["logUnavailable"]=serde_json::json!(!pending_controls.is_empty());value}));
                         }
                         Job::Intent {
                             id,
@@ -2458,6 +4265,8 @@ impl Journal {
             })?;
         started.await??;
         Ok(Self {
+            full_privacy: crate::full_privacy::Runtime::default(),
+            fingerprint_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
             jobs,
             changes,
             secret_key,
@@ -2478,13 +4287,18 @@ fn open_connection(path: &Path, key_check: &[u8; 32]) -> Result<Connection> {
         return Err(std::io::Error::other("unsupported database version").into());
     }
     crate::clock::register(&connection)?;
+    crate::clip_warnings::register(&connection)?;
     connection.execute_batch("BEGIN IMMEDIATE;")?;
     connection.execute_batch("CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY,ts INTEGER NOT NULL,mono INTEGER NOT NULL DEFAULT (intercat_mono()),boot TEXT NOT NULL DEFAULT (intercat_boot()),position INTEGER NOT NULL DEFAULT (intercat_position()),track_id TEXT,session_id TEXT,kind TEXT NOT NULL,payload TEXT NOT NULL,source_seq INTEGER REFERENCES events(seq));
     CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,payload TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('prepared','dispatched','complete','superseded')));
     CREATE TABLE IF NOT EXISTS utterances(id TEXT PRIMARY KEY,text TEXT NOT NULL,created_at INTEGER NOT NULL,target TEXT NOT NULL,selected TEXT,state TEXT NOT NULL,revision INTEGER NOT NULL,decision TEXT,reason TEXT,provisional TEXT,question_id TEXT,question_revision INTEGER,dispatch_command TEXT);
     CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY,record TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS input_attachments(input TEXT NOT NULL REFERENCES utterances(id),attachment TEXT NOT NULL REFERENCES attachments(id),ordinal INTEGER NOT NULL,PRIMARY KEY(input,attachment),UNIQUE(input,ordinal));
+    CREATE TABLE IF NOT EXISTS utterance_sources(input TEXT PRIMARY KEY REFERENCES utterances(id) ON DELETE CASCADE,record TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS tracks(id TEXT PRIMARY KEY,label TEXT NOT NULL,title TEXT NOT NULL,status TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS timeline_edit_positions ON operations(json_extract(payload,'$.session'),json_extract(payload,'$.position')) WHERE kind='timeline.edit';
+    CREATE INDEX IF NOT EXISTS redirect_interrupt_inputs ON events(json_extract(payload,'$.inputId')) WHERE kind='redirect.state' AND json_extract(payload,'$.phase')='interrupting';
+    CREATE INDEX IF NOT EXISTS worker_active_turns ON events(json_extract(payload,'$.trackId'),json_extract(payload,'$.sessionId'),seq) WHERE kind='worker.state' AND json_type(payload,'$.activeTurn')='text';
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS workspaces(track_id TEXT PRIMARY KEY REFERENCES tracks(id),record TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS workers(track_id TEXT PRIMARY KEY REFERENCES tracks(id),record TEXT NOT NULL);
@@ -2497,8 +4311,16 @@ fn open_connection(path: &Path, key_check: &[u8; 32]) -> Result<Connection> {
     CREATE TABLE IF NOT EXISTS effects(id TEXT PRIMARY KEY,track TEXT NOT NULL,session TEXT NOT NULL,item TEXT NOT NULL,clip TEXT,record TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS effects_clip ON effects(clip);
 ")?;
+    crate::input_readings::install(&connection)?;
+    crate::description_store::install(&connection)?;
+    crate::editor_log::install(&connection)?;
+    crate::rephrases::install(&connection)?;
+    crate::reason_review::install(&connection)?;
+    crate::branch_points::install(&connection)?;
+    crate::privacy::install(&connection)?;
     if version == 0 {
         crate::attachment_history::install(&connection)?;
+        crate::attachment_screening::install(&connection)?;
         crate::backup_choices::install(&connection)?;
         crate::backup_apply::install(&connection)?;
         crate::timeline::install(&connection)?;
@@ -2510,6 +4332,22 @@ fn open_connection(path: &Path, key_check: &[u8; 32]) -> Result<Connection> {
         crate::redirect::install(&connection)?;
         crate::branch::install(&connection)?;
     }
+    crate::clip_summary_store::install(&connection)?;
+    crate::clip_warnings::install(&connection)?;
+    crate::clip_files::install(&connection)?;
+    crate::integration_order::install(&connection)?;
+    crate::report_result::install(&connection)?;
+    crate::proposals::install(&connection)?;
+    crate::assumption_store::install(&connection)?;
+    crate::session_parameters::install(&connection)?;
+    crate::input_timeline::install(&connection)?;
+    crate::input_context::install(&connection)?;
+    crate::input_feedback::install(&connection)?;
+    crate::confirmation::install(&connection)?;
+    crate::start_condition::install(&connection)?;
+    crate::app_commands::install(&connection)?;
+    crate::inference_store::install(&connection)?;
+    crate::routing_index::install(&connection)?;
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     crate::secret_store::verify_key(&connection, key_check, version == 0)?;
     crate::secret_store::catalog(&connection)?;
@@ -2524,6 +4362,7 @@ fn open_connection(path: &Path, key_check: &[u8; 32]) -> Result<Connection> {
     crate::repair_run_store::interrupt(&mut connection)?;
     crate::secret_input_store::interrupt(&mut connection)?;
     crate::redirect::interrupt(&mut connection)?;
+    crate::input_readings::recover(&mut connection)?;
     connection.execute("UPDATE project_secret_state SET ready=0", [])?;
     Ok(connection)
 }
@@ -2581,39 +4420,102 @@ fn input_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InputRow> {
         row.get(11)?,
     ))
 }
-fn input_value(row: InputRow) -> Result<Value> {
+fn input_value(connection: &Connection, row: InputRow) -> Result<Value> {
     let decision: Option<Decision> = row.7.map(|s| serde_json::from_str(&s)).transpose()?;
-    let decision = decision.map(|mut d| {
-        d.scores = Value::Null;
-        d
-    });
-    Ok(
-        serde_json::json!({"id":row.0,"text":row.1,"createdAt":row.2,"target":serde_json::from_str::<Target>(&row.3)?,"selectedTrackId":row.4,"state":row.5,"revision":row.6,"decision":decision,"reason":row.8,"provisionalTrackId":row.9,"replyTo":row.10.map(|id|serde_json::json!({"id":id,"revision":row.11}))}),
-    )
+    let start_condition = decision
+        .as_ref()
+        .map(|decision| crate::start_condition::projection(connection, &row.0, decision))
+        .transpose()?
+        .flatten();
+    let start_waiting = decision
+        .as_ref()
+        .map(|decision| crate::app_commands::projection(connection, &row.0, decision))
+        .transpose()?
+        .flatten();
+    let presentation = if row.5 == "placed" {
+        decision
+            .as_ref()
+            .map(crate::app_commands::presentation)
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let review = decision
+        .as_ref()
+        .map(crate::decision_review::read)
+        .transpose()?
+        .flatten();
+    let decision = decision
+        .map(|mut d| -> Result<Value> {
+            let timings = d.timings();
+            d.scores = Value::Null;
+            let mut value = serde_json::to_value(d)?;
+            value["timings"] = serde_json::to_value(timings)?;
+            Ok(value)
+        })
+        .transpose()?;
+    let reply_to = row
+        .10
+        .map(|id| -> Result<Value> {
+            let question = crate::report_store::original_question(
+                connection,
+                &id,
+                row.11.unwrap_or_default(),
+            )?;
+            Ok(serde_json::json!({"id":id,"revision":row.11,"question":question}))
+        })
+        .transpose()?;
+    let confirmation = crate::confirmation::pending(connection, &row.0)?;
+    let mut value = serde_json::json!({"id":row.0,"text":row.1,"createdAt":row.2,"target":serde_json::from_str::<Target>(&row.3)?,"selectedTrackId":row.4,"state":row.5,"interruptStarted":crate::redirect::interrupt_started(connection, &row.0)?,"revision":row.6,"decision":decision,"review":review,"confirmation":confirmation,"reason":row.8,"provisionalTrackId":row.9,"replyTo":reply_to});
+    value["reading"] = crate::input_readings::status(connection, &row.0)?.unwrap_or(Value::Null);
+    value["rephrase"] = crate::rephrases::read(connection, &row.0)?.unwrap_or(Value::Null);
+    value["reasonReview"] =
+        crate::reason_review::projection(connection, &row.0)?.unwrap_or(Value::Null);
+    value["deadline"] = crate::input_readings::deadline(connection, &row.0)?.unwrap_or(Value::Null);
+    value["startCondition"] = start_condition.unwrap_or(Value::Null);
+    value["startWaiting"] = start_waiting.unwrap_or(Value::Null);
+    value["presentation"] = serde_json::to_value(presentation)?;
+    value["correction"] =
+        crate::input_feedback::summary(connection, &row.0)?.unwrap_or(Value::Null);
+    if let Some(description) = crate::description_store::read(connection, &row.0)? {
+        value["decision"]["description"] = description;
+    }
+    if let Some(record) = crate::request_sources::read(connection, &row.0)? {
+        value["sources"] = serde_json::to_value(record.sources)?;
+        value["sourceText"] = row.1.clone().into();
+        if row.1.trim().is_empty() {
+            value["text"] = record.preview.chars().take(120).collect::<String>().into();
+        }
+    }
+    Ok(value)
 }
 fn read_input(connection: &Connection, id: &str) -> Result<Value> {
     crate::session_retirement::ensure_input(connection, id)?;
-    let mut value=input_value(connection.query_row("SELECT id,text,created_at,target,selected,state,revision,decision,reason,provisional,question_id,question_revision FROM utterances WHERE id=?1",[id],input_row)?)?;
+    let mut value=input_value(connection, connection.query_row("SELECT id,text,created_at,target,selected,state,revision,decision,reason,provisional,question_id,question_revision FROM utterances WHERE id=?1",[id],input_row)?)?;
     value["attachments"] = serde_json::to_value(
         crate::attachment_store::records(connection, id)?
             .into_iter()
             .map(|s| s.attachment)
             .collect::<Vec<_>>(),
     )?;
+    value["editHold"] = crate::edit_hold::status(connection, id)?.unwrap_or(Value::Null);
     Ok(value)
 }
 fn snapshot(connection: &Connection) -> Result<Value> {
     let sequence: i64 =
         connection.query_row("SELECT coalesce(max(seq),0) FROM events", [], |r| r.get(0))?;
-    let mut stmt=connection.prepare("SELECT id,text,created_at,target,selected,state,revision,decision,reason,provisional,question_id,question_revision FROM utterances WHERE state NOT IN ('landed','cut','orphaned') OR id IN (SELECT id FROM utterances ORDER BY created_at DESC,id DESC LIMIT 100) ORDER BY created_at DESC,id DESC")?;
+    let mut stmt=connection.prepare("SELECT id,text,created_at,target,selected,state,revision,decision,reason,provisional,question_id,question_revision FROM utterances WHERE state NOT IN ('landed','cut') OR id IN (SELECT id FROM utterances ORDER BY created_at DESC,id DESC LIMIT 100) ORDER BY created_at DESC,id DESC")?;
     let rows = stmt
         .query_map([], input_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut utterances = rows
         .into_iter()
-        .map(input_value)
+        .map(|row| input_value(connection, row))
         .collect::<Result<Vec<_>>>()?;
     for value in &mut utterances {
+        value["editHold"] = crate::edit_hold::status(connection, value["id"].as_str().unwrap())?
+            .unwrap_or(Value::Null);
         value["attachments"] = serde_json::to_value(
             crate::attachment_store::records(connection, value["id"].as_str().unwrap())?
                 .into_iter()
@@ -2623,7 +4525,7 @@ fn snapshot(connection: &Connection) -> Result<Value> {
     }
     utterances.reverse();
     let mut stmt = connection.prepare("SELECT id,label,title,status FROM tracks ORDER BY rowid")?;
-    let tracks=stmt.query_map([],|r|Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"label":r.get::<_,String>(1)?,"title":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut tracks=stmt.query_map([],|r|Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"label":r.get::<_,String>(1)?,"title":crate::privacy::truncate(&r.get::<_,String>(2)?,80),"status":r.get::<_,String>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut stmt = connection.prepare("SELECT record FROM workspaces ORDER BY rowid")?;
     let workspaces = stmt
         .query_map([], |r| r.get::<_, String>(0))?
@@ -2638,9 +4540,11 @@ fn snapshot(connection: &Connection) -> Result<Value> {
         .into_iter()
         .map(|s| serde_json::from_str::<Value>(&s).map_err(Into::into))
         .collect::<Result<Vec<_>>>()?;
-    Ok(
-        serde_json::json!({"unloggedControls":crate::dispatch_control::unlogged(connection)?,"localResumes":crate::dispatch_control::local_resumes(connection)?,"dispatchPaused":crate::dispatch_control::paused(connection)?,"pickups":crate::pickup::snapshot(connection)?.iter().map(|r|r.status()).collect::<Vec<_>>(),"branches":crate::branch::snapshot(connection)?,"redirects":crate::redirect::snapshot(connection)?,"projectSecrets":crate::project_secrets::status(connection)?,"secretInputs":crate::secret_input_store::snapshot(connection)?,"daemonPid":std::process::id(),"sequence":sequence,"integration":crate::integration_store::snapshot(connection)?,"repairRuns":crate::repair_run_store::snapshot(connection)?,"timeline":crate::timeline::snapshot(connection)?,"stops":crate::policy_store::stops(connection)?,"effects":crate::effects::list(connection,None,None)?,"pendingRestores":crate::deletion::pending(connection)?,"utterances":utterances,"tracks":tracks,"workspaces":workspaces,"workers":workers,"reports":crate::report_store::pending_reports(connection)?,"reportQuestions":crate::report_store::active_questions(connection)?,"workerConfigured":read_setting(connection,"worker")?.is_some(),"project":read_setting(connection,"project")?,"session":read_setting(connection,"session")?}),
-    )
+    crate::report_result::project(connection, &mut tracks, &workers)?;
+    let proposal = crate::proposals::current(connection)?;
+    let mut value = serde_json::json!({"proposal":proposal,"editorEntries":crate::editor_log::current(connection)?,"confirmation":crate::confirmation::status(connection)?,"unloggedControls":crate::dispatch_control::unlogged(connection)?,"localResumes":crate::dispatch_control::local_resumes(connection)?,"dispatchPaused":crate::dispatch_control::paused(connection)?,"pickups":crate::pickup::snapshot(connection)?.iter().map(|r|r.status()).collect::<Vec<_>>(),"branches":crate::branch::snapshot(connection)?,"redirects":crate::redirect::snapshot(connection)?,"projectSecrets":crate::project_secrets::status(connection)?,"secretInputs":crate::secret_input_store::snapshot(connection)?,"daemonPid":std::process::id(),"sequence":sequence,"privacy":crate::privacy_policy::state(connection)?,"privacyRevision":crate::secret_store::catalog(connection)?.current.revision.checked_add(crate::privacy_policy::state(connection)?.revision).ok_or("Privacy revision overflow.")?,"integration":crate::integration_store::snapshot(connection)?,"repairRuns":crate::repair_run_store::snapshot(connection)?,"timeline":crate::timeline::snapshot(connection)?,"stops":crate::policy_store::stops(connection)?,"effects":crate::effects::list(connection,None,None)?,"pendingRestores":crate::deletion::pending(connection)?,"editHistory":crate::timeline_history::snapshot(connection)?,"utterances":utterances,"tracks":tracks,"workspaces":workspaces,"workers":workers,"reports":crate::report_store::pending_reports(connection)?,"reportQuestions":crate::report_store::active_questions(connection)?,"assumptions":crate::assumption_store::list(connection,None)?,"workerConfigured":read_setting(connection,"worker")?.is_some(),"project":read_setting(connection,"project")?,"session":read_setting(connection,"session")?});
+    crate::session_parameters::project(connection, &mut value)?;
+    Ok(value)
 }
 
 fn reserve_turn(
@@ -2674,10 +4578,14 @@ fn reserve_turn(
         }
         return Ok(Admission::Replay(state));
     }
+    if crate::edit_hold::active(&transaction, input)? {
+        return Err(StartSuperseded.into());
+    }
     crate::redirect::reserve(&transaction, input, revision, track, &params["sessionId"])?;
     crate::report_store::validate_dispatch(&transaction, input, track)?;
     crate::project_secrets::validate_dispatch(&transaction, track)?;
-    let changed=transaction.execute("UPDATE utterances SET state='starting',dispatch_command=?4 WHERE id=?1 AND revision=?2 AND state='placed' AND json_extract(decision,'$.trackId')=?3",params![input,revision,track,params["commandId"].as_str()])?;
+    crate::start_condition::validate_dispatch(&transaction, input)?;
+    let changed=transaction.execute("UPDATE utterances SET state='starting',dispatch_command=?4 WHERE id=?1 AND revision=?2 AND state='placed' AND json_extract(decision,'$.kind') IN ('fork','extend','schedule','trim') AND json_extract(decision,'$.trackId')=?3",params![input,revision,track,params["commandId"].as_str()])?;
     if changed != 1 {
         return Err(StartSuperseded.into());
     }
@@ -2803,7 +4711,7 @@ fn record_worker_state(connection: &Connection, state: &crate::runtime::WorkerSt
         crate::session_retirement::ensure_open(connection, session)?;
     }
     if state.phase == "needs-recovery" {
-        connection.execute("UPDATE utterances SET state='held',revision=revision+1,reason='The previous worker needs recovery. Review before sending.' WHERE (json_extract(decision,'$.trackId')=?1 OR provisional=?1) AND state IN ('staged','reading','placed','starting','sent')",[&state.track_id])?;
+        connection.execute("UPDATE utterances SET state='held',revision=revision+1,reason='The previous worker needs recovery. Review before sending.' WHERE (json_extract(decision,'$.trackId')=?1 OR provisional=?1) AND state IN ('staged','reading','placed','starting','sent') AND coalesce(json_extract(decision,'$.kind'),'')<>'park'",[&state.track_id])?;
     }
     let payload = serde_json::to_string(state)?;
     let terminal: Option<String> = if state.active_turn.is_none() && !state.checkpoint_pending {
@@ -2844,6 +4752,7 @@ fn record_worker_state(connection: &Connection, state: &crate::runtime::WorkerSt
         "UPDATE tracks SET status=?2 WHERE id=?1",
         params![state.track_id, track_status],
     )?;
+    crate::editor_log::worker_changed(connection, state, terminal.as_deref())?;
     connection.execute("INSERT INTO workers VALUES(?1,?2) ON CONFLICT(track_id) DO UPDATE SET record=excluded.record",params![state.track_id,payload])?;
     connection.execute(
         "INSERT INTO events(ts,kind,payload) VALUES(?1,'worker.state',?2)",
@@ -2877,7 +4786,7 @@ fn stop_lost_worker(
         }
         return Ok(());
     }
-    tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='The worker ended after connection loss. This request is held.' WHERE (json_extract(decision,'$.trackId')=?1 OR provisional=?1) AND state IN ('placed','starting','sent')",[&state.track_id])?;
+    tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='The worker ended after connection loss. This request is held.' WHERE (json_extract(decision,'$.trackId')=?1 OR provisional=?1) AND state IN ('placed','starting','sent') AND coalesce(json_extract(decision,'$.kind'),'')<>'park'",[&state.track_id])?;
     record_worker_state(&tx, state)?;
     tx.execute(
         "INSERT INTO operations VALUES(?1,'worker.stopLost',?2,'complete')",
@@ -3134,13 +5043,38 @@ fn stage_utterance(
     target: &Target,
     selected: Option<&str>,
     attachments: &[uuid::Uuid],
+    sources: Option<&crate::request_sources::Record>,
 ) -> Result<Value> {
     crate::session_retirement::ensure_input(connection, id)?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     let transaction = connection.transaction()?;
-    let payload = serde_json::to_string(
-        &serde_json::json!({"text":text,"target":target,"selectedTrackId":selected,"attachmentIds":attachments}),
+    let value = insert_utterance(
+        &transaction,
+        id,
+        text,
+        target,
+        selected,
+        attachments,
+        sources,
     )?;
+    transaction.commit()?;
+    Ok(value)
+}
+
+pub(crate) fn insert_utterance(
+    transaction: &rusqlite::Transaction<'_>,
+    id: &str,
+    text: &str,
+    target: &Target,
+    selected: Option<&str>,
+    attachments: &[uuid::Uuid],
+    sources: Option<&crate::request_sources::Record>,
+) -> Result<Value> {
+    let mut value = serde_json::json!({"text":text,"target":target,"selectedTrackId":selected,"attachmentIds":attachments});
+    if let Some(sources) = sources {
+        value["sources"] = serde_json::to_value(sources)?;
+    }
+    let payload = serde_json::to_string(&value)?;
     let existing: Option<(String, String)> = transaction
         .query_row(
             "SELECT kind,payload FROM operations WHERE id=?1",
@@ -3166,9 +5100,16 @@ fn stage_utterance(
             }
         }
         let now = timestamp();
-        if read_setting(&transaction, "session")?.is_none() {
+        if read_setting(transaction, "session")?.is_none() {
             let slug = format!("s-{}", local_minute(now / 1000)?);
-            let session = serde_json::json!({"id":id,"slug":slug,"name":text.chars().take(30).collect::<String>(),"createdAt":now});
+            let label = if text.trim().is_empty() {
+                sources
+                    .map(|record| record.preview.as_str())
+                    .unwrap_or(text)
+            } else {
+                text
+            };
+            let session = serde_json::json!({"id":id,"slug":slug,"name":label,"createdAt":now});
             transaction.execute(
                 "INSERT INTO settings VALUES('session',?1)",
                 [serde_json::to_string(&session)?],
@@ -3183,13 +5124,28 @@ fn stage_utterance(
             "INSERT INTO utterances(id,text,created_at,target,selected,state,revision,decision,reason,provisional) VALUES(?1,?2,?3,?4,?5,'staged',1,NULL,NULL,?6)",
             params![id, text, now, serde_json::to_string(target)?, selected, provisional],
         )?;
-        if crate::dispatch_control::paused(&transaction)? {
+        crate::start_condition::capture(transaction, id)?;
+        crate::app_commands::capture(transaction, id)?;
+        crate::reason_review::capture_sources(transaction, id)?;
+        if crate::dispatch_control::paused(transaction)? {
             transaction.execute(
                 "UPDATE utterances SET state='held',reason='Turns stopped' WHERE id=?1",
                 [id],
             )?;
         }
-        crate::attachment_store::bind(&transaction, id, attachments)?;
+        crate::attachment_store::bind(transaction, id, attachments)?;
+        if let Some(sources) = sources {
+            crate::request_sources::write(transaction, id, sources)?;
+            if text.trim().is_empty()
+                && sources.sources.iter().all(|source| {
+                    source.role == crate::request_sources::Role::Reference
+                        && source.after.trim().is_empty()
+                })
+                && transaction.execute("UPDATE utterances SET state='asked',reason='What should I do with this?' WHERE id=?1 AND state='staged'", [id])? > 0
+            {
+                crate::rephrases::begin(transaction, id, 1, false)?;
+            }
+        }
         transaction.execute(
             "INSERT INTO operations VALUES(?1,'utterance.create',?2,'complete')",
             params![id, payload],
@@ -3198,36 +5154,81 @@ fn stage_utterance(
             "INSERT INTO events(ts,kind,payload) VALUES(?1,'utterance.staged',?2)",
             params![
                 now,
-                serde_json::to_string(&serde_json::json!({"id":id,"text":text,"target":target}))?
+                serde_json::to_string(&serde_json::json!({"id":id,"text":text,"target":target,"sessionId":read_setting(transaction,"session")?.map(|session|session["id"].clone())}))?
             ],
         )?;
+        crate::input_readings::invalidate_parks(transaction)?;
     }
-    transaction.commit()?;
-    read_input(connection, id)
+    read_input(transaction, id)
+}
+
+fn input_candidates(
+    connection: &Connection,
+    text: &str,
+    target: &Target,
+    selected: Option<&str>,
+) -> Result<crate::routing::Selection> {
+    let mut statement = connection.prepare("SELECT t.id,t.title,t.status,t.label,(SELECT max(u.created_at) FROM utterances u WHERE json_extract(u.decision,'$.trackId')=t.id) FROM tracks t ORDER BY t.rowid")?;
+    let tracks = statement
+        .query_map([], |r| {
+            Ok(crate::routing::Track {
+                candidate: Candidate {
+                    id: r.get(0)?,
+                    label: r.get(3)?,
+                    title: r.get(1)?,
+                    status: r.get(2)?,
+                    activity: None,
+                    running: None,
+                    planned: Vec::new(),
+                },
+                spoken_at: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut statement = connection.prepare("SELECT track_id FROM (
+  SELECT track_id,0 priority,rowid position FROM report_questions WHERE state IN ('open','queued','held')
+  UNION ALL SELECT track_id,1,rowid FROM workers WHERE json_extract(record,'$.detail') IS NOT NULL AND json_extract(record,'$.phase') IN ('failed','needs-recovery','question','lost','after-connection-loss')
+  UNION ALL SELECT track_id,2,rowid FROM workers WHERE json_array_length(record,'$.prompts')>0
+  UNION ALL SELECT track_id,3,rowid FROM workers WHERE json_array_length(record,'$.approvals')>0
+) GROUP BY track_id ORDER BY min(priority),min(position)")?;
+    let needs_you = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut selection = crate::routing::select(
+        connection,
+        text,
+        tracks,
+        selected,
+        match target {
+            Target::Lock(id) => Some(id.as_str()),
+            _ => None,
+        },
+        &needs_you,
+    )?;
+    for candidate in selection.first.iter_mut().chain(&mut selection.expanded) {
+        (candidate.running, candidate.planned) =
+            crate::input_context::track(connection, &candidate.id)?;
+    }
+    Ok(selection)
 }
 
 fn claim_input(connection: &mut Connection) -> Result<Option<PendingInput>> {
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     let transaction = connection.transaction()?;
-    let row: Option<(String,String,String,Option<String>,i64)> = transaction.query_row("SELECT id,text,target,selected,revision FROM utterances WHERE state='staged' ORDER BY created_at,id LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+    let row: Option<(String,String,String,Option<String>,i64)> = transaction.query_row("SELECT id,text,target,selected,revision FROM utterances WHERE state='staged' AND NOT EXISTS(SELECT 1 FROM operations WHERE kind='utterance.edit' AND state='prepared' AND json_extract(payload,'$.input')=utterances.id) ORDER BY created_at,id LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
     let Some((id, text, target, selected, revision)) = row else {
         return Ok(None);
     };
-    let mut statement = transaction.prepare("SELECT t.id,t.title,t.status FROM tracks t ORDER BY (SELECT max(u.created_at) FROM utterances u WHERE json_extract(u.decision,'$.trackId')=t.id) DESC,t.rowid")?;
-    let tracks = statement
-        .query_map([], |r| {
-            Ok(Candidate {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                status: r.get(2)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(statement);
+    let target: Target = serde_json::from_str(&target)?;
+    let candidates = input_candidates(&transaction, &text, &target, selected.as_deref())?;
     transaction.execute(
         "UPDATE utterances SET state='reading',reason=NULL WHERE id=?1",
         [&id],
     )?;
+    let reading = crate::input_readings::begin_input(&transaction, &id, revision)?;
+    let history = crate::input_context::read(&transaction, &id, reading.index)?;
     transaction.execute(
         "INSERT INTO events(ts,kind,payload) VALUES(?1,'utterance.reading',?2)",
         params![
@@ -3236,14 +5237,61 @@ fn claim_input(connection: &mut Connection) -> Result<Option<PendingInput>> {
         ],
     )?;
     transaction.commit()?;
+    let sources = crate::request_sources::read(connection, &id)?
+        .map(|record| record.sources)
+        .unwrap_or_default();
+    let has_attachments = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM input_attachments WHERE input=?1)",
+        [&id],
+        |row| row.get(0),
+    )?;
     Ok(Some(PendingInput {
         id,
         text,
-        target: serde_json::from_str(&target)?,
+        target,
         selected,
         revision,
-        tracks,
+        tracks: candidates.first,
+        expanded_tracks: candidates.expanded,
+        sources,
+        has_attachments,
+        context: None,
+        reading_index: reading.index,
+        history,
     }))
+}
+
+pub(crate) fn pending_input(connection: &Connection, id: &str) -> Result<PendingInput> {
+    let (text, target, selected, revision): (String, String, Option<String>, i64) = connection
+        .query_row(
+            "SELECT text,target,selected,revision FROM utterances WHERE id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let target: Target = serde_json::from_str(&target)?;
+    let candidates = input_candidates(connection, &text, &target, selected.as_deref())?;
+    let sources = crate::request_sources::read(connection, id)?
+        .map(|record| record.sources)
+        .unwrap_or_default();
+    let has_attachments = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM input_attachments WHERE input=?1)",
+        [id],
+        |row| row.get(0),
+    )?;
+    Ok(PendingInput {
+        id: id.into(),
+        text,
+        target,
+        selected,
+        revision,
+        tracks: candidates.first,
+        expanded_tracks: candidates.expanded,
+        sources,
+        has_attachments,
+        context: None,
+        reading_index: 0,
+        history: crate::input_context::read(connection, id, 0)?,
+    })
 }
 fn apply_input(
     connection: &mut Connection,
@@ -3261,10 +5309,64 @@ fn apply_input(
     if current != ("reading".into(), revision) {
         return Ok(());
     }
+    apply_outcome(&transaction, id, revision, outcome)?;
+    crate::input_readings::finish_input(&transaction, id, revision)?;
+    crate::input_readings::queue_latest(&transaction, id, revision)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(crate) fn decision_worker(
+    connection: &Connection,
+    decision: &Decision,
+) -> Result<Option<crate::runtime::WorkerState>> {
+    let Some(track) = &decision.track_id else {
+        return Ok(None);
+    };
+    connection
+        .query_row(
+            "SELECT record FROM workers WHERE track_id=?1",
+            [track],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|text| serde_json::from_str(&text).map_err(Into::into))
+        .transpose()
+}
+
+pub(crate) fn apply_outcome(
+    transaction: &Connection,
+    id: &str,
+    revision: i64,
+    outcome: Outcome,
+) -> Result<()> {
+    let mut no_turn = false;
     let (mut state, decision, mut reason) = match outcome {
         Outcome::Defer => ("staged", None, Some("editor unavailable".to_owned())),
         Outcome::Asked(reason) => ("asked", None, Some(reason)),
+        Outcome::Rephrase { generate } => {
+            crate::rephrases::begin(transaction, id, revision, generate)?;
+            (
+                "asked",
+                None,
+                Some(
+                    if generate {
+                        "Too long for the Editor · give it a one-line request"
+                    } else {
+                        "What should I do with this?"
+                    }
+                    .into(),
+                ),
+            )
+        }
         Outcome::Classified(mut decision) => {
+            crate::reason_review::capture(transaction, id, revision, &mut decision)?;
+            crate::start_condition::prepare(transaction, id, &mut decision)?;
+            if decision.kind == Kind::Park {
+                decision.track_id = None;
+                decision.boundary = None;
+                decision.command = None;
+            }
             if decision.kind == Kind::Trim {
                 decision.boundary = Some("now".into());
             }
@@ -3273,6 +5375,24 @@ fn apply_input(
             if decision.timed_out {
                 state = "asked";
                 reason = Some("The Editor took too long. Choose where this should go.".into());
+            } else if let Some(mut review) = crate::decision_review::read(&decision)? {
+                let worker = decision_worker(transaction, &decision)?;
+                crate::decision_review::bind(&mut review, worker.as_ref());
+                let label = decision
+                    .track_id
+                    .as_ref()
+                    .map(|track| {
+                        transaction.query_row(
+                            "SELECT label FROM tracks WHERE id=?1",
+                            [track],
+                            |row| row.get::<_, String>(0),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                reason = Some(crate::decision_review::reason(&review, &label));
+                crate::decision_review::write(&mut decision, review)?;
+                state = "asked";
             } else if decision.boundary.as_deref() == Some("after-clip") {
                 state = "asked";
                 reason = Some("Choose the step this request should wait for.".into());
@@ -3280,10 +5400,26 @@ fn apply_input(
                 && decision.track_id.is_none()
             {
                 state = "asked";
-                reason = Some("Choose a track for this request.".into());
+                reason = Some(if decision.scores["routing"]["pass"] == 2 {
+                    "Can't place · Not started · pick a track".into()
+                } else {
+                    "Choose a track for this request.".into()
+                });
+            } else if !matches!(decision.kind, Kind::Ask | Kind::Park | Kind::Plan)
+                && crate::confirmation::gate(transaction, id, revision, &decision)?
+            {
+                state = "asked";
+                reason = Some("waiting for OK".into());
+            } else if decision.kind == Kind::Command
+                && decision.command.as_deref() == Some("start-waiting")
+            {
+                reason = crate::app_commands::begin(transaction, id, &mut decision)?;
+                state = if reason.is_some() { "asked" } else { "landed" };
+            } else if crate::app_commands::prepare_presentation(&mut decision)? {
+                no_turn = true;
             } else if decision.kind == Kind::Trim {
                 if crate::redirect::prepare(
-                    &transaction,
+                    transaction,
                     id,
                     revision,
                     decision.track_id.as_deref().unwrap(),
@@ -3297,11 +5433,11 @@ fn apply_input(
                 state = "asked";
                 reason = Some("Please clarify this request.".into());
             } else if decision.kind == Kind::Park {
-                state = "parked";
+                no_turn = true;
             } else if decision.kind == Kind::Plan {
                 state = "asked";
                 reason = Some("This request needs a plan.".into());
-            } else if decision.kind == Kind::Fork {
+            } else if decision.kind == Kind::Fork && decision.track_id.is_none() {
                 let count: i64 = transaction.query_row(
                     "SELECT count(*) FROM tracks WHERE label NOT GLOB '*[0-9]*'",
                     [],
@@ -3314,24 +5450,28 @@ fn apply_input(
                     label.insert(0, (b'A' + (number % 26) as u8) as char);
                     number /= 26;
                 }
-                let title: String = transaction
-                    .query_row("SELECT text FROM utterances WHERE id=?1", [id], |r| {
-                        r.get::<_, String>(0)
-                    })?
-                    .chars()
-                    .take(30)
-                    .collect();
+                let mut title: String = transaction.query_row(
+                    "SELECT text FROM utterances WHERE id=?1",
+                    [id],
+                    |r| r.get::<_, String>(0),
+                )?;
+                if title.trim().is_empty()
+                    && let Some(record) = crate::request_sources::read(transaction, id)?
+                {
+                    title = record.preview;
+                }
                 let track = uuid::Uuid::now_v7().to_string();
                 transaction.execute(
                     "INSERT INTO tracks VALUES(?1,?2,?3,'waiting')",
                     params![track, label, title],
                 )?;
+                crate::editor_log::fork(transaction, id, &track, &label)?;
                 decision.track_id = Some(track);
             }
             (state, Some(serde_json::to_string(&decision)?), reason)
         }
     };
-    if state == "placed" && crate::dispatch_control::paused(&transaction)? {
+    if state == "placed" && !no_turn && crate::dispatch_control::paused(transaction)? {
         state = "held";
         reason = Some("Turns stopped".into());
     }
@@ -3340,9 +5480,9 @@ fn apply_input(
         params![id, state, decision, reason],
     )?;
     transaction.execute("INSERT INTO events(ts,kind,payload) VALUES(?1,'utterance.classified',?2)",params![timestamp(),serde_json::to_string(&serde_json::json!({"id":id,"revision":revision,"state":state,"decision":decision.map(|d|serde_json::from_str::<Value>(&d)).transpose()?,"reason":reason}))?])?;
-    transaction.commit()?;
     Ok(())
 }
+
 fn resolve_input(
     connection: &mut Connection,
     id: &str,
@@ -3367,22 +5507,134 @@ fn resolve_input(
             return Err(std::io::Error::other("operation ID reused").into());
         }
     } else {
-        let (state, current): (String, i64) = transaction.query_row(
-            "SELECT state,revision FROM utterances WHERE id=?1",
+        if crate::edit_hold::active(&transaction, input)? {
+            return Err("Finish editing this request first.".into());
+        }
+        let (state, current, reason): (String, i64, Option<String>) = transaction.query_row(
+            "SELECT state,revision,reason FROM utterances WHERE id=?1",
             [input],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        let placed_hold = matches!(resolution, Resolution::Hold) && state == "placed";
-        if current != revision || (!placed_hold && !["asked", "held"].contains(&state.as_str())) {
+        let placed_action = matches!(resolution, Resolution::Hold)
+            && ["placed", "redirecting"].contains(&state.as_str())
+            || matches!(resolution, Resolution::Presented) && state == "placed";
+        if current != revision
+            || (!placed_action && !["asked", "held", "orphaned"].contains(&state.as_str()))
+            || (state == "orphaned" && !matches!(resolution, Resolution::Retry { .. }))
+        {
             return Err(std::io::Error::other("request changed; refresh before answering").into());
         }
         match resolution {
+            Resolution::Presented => {
+                if crate::confirmation::pending(&transaction, input)?.is_some() {
+                    return Err("Confirm this application action first.".into());
+                }
+                crate::app_commands::presented(&transaction, input, id)?;
+            }
+            Resolution::StartWaiting { choice } => {
+                if state != "asked" || crate::confirmation::pending(&transaction, input)?.is_some()
+                {
+                    return Err("This command is not waiting for a request choice.".into());
+                }
+                let raw: String = transaction.query_row(
+                    "SELECT decision FROM utterances WHERE id=?1",
+                    [input],
+                    |row| row.get(0),
+                )?;
+                let mut decision: Decision = serde_json::from_str(&raw)?;
+                if crate::decision_review::read(&decision)?.is_some() {
+                    return Err("Confirm what this command should do first.".into());
+                }
+                crate::app_commands::select(&transaction, input, &mut decision, choice)?;
+                transaction.execute("UPDATE utterances SET state='landed',revision=revision+1,decision=?2,reason=NULL WHERE id=?1",params![input,serde_json::to_string(&decision)?])?;
+            }
+            Resolution::Confirm { choice } => {
+                if state != "asked" {
+                    return Err("This request is not waiting for that choice.".into());
+                }
+                let instruction = if matches!(choice, crate::decision_review::Choice::Instruction) {
+                    crate::input_readings::instruction(&transaction, input)?
+                } else {
+                    None
+                };
+                let confirmed = if let Some(instruction) = instruction {
+                    instruction
+                } else {
+                    let stored: String = transaction.query_row(
+                        "SELECT decision FROM utterances WHERE id=?1",
+                        [input],
+                        |row| row.get(0),
+                    )?;
+                    let decision: Decision = serde_json::from_str(&stored)?;
+                    let review = crate::decision_review::read(&decision)?
+                        .ok_or("This request has no pending choice.")?;
+                    let worker = decision_worker(&transaction, &decision)?;
+                    crate::decision_review::confirm(decision, &review, choice, worker.as_ref())?
+                };
+                if let crate::decision_review::Choice::AfterWorkerTurn { source } = choice {
+                    crate::start_condition::choose(&transaction, input, source)?;
+                }
+                transaction.execute(
+                    "UPDATE utterances SET revision=revision+1 WHERE id=?1",
+                    [input],
+                )?;
+                apply_outcome(
+                    &transaction,
+                    input,
+                    revision + 1,
+                    Outcome::Classified(confirmed),
+                )?;
+            }
             Resolution::Hold => {
-                transaction.execute("UPDATE utterances SET state='held',revision=revision+1,reason='Held by you' WHERE id=?1", [input])?;
-                crate::redirect::input_state(&transaction, input, "held")?;
+                if state != "held" || reason.as_deref() != Some("Held by you") {
+                    let before = crate::timeline_history::capture(&transaction, input)?;
+                    transaction.execute("UPDATE utterances SET state='held',revision=revision+1,reason='Held by you' WHERE id=?1", [input])?;
+                    crate::redirect::input_state(&transaction, input, "held")?;
+                    crate::timeline_history::record(&transaction, before, "Hold")?;
+                }
             }
             Resolution::Retry { target } => {
-                if crate::report_store::retry_reply(&transaction, input, target)?
+                crate::report_store::detach_orphaned_reply(&transaction, input)?;
+                if state == "orphaned" {
+                    let (kind, track_id) = match target {
+                        Target::Lock(track) => {
+                            if !transaction.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM tracks WHERE id=?1)",
+                                [track],
+                                |row| row.get::<_, bool>(0),
+                            )? {
+                                return Err("The chosen track is unavailable.".into());
+                            }
+                            (Kind::Extend, Some(track.clone()))
+                        }
+                        Target::New => (Kind::Fork, None),
+                        Target::None => return Err("Choose a destination for this reply.".into()),
+                    };
+                    transaction.execute(
+                        "UPDATE utterances SET target=?2,revision=revision+1 WHERE id=?1",
+                        params![input, serde_json::to_string(target)?],
+                    )?;
+                    let boundary = if kind == Kind::Fork {
+                        "now"
+                    } else {
+                        "after-turn"
+                    };
+                    apply_outcome(
+                        &transaction,
+                        input,
+                        revision + 1,
+                        Outcome::Classified(Decision {
+                            kind,
+                            track_id,
+                            boundary: Some(boundary.into()),
+                            command: None,
+                            confidence: 1.0,
+                            inference_ms: 0.0,
+                            timed_out: false,
+                            scores: serde_json::json!({"human":true}),
+                        }),
+                    )?;
+                } else if crate::report_store::retry_reply(&transaction, input, target)?
                     || crate::redirect::retry(&transaction, input, target)?
                 {
                     // Bound replies and held corrections keep their original target.
@@ -3398,6 +5650,7 @@ fn resolve_input(
                         }
                     }
                     crate::redirect::forget(&transaction, input)?;
+                    crate::app_commands::capture(&transaction, input)?;
                     transaction.execute("UPDATE utterances SET state='staged',revision=revision+1,target=?2,provisional=?3,decision=NULL,reason=NULL WHERE id=?1", params![input,serde_json::to_string(target)?,match target { Target::Lock(id) => Some(id), _ => None }])?;
                 }
             }
@@ -3439,7 +5692,7 @@ fn hold_inputs(connection: &mut Connection, id: &str, track: &str, unlogged: boo
     )? {
         return Err("The track is unavailable.".into());
     }
-    tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='Held after this turn' WHERE state IN ('staged','reading','placed','held') AND (json_extract(decision,'$.trackId')=?1 OR (decision IS NULL AND provisional=?1))",[track])?;
+    tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='Held after this turn' WHERE state IN ('staged','reading','placed','held') AND (json_extract(decision,'$.trackId')=?1 OR (decision IS NULL AND provisional=?1)) AND coalesce(json_extract(decision,'$.kind'),'')<>'park'",[track])?;
     tx.execute(
         "INSERT INTO operations VALUES(?1,'worker.hold',?2,'complete')",
         params![id, payload],
@@ -3480,38 +5733,15 @@ fn start_held_input(
             return Err("Operation ID reused.".into());
         }
     } else {
-        if crate::dispatch_control::paused(&tx)? {
-            return Err("Turns are stopped. Resume before starting a request.".into());
+        if !crate::app_commands::resume_presentation(&tx, id, input, revision)? {
+            crate::input_start::start(
+                &tx,
+                id,
+                input,
+                revision,
+                crate::input_start::Permission::Button,
+            )?;
         }
-        let (state, current, decision): (String, i64, Option<String>) = tx.query_row(
-            "SELECT state,revision,decision FROM utterances WHERE id=?1",
-            [input],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        let decision: Value =
-            serde_json::from_str(&decision.ok_or("This request needs a destination first.")?)?;
-        if state != "held"
-            || current != revision
-            || !matches!(
-                decision["kind"].as_str(),
-                Some("fork" | "extend" | "schedule")
-            )
-            || !decision["trackId"].is_string()
-        {
-            return Err("This request changed or cannot be started here.".into());
-        }
-        tx.execute(
-            "UPDATE utterances SET state='placed',revision=revision+1,reason=NULL,decision=json_set(decision,'$.boundary','now') WHERE id=?1",
-            [input],
-        )?;
-        tx.execute(
-            "INSERT INTO operations VALUES(?1,'utterance.start',?2,'complete')",
-            params![id, payload],
-        )?;
-        tx.execute(
-            "INSERT INTO events(ts,kind,payload) VALUES(?1,'utterance.started',?2)",
-            params![timestamp(), payload],
-        )?;
     }
     tx.commit()?;
     read_input(connection, input)
@@ -3533,22 +5763,10 @@ fn cut_input(connection: &mut Connection, id: &str, input: &str) -> Result<Value
             return Err(std::io::Error::other("operation ID reused").into());
         }
     } else {
-        let state: String =
-            transaction.query_row("SELECT state FROM utterances WHERE id=?1", [input], |r| {
-                r.get(0)
-            })?;
-        if ![
-            "staged", "reading", "placed", "parked", "asked", "held", "cut", "orphaned",
-        ]
-        .contains(&state.as_str())
-        {
-            return Err(std::io::Error::other("this request already started").into());
+        if crate::edit_hold::active(&transaction, input)? {
+            return Err("Finish editing this request first.".into());
         }
-        transaction.execute(
-            "UPDATE utterances SET state='cut',revision=revision+1 WHERE id=?1",
-            [input],
-        )?;
-        crate::report_store::input_state(&transaction, input, "cut")?;
+        take_back(&transaction, input)?;
         transaction.execute(
             "INSERT INTO operations VALUES(?1,'utterance.cut',?2,'complete')",
             params![id, payload],
@@ -3560,6 +5778,40 @@ fn cut_input(connection: &mut Connection, id: &str, input: &str) -> Result<Value
     }
     transaction.commit()?;
     read_input(connection, input)
+}
+pub(crate) fn take_back(connection: &rusqlite::Transaction<'_>, input: &str) -> Result<()> {
+    let state: String =
+        connection.query_row("SELECT state FROM utterances WHERE id=?1", [input], |row| {
+            row.get(0)
+        })?;
+    if ![
+        "staged",
+        "reading",
+        "placed",
+        "asked",
+        "held",
+        "cut",
+        "orphaned",
+        "redirecting",
+    ]
+    .contains(&state.as_str())
+        || crate::redirect::interrupt_started(connection, input)?
+    {
+        return Err("This request already started.".into());
+    }
+    if state == "cut" {
+        return Ok(());
+    }
+    let before = crate::timeline_history::capture(connection, input)?;
+    crate::inference_store::take_back(connection, input)?;
+    connection.execute(
+        "UPDATE utterances SET state='cut',revision=revision+1 WHERE id=?1",
+        [input],
+    )?;
+    crate::redirect::forget(connection, input)?;
+    crate::report_store::input_state(connection, input, "cut")?;
+    crate::timeline_history::record(connection, before, "Take back")?;
+    Ok(())
 }
 fn recover_inputs(connection: &mut Connection) -> Result<()> {
     connection.pragma_update(None, "synchronous", "FULL")?;
@@ -3663,6 +5915,212 @@ fn finish(connection: &mut Connection, id: &str, state: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reference_screening_holds_fingerprints_without_holding_stop_or_snapshot() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let key = crate::secrets::Key::new([7; 32]);
+        let path = directory.path().join("journal.sqlite");
+        let journal = Journal::open(&path, crate::secrets::Key::new([7; 32])).await?;
+        Connection::open(&path)?.execute("INSERT INTO msp_positions VALUES('s','t',NULL)", [])?;
+        let original = "A value learned after the paste: local-reference-secret";
+        let source = directory.path().join("paste.txt");
+        std::fs::write(&source, original)?;
+        let attachment = journal
+            .import_pasted_text(uuid::Uuid::now_v7(), source)
+            .await?;
+        let store = crate::attachment_store::Store {
+            root: (*journal.attachment_root).clone(),
+            key: journal.secret_key.clone(),
+        };
+        let (stored, _, _) = store.text(attachment.id)?.unwrap();
+        let (screening, _) = journal
+            .check_pasted_references(&store, std::slice::from_ref(&stored))
+            .await?;
+        let text = "local-reference-secret";
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let registration = crate::secrets::Registration {
+            op_id: uuid::Uuid::now_v7(),
+            track_id: "t".into(),
+            session_id: "s".into(),
+            name: "TOKEN".into(),
+            byte_len: text.len(),
+            tag: hex(&key.tag(text.as_bytes())),
+            key_check: hex(&key.check()),
+        };
+        let writer = journal.clone();
+        let mut registering =
+            tokio::spawn(async move { writer.register_fingerprint(registration).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut registering)
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            journal.pause_dispatch(uuid::Uuid::now_v7(), true),
+        )
+        .await??;
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), journal.snapshot()).await??["dispatchPaused"],
+            true
+        );
+        assert_eq!(screening.mask.redact(original), original);
+        drop(screening);
+        let catalog =
+            tokio::time::timeout(std::time::Duration::from_secs(1), registering).await???;
+        journal.confirm_fingerprints(catalog.current).await?;
+        let result = journal.check_pasted_references(&store, &[stored]).await;
+        assert!(result.err().unwrap().to_string().contains("needs review"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_copy_wait_keeps_its_screening_until_the_blocking_copy_finishes() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let journal = Journal::open(
+            directory.path().join("db"),
+            crate::secrets::Key::new([7; 32]),
+        )
+        .await?;
+        let screening = journal.screening().await?;
+        let (release, waiting) = std::sync::mpsc::channel();
+        let (began, started) = tokio::sync::oneshot::channel();
+        let job = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _screening = screening;
+                let _ = began.send(());
+                waiting.recv().unwrap();
+            })
+            .await
+        });
+        started.await?;
+        job.abort();
+        let _ = job.await;
+        assert!(journal.fingerprint_gate.try_write().is_err());
+        release.send(())?;
+        let _writer = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            journal.fingerprint_gate.write(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preparing_a_turn_screens_project_instructions_and_keeps_its_dispatch_lease()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let journal =
+            Journal::open(root.path().join("db"), crate::secrets::Key::new([7; 32])).await?;
+        let workspace = root.path().join("work");
+        std::fs::create_dir(&workspace)?;
+        let secret = concat!("ghp_", "A6k9P2mR7x4T1v8B5n0Q3s6Z9c2Y7w4L8d1H");
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            format!("Keep this rule.\ntoken={secret}\nPreserve the final constraint."),
+        )?;
+        let id = uuid::Uuid::now_v7();
+        journal
+            .stage_utterance(id, "Explain the change".into(), Target::New, None, vec![])
+            .await?;
+        let input = journal.claim_input().await?.unwrap();
+        journal
+            .apply_input(
+                input.id,
+                input.revision,
+                Outcome::Classified(Decision {
+                    kind: Kind::Fork,
+                    track_id: None,
+                    boundary: Some("now".into()),
+                    command: None,
+                    confidence: 1.,
+                    inference_ms: 1.,
+                    timed_out: false,
+                    scores: serde_json::json!({}),
+                }),
+            )
+            .await?;
+        let track = journal.snapshot().await?["tracks"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let operation = uuid::Uuid::now_v7();
+        let params = serde_json::json!({"commandId":operation,"sessionId":"s","input":[{"type":"skill","source":"user","selector":"intercat-report","arguments":"Explain the change"}]});
+        let prepared = journal
+            .prepare_turn(id.to_string(), track.clone(), "s".into(), workspace, params)
+            .await?;
+        let text = prepared.params()["input"][0]["arguments"].as_str().unwrap();
+        assert!(!text.contains(secret));
+        assert!(text.contains("Explain the change"));
+        assert!(text.contains("Keep this rule."));
+        assert!(text.contains("Preserve the final constraint."));
+        assert!(journal.fingerprint_gate.try_write().is_err());
+        assert_eq!(
+            journal
+                .reserve_turn(
+                    operation,
+                    id.to_string(),
+                    1,
+                    track,
+                    prepared.params().clone()
+                )
+                .await?,
+            Admission::New
+        );
+        drop(prepared);
+        assert!(journal.fingerprint_gate.try_write().is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_requires_an_unchanged_screened_payload_after_new_fingerprints() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let journal =
+            Journal::open(root.path().join("db"), crate::secrets::Key::new([7; 32])).await?;
+        Connection::open(root.path().join("db"))?
+            .execute("INSERT INTO msp_positions VALUES('s','t',NULL)", [])?;
+        let secret = "known-only-before-replay";
+        let key = crate::secrets::Key::new([7; 32]);
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let catalog = journal
+            .register_fingerprint(crate::secrets::Registration {
+                op_id: uuid::Uuid::now_v7(),
+                track_id: "t".into(),
+                session_id: "s".into(),
+                name: "TOKEN".into(),
+                byte_len: secret.len(),
+                tag: hex(&key.tag(secret.as_bytes())),
+                key_check: hex(&key.check()),
+            })
+            .await?;
+        journal.confirm_fingerprints(catalog.current).await?;
+        let params = serde_json::json!({"commandId":uuid::Uuid::now_v7(),"sessionId":"s","input":[{"type":"text","text":format!("An old request containing {secret}")}]});
+        assert!(
+            journal
+                .screen_replay(params, "t".into(), "s".into())
+                .await
+                .is_err()
+        );
+        let safe = serde_json::json!({"commandId":uuid::Uuid::now_v7(),"sessionId":"s","input":[{"type":"text","text":"An unchanged request"}]});
+        let prepared = journal
+            .screen_replay(safe.clone(), "t".into(), "s".into())
+            .await?;
+        assert_eq!(prepared.params(), &safe);
+        Ok(())
+    }
 
     #[test]
     fn writer_transaction_prevents_lock_takeover_between_read_and_write() -> Result<()> {

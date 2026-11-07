@@ -13,8 +13,18 @@ use uuid::Uuid;
 )]
 pub enum Purpose {
     Check,
-    RemoveSecret { finding: String },
-    Edit { selection: Selection, text: String },
+    RemoveSecret {
+        finding: String,
+    },
+    Assumption {
+        id: Uuid,
+        revision: i64,
+        text: String,
+    },
+    Edit {
+        selection: Selection,
+        text: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +256,21 @@ impl Run {
                     && !job.kept_secrets.contains(finding) =>
             {
                 Ok(())
+            }
+            Purpose::Assumption { id, revision, text }
+                if candidate
+                    .commits
+                    .iter()
+                    .any(|commit| commit.track == request.track)
+                    && job.assumptions.iter().any(|review| {
+                        crate::integration_assumptions::included(job, review)
+                            && review.assumption.id == id.to_string()
+                            && review.assumption.revision == *revision
+                            && review.assumption.track_id == request.track
+                            && review.assumption.state == "open"
+                    }) =>
+            {
+                validate_instruction(text)
             }
             Purpose::Edit { selection, text }
                 if matches!(

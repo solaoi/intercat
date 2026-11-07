@@ -553,6 +553,11 @@ fn summary(db: &Connection, clip: &Clip, now: &Stamp) -> Result<Value> {
     } else {
         "Thinking".into()
     };
+    let generated = crate::clip_summary_store::read(db, &clip.id)?;
+    let label = generated
+        .as_ref()
+        .map(|value| value.summary.clone())
+        .unwrap_or(label);
     let (duration, approximate) = clip.end.as_ref().unwrap_or(now).elapsed(&clip.start);
     let approximate = approximate || clip.recovered;
     let generation = clip
@@ -572,9 +577,22 @@ fn summary(db: &Connection, clip: &Clip, now: &Stamp) -> Result<Value> {
             |r| r.get(0),
         )?
     };
-    Ok(
-        json!({"id":clip.id,"trackId":clip.track_id,"repairRunId":clip.repair_run_id,"ordinal":clip.ordinal,"sessionId":clip.session_id,"turnId":clip.turn_id,"category":clip.category,"label":label,"kind":kind,"start":clip.start.timeline_ms,"end":clip.start.timeline_ms+duration,"running":clip.end.is_none(),"generationEnd":generation,"approximate":approximate,"effectCount":effect_count,"toolTicks":tools.iter().map(|i|json!({"itemId":i["itemId"],"tool":i["tool"],"status":i["status"]})).collect::<Vec<_>>()}),
-    )
+    let mut value = json!({"id":clip.id,"trackId":clip.track_id,"repairRunId":clip.repair_run_id,"ordinal":clip.ordinal,"sessionId":clip.session_id,"turnId":clip.turn_id,"category":clip.category,"label":label,"kind":kind,"start":clip.start.timeline_ms,"end":clip.start.timeline_ms+duration,"running":clip.end.is_none(),"generationEnd":generation,"approximate":approximate,"effectCount":effect_count,"toolTicks":tools.iter().map(|i|json!({"itemId":i["itemId"],"tool":i["tool"],"status":i["status"]})).collect::<Vec<_>>()});
+    let assumptions = crate::assumption_store::list(db, Some(&clip.id))?;
+    value["assumptionCount"] = json!(assumptions.len());
+    value["assumptionIds"] = json!(assumptions.iter().map(|item| &item.id).collect::<Vec<_>>());
+    value["assumptionTimes"] = json!(
+        assumptions
+            .iter()
+            .filter_map(|item| item.observed_at.as_ref().map(|stamp| stamp.timeline_ms))
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    value["warnings"] = json!(crate::clip_warnings::read(db, &clip.id)?);
+    if let Some(generated) = generated {
+        value["title"] = generated.title.into();
+        value["summary"] = generated.summary.into();
+    }
+    Ok(value)
 }
 pub fn snapshot(db: &Connection) -> Result<Value> {
     let now = Stamp::now();
@@ -604,8 +622,7 @@ pub struct Window {
     pub since: Option<i64>,
 }
 pub fn window(db: &Connection, request: Window) -> Result<Value> {
-    if request.tracks.is_empty()
-        || request.tracks.len() > 300
+    if request.tracks.len() > 300
         || request
             .tracks
             .iter()
@@ -619,11 +636,15 @@ pub fn window(db: &Connection, request: Window) -> Result<Value> {
     let revision: i64 = db.query_row("SELECT revision FROM timeline_revision", [], |r| r.get(0))?;
     let reset = request.since.is_none_or(|since| since > revision);
     let since = if reset { -1 } else { request.since.unwrap() };
-    let placeholders = std::iter::repeat_n("?", request.tracks.len())
+    let placeholders = (2..request.tracks.len() + 2)
+        .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT v.id,v.deleted,c.record FROM timeline_versions v LEFT JOIN timeline_clips c ON c.id=v.id WHERE v.version>? AND v.track IN ({placeholders}) ORDER BY c.ordinal,v.id"
+        "SELECT v.id,v.deleted,c.record FROM timeline_versions v LEFT JOIN timeline_clips c ON c.id=v.id
+        WHERE v.id IN (SELECT id FROM timeline_versions WHERE version>?1 AND track IN ({placeholders})
+            UNION SELECT w.clip FROM timeline_warning_versions w JOIN timeline_versions t ON t.id=w.clip
+                WHERE w.version>?1 AND t.track IN ({placeholders})) ORDER BY c.ordinal,v.id"
     );
     let args = std::iter::once(rusqlite::types::Value::Integer(since))
         .chain(request.tracks.into_iter().map(rusqlite::types::Value::Text));
@@ -638,6 +659,7 @@ pub fn window(db: &Connection, request: Window) -> Result<Value> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let now = Stamp::now();
+    let marked = crate::assumption_store::in_window(db, request.start, request.end)?;
     let mut clips = Vec::new();
     let mut removed = Vec::new();
     for (id, deleted, record) in rows {
@@ -648,12 +670,12 @@ pub fn window(db: &Connection, request: Window) -> Result<Value> {
             continue;
         }
         let clip: Clip = serde_json::from_str(&record.ok_or("Timeline version has no clip.")?)?;
-        if clip.start.timeline_ms <= request.end
+        let bar_visible = clip.start.timeline_ms <= request.end
             && clip
                 .end
                 .as_ref()
-                .is_none_or(|end| end.timeline_ms >= request.start)
-        {
+                .is_none_or(|end| end.timeline_ms >= request.start);
+        if bar_visible || marked.contains(&clip.id) {
             clips.push(summary(db, &clip, &now)?);
         } else if !reset {
             removed.push(id);
@@ -662,9 +684,9 @@ pub fn window(db: &Connection, request: Window) -> Result<Value> {
     // The You row covers every track, including those below the viewport.
     // Its time window is shared with clips; its history has no last-N cutoff.
     let sql = if reset {
-        "SELECT m.session,m.item,0,m.track,m.position,m.input,coalesce(u.text,'Received message'),m.repair FROM timeline_marks m LEFT JOIN utterances u ON u.id=m.input WHERE m.position BETWEEN ?1 AND ?2 ORDER BY m.position,m.session,m.item"
+        "SELECT m.session,m.item,0,m.track,m.position,m.input,coalesce(u.text,'Received message'),m.repair,EXISTS(SELECT 1 FROM input_timeline p WHERE p.input=m.input) FROM timeline_marks m LEFT JOIN utterances u ON u.id=m.input WHERE m.position BETWEEN ?1 AND ?2 ORDER BY m.position,m.session,m.item"
     } else {
-        "SELECT v.session,v.item,v.deleted,m.track,m.position,m.input,coalesce(u.text,'Received message'),m.repair FROM timeline_mark_versions v LEFT JOIN timeline_marks m USING(session,item) LEFT JOIN utterances u ON u.id=m.input WHERE v.version>?1 ORDER BY m.position,v.session,v.item"
+        "SELECT v.session,v.item,v.deleted,m.track,m.position,m.input,coalesce(u.text,'Received message'),m.repair,EXISTS(SELECT 1 FROM input_timeline p WHERE p.input=m.input) FROM timeline_mark_versions v LEFT JOIN timeline_marks m USING(session,item) LEFT JOIN utterances u ON u.id=m.input WHERE v.version>?1 ORDER BY m.position,v.session,v.item"
     };
     let mut query = db.prepare(sql)?;
     let args: &[i64] = if reset {
@@ -679,6 +701,7 @@ pub fn window(db: &Connection, request: Window) -> Result<Value> {
         let id = format!("{}/{}", row.get::<_, String>(0)?, row.get::<_, String>(1)?);
         let position: Option<i64> = row.get(4)?;
         if row.get::<_, bool>(2)?
+            || row.get::<_, bool>(8)?
             || position.is_none_or(|at| at < request.start || at > request.end)
         {
             if !reset {
@@ -688,6 +711,10 @@ pub fn window(db: &Connection, request: Window) -> Result<Value> {
             marks.push(json!({"id":id,"trackId":row.get::<_,String>(3)?,"at":position,"inputId":row.get::<_,Option<String>>(5)?,"text":row.get::<_,String>(6)?,"repairRunId":row.get::<_,Option<String>>(7)?}));
         }
     }
+    let (inputs, removed_inputs) =
+        crate::input_timeline::window(db, request.start, request.end, (!reset).then_some(since))?;
+    marks.extend(inputs);
+    removed_marks.extend(removed_inputs);
     Ok(
         json!({"revision":revision,"reset":reset,"clips":clips,"removed":removed,"marks":marks,"removedMarks":removed_marks}),
     )
@@ -758,6 +785,6 @@ pub fn detail(db: &Connection, id: &str) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(
-        json!({"clip":summary(db,&clip,&Stamp::now())?,"items":all,"deletionSnapshots":snapshots,"effects":effects}),
+        json!({"model":crate::session_parameters::read(db,&clip.session_id,clip.turn_id.as_deref())?,"clip":summary(db,&clip,&Stamp::now())?,"items":all,"deletionSnapshots":snapshots,"effects":effects,"assumptions":crate::assumption_store::list(db,Some(&clip.id))?}),
     )
 }

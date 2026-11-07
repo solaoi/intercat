@@ -167,6 +167,7 @@ async fn run_task(
         },
     )
     .await?;
+    let start_guard = crate::msp::StartGuard::Shutdown(stopping.clone());
     let result = async {
         host.connection.client.set_redaction(mask.clone());
         if host.connection.client.initialize().await?["sessionDurability"] != "durable" {
@@ -227,7 +228,12 @@ async fn run_task(
                     "{PROMPT}This is an ordered set of partial summaries of the same history. Merge only their evidence facts. Later user corrections override earlier alternatives. Remove earlier uncertainty when a later record resolves it. Do not keep a superseded choice as an open question. Retain explicit unanswered user questions.\n\n"
                 )
             };
-            let accepted=host.connection.client.request("turn/start",json!({"commandId":task.turn_command,"sessionId":task.session_id,"reasoningEffort":"minimal","tokenBudget":131072,"input":[{"type":"text","text":format!("{prefix}BEGIN_RECOVERY_RECORDS\n{}\nEND_RECOVERY_RECORDS",task.input)}]})).await?;
+            let prepared=journal.screen_start(json!({"commandId":task.turn_command,"sessionId":task.session_id,"reasoningEffort":"minimal","tokenBudget":131072,"input":[{"type":"text","text":format!("{prefix}BEGIN_RECOVERY_RECORDS\n{}\nEND_RECOVERY_RECORDS",task.input)}]})).await?;
+            let accepted = host
+                .connection
+                .client
+                .start(prepared, start_guard.clone())
+                .await?;
             if accepted["disposition"] != "started" {
                 return Err("The planner's one turn was not started.".into());
             }

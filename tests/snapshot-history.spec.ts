@@ -1,3 +1,4 @@
+import { mockDrafts } from './support/drafts';
 import { closeWindow } from './support/close';
 import { _electron as electron, expect, test, type ElectronApplication } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
@@ -25,6 +26,7 @@ test.afterAll(async () => { if (app) await closeWindow(app); await rm(root, { re
 
 test('snapshot-only history opens with real projected content and no fabricated turn or timing', async ({}, testInfo) => {
   app = await electron.launch({ args: ['.', '--preview', `--user-data-dir=${path.join(root, 'electron')}`] });
+  await mockDrafts(app);
   const page = await app.firstWindow();
   const clip = projection.timeline.clips[0];
   expect(clip.category).toBe('snapshot');

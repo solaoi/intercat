@@ -1,3 +1,4 @@
+import { mockDrafts } from './support/drafts';
 import { closeWindow } from './support/close';
 import { _electron as electron, expect, test, type ElectronApplication } from '@playwright/test';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
@@ -50,6 +51,7 @@ test('300 tracks remain drawable and reachable without a full-height canvas', as
   const errors: string[] = [];
   try {
     app = await electron.launch({ args: ['.', '--preview', `--user-data-dir=${data}`] });
+  await mockDrafts(app);
     const page = await app.firstWindow();
     page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => {
@@ -64,7 +66,9 @@ test('300 tracks remain drawable and reachable without a full-height canvas', as
       window.setSize(1440, 1000); window.reload();
     }, fixture(300, 300));
     await expect(page.locator('.timeline')).toHaveAttribute('data-ready', 'true');
-    await expect(page.getByLabel('Received inputs', { exact: true }).getByRole('button')).toHaveCount(600);
+    const inputGroups = page.getByLabel('Timeline requests', { exact: true }).getByRole('button');
+    await expect.poll(() => inputGroups.count()).toBeGreaterThan(0);
+    expect(await inputGroups.evaluateAll(buttons => buttons.reduce((count, button) => count + Number(button.getAttribute('aria-label')?.match(/^(\d+) requests/)?.[1] ?? 1), 0))).toBe(600);
     const geometry = await page.evaluate(() => {
       const canvas = document.querySelector('.canvas-host canvas') as HTMLCanvasElement;
       const stage = document.querySelector('.stage')!;
@@ -93,7 +97,7 @@ test('300 tracks remain drawable and reachable without a full-height canvas', as
     }
     await expect(grid).toHaveAttribute('aria-activedescendant', 'track-load-299');
     await expect(page.locator('#track-load-299')).toBeInViewport();
-    await expect(page.locator('#track-load-299 [role=gridcell]')).toHaveAccessibleName('300 · 利用者認証と変更履歴を確認するトラック 300 · done');
+    await expect(page.locator('#track-load-299 [role=gridcell]')).toHaveAccessibleName('300 · 利用者認証と変更履歴を確認するトラック 300 · done · result unclear');
     await page.screenshot({ path: path.join(output, 'last-track.png') });
     if (voiceover) {
       await writeFile(path.join(output, 'voiceover.json'), JSON.stringify({ rows: spokenRows, errors }, null, 2));

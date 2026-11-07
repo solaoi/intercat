@@ -1,0 +1,91 @@
+[
+  {
+    "case": "native-1-0-write_file",
+    "reference": {
+      "kind": "tool_patch",
+      "mediaType": "application/json",
+      "byteLen": 141
+    },
+    "output": {
+      "content": "{\"files\":[{\"path\":\"/dummy/workspace/file-created.txt\",\"hunks\":[{\"oldStart\":1,\"oldLines\":0,\"newStart\":1,\"newLines\":1,\"lines\":[\"+created\"]}]}]}",
+      "encoding": "utf8",
+      "byteLen": 141,
+      "offsetBytes": 0,
+      "eof": true,
+      "mediaType": "application/json"
+    },
+    "expected": [
+      "file-created.txt"
+    ]
+  },
+  {
+    "case": "native-1-1-edit_file",
+    "reference": {
+      "kind": "tool_patch",
+      "mediaType": "application/json",
+      "byteLen": 150
+    },
+    "output": {
+      "content": "{\"files\":[{\"path\":\"/dummy/workspace/file-existing.txt\",\"hunks\":[{\"oldStart\":1,\"oldLines\":1,\"newStart\":1,\"newLines\":1,\"lines\":[\"-before\",\"+after\"]}]}]}",
+      "encoding": "utf8",
+      "byteLen": 150,
+      "offsetBytes": 0,
+      "eof": true,
+      "mediaType": "application/json"
+    },
+    "expected": [
+      "file-existing.txt"
+    ]
+  },
+  {
+    "case": "native-edge-0-write_file",
+    "reference": {
+      "kind": "tool_patch",
+      "mediaType": "application/json",
+      "byteLen": 65
+    },
+    "output": {
+      "content": "{\"files\":[{\"path\":\"/dummy/workspace/file-empty.txt\",\"hunks\":[]}]}",
+      "encoding": "utf8",
+      "byteLen": 65,
+      "offsetBytes": 0,
+      "eof": true,
+      "mediaType": "application/json"
+    },
+    "expected": []
+  },
+  {
+    "case": "native-edge-1-write_file",
+    "reference": {
+      "kind": "tool_patch",
+      "mediaType": "application/json",
+      "byteLen": 68
+    },
+    "output": {
+      "content": "{\"files\":[{\"path\":\"/dummy/workspace/file-existing.txt\",\"hunks\":[]}]}",
+      "encoding": "utf8",
+      "byteLen": 68,
+      "offsetBytes": 0,
+      "eof": true,
+      "mediaType": "application/json"
+    },
+    "expected": []
+  },
+  {
+    "case": "native-edge-2-edit_file",
+    "reference": {
+      "kind": "tool_patch",
+      "mediaType": "application/json",
+      "byteLen": 68
+    },
+    "output": {
+      "content": "{\"files\":[{\"path\":\"/dummy/workspace/file-existing.txt\",\"hunks\":[]}]}",
+      "encoding": "utf8",
+      "byteLen": 68,
+      "offsetBytes": 0,
+      "eof": true,
+      "mediaType": "application/json"
+    },
+    "expected": []
+  }
+]

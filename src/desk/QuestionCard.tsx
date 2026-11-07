@@ -47,7 +47,7 @@ export function QuestionCard({ stopping, pendingSecret = false, prompt, label, r
       </fieldset>)}
     </div>
     {error && <p role="alert">{error}</p>}
-    <footer className="question-actions"><button disabled={waiting || (explain ? !explanation.trim() || Array.from(explanation).length > 500 : !complete)} onClick={() => { void send(explain ? { action: 'explain', content: explanation } : { action: 'answer', answers: prompt.request.questions.map(question => answers[question.id]) }); }}>{explain ? 'Send explanation' : 'Send answers'}</button><button disabled={waiting} onClick={() => setExplain(!explain)}>{explain ? 'Use the options' : 'Explain instead'}</button>{provideSecret && <button disabled={waiting} onClick={() => setSecret(true)}>Provide a secret</button>}<button disabled={stopping} onClick={() => { void send({ action: 'stop', answers: partial }); }}>Stop</button></footer>
+    <footer className="question-actions" data-card-actions><button disabled={waiting || (explain ? !explanation.trim() || Array.from(explanation).length > 500 : !complete)} onClick={() => { void send(explain ? { action: 'explain', content: explanation } : { action: 'answer', answers: prompt.request.questions.map(question => answers[question.id]) }); }}>{explain ? 'Send explanation' : 'Send answers'}</button><button disabled={waiting} onClick={() => setExplain(!explain)}>{explain ? 'Use the options' : 'Explain instead'}</button>{provideSecret && <button disabled={waiting} onClick={() => setSecret(true)}>Provide a secret</button>}<button disabled={stopping} onClick={() => { void send({ action: 'stop', answers: partial }); }}>Stop</button></footer>
     </>}
   </section>;
 }

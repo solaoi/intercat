@@ -342,6 +342,120 @@ pub struct Inspection {
     pub material: Vec<u8>,
     pub review: Review,
 }
+
+fn comparison_bytes(root: &File, path: &str, expected: &Entry) -> Result<Vec<u8>> {
+    let (directory, name) = parent(root, path)?;
+    if Stamp::new(&stat(&directory, &name)?) != expected.stamp {
+        return Err("File changed during comparison.".into());
+    }
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let mut opened = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(file.as_raw_fd(), opened.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if Stamp::new(&unsafe { opened.assume_init() }) != expected.stamp || !file.metadata()?.is_file()
+    {
+        return Err("Comparison target changed type.".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE
+        || Stamp::new(&stat(&directory, &name)?) != expected.stamp
+        || Some(Sha256::digest(&bytes).as_slice()) != expected.digest.as_deref()
+    {
+        return Err("File changed during comparison.".into());
+    }
+    Ok(bytes)
+}
+
+/// Compare only named paths without following a replaced ancestor or reading
+/// protected files. This does not refresh the real Git index or run filters.
+pub(crate) fn changed_paths(
+    path: &Path,
+    baseline: &str,
+    paths: &[String],
+) -> Result<BTreeSet<String>> {
+    let repository = Repository::open(path)?;
+    let saved = repository.saved_files(baseline.parse()?)?;
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let mut total = 0;
+    let mut changed = BTreeSet::new();
+    for name in paths {
+        if name.split('/').any(|part| part == ".git") || protected(name) {
+            return Err("Protected path in file comparison.".into());
+        }
+        let entry = match read_entry(&root, name, &mut total) {
+            Ok(entry) => Some(entry),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        if entry.as_ref().is_some_and(|entry| entry.blocked.is_some()) {
+            return Err("The named file cannot be compared safely.".into());
+        }
+        let different = match (entry, saved.get(name)) {
+            (None, None) => false,
+            (None, Some(_)) | (Some(_), None) => true,
+            (Some(entry), Some(file)) => {
+                let size = repository.saved_size(file)?;
+                total = total
+                    .checked_add(size)
+                    .ok_or("File comparison exceeds its byte limit.")?;
+                if size > MAX_FILE || total > MAX_TOTAL {
+                    return Err("The named file cannot be compared safely.".into());
+                }
+                let mode = if entry.stamp.mode & libc::S_IFMT as u32 == libc::S_IFLNK as u32 {
+                    0o120000
+                } else if entry.stamp.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32 {
+                    0o040000
+                } else if entry.stamp.mode & 0o111 != 0 {
+                    0o100755
+                } else {
+                    0o100644
+                };
+                if file.mode as u32 != mode {
+                    true
+                } else {
+                    let original = repository.saved_bytes(file)?;
+                    if entry.digest.as_deref() == Some(Sha256::digest(&original).as_slice()) {
+                        false
+                    } else if mode == 0o120000 {
+                        true
+                    } else {
+                        repository.normalized_file(
+                            baseline.parse()?,
+                            name,
+                            &comparison_bytes(&root, name, &entry)?,
+                        )? != original
+                    }
+                }
+            }
+        };
+        if different {
+            changed.insert(name.clone());
+        }
+    }
+    Ok(changed)
+}
+
 pub fn inspect(
     path: &Path,
     baseline: &str,
@@ -357,7 +471,8 @@ pub fn inspect(
     let attachments = intercat_git::AttachmentPaths::from_paths(saved.keys().map(String::as_str))
         .with_roots(&source.roots)?;
     let before = scan(path)?;
-    let originals = crate::backup_attachments::originals(&source.store, &source.records)?;
+    let originals =
+        crate::backup_attachments::originals(&source.store, &source.records, &source.screenings)?;
     let after = scan(path)?;
     if before != after {
         return Err("Files changed during review. Stop writers and review again.".into());

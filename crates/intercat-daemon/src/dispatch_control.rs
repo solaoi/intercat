@@ -93,7 +93,7 @@ pub(crate) fn set(
     }
     tx.execute("INSERT INTO settings VALUES('dispatchPaused',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[pause.to_string()])?;
     if pause {
-        tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='Turns stopped' WHERE state IN ('staged','reading','placed','held')",[])?;
+        tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='Turns stopped' WHERE state IN ('staged','reading','placed','held') AND coalesce(json_extract(decision,'$.kind'),'') NOT IN ('park','command')",[])?;
     }
     tx.execute(
         "INSERT INTO operations VALUES(?1,'system.pause',?2,'complete')",

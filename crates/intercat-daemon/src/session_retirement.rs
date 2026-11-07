@@ -97,6 +97,7 @@ pub(crate) fn retire(
     operation: Uuid,
 ) -> Result<()> {
     ensure_open(tx, session)?;
+    crate::proposals::retire(tx, session)?;
     tx.execute("INSERT INTO retired_inputs SELECT id,?1 FROM utterances WHERE id IN (SELECT input FROM timeline_marks WHERE session=?1 AND input IS NOT NULL) OR dispatch_command IN (SELECT command FROM attachment_turns WHERE session=?1) ON CONFLICT DO NOTHING",[session])?;
     tx.execute(
         "DELETE FROM redirects WHERE input IN (SELECT input FROM retired_inputs WHERE session=?1)",
@@ -120,6 +121,7 @@ pub(crate) fn retire(
         "effect_gates",
         "msp_applied",
         "msp_gaps",
+        "session_parameters",
     ] {
         tx.execute(&format!("DELETE FROM {table} WHERE session=?1"), [session])?;
     }

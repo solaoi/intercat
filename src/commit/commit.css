@@ -7,3 +7,35 @@
 .commit-refresh{padding:10px 14px;background:#30271b;border-block:1px solid #725b38;flex:none;font-size:12px}.commit-refresh p{font-size:11px;color:#cbb48f;margin:6px 0}.commit-refresh>div{display:flex;gap:8px}.commit-refresh button{padding:6px 9px;border:1px solid #756144;border-radius:4px}
 
 .commit-sheet:has(.commit-refresh) .commit-details{min-height:0}
+@media (max-height: 620px) {
+  .commit-sheet:has(.approval-reply) .commit-repair { flex: 1; max-height: none; }
+  .commit-sheet:has(.approval-reply) :is(.commit-target, .commit-tracks, .commit-tabs, .commit-details) { display: none; }
+}
+
+.commit-assumptions { flex: none; max-height: 30vh; overflow: auto; padding: 12px 14px; border-block: 1px solid #514734; font-size: 12px; overflow-wrap: anywhere; }
+.commit-assumptions h3 { margin: 0 0 8px; font-size: 12px; }
+.commit-assumptions article + article { margin-top: 14px; }
+.commit-assumptions p { margin: 6px 0; color: #b5ad9f; }
+.commit-assumptions blockquote { margin: 6px 0; padding-left: 8px; border-left: 2px solid #776746; }
+.commit-assumptions textarea { display: block; width: 100%; min-height: 60px; margin-top: 5px; padding: 6px; resize: vertical; border: 1px solid #514734; border-radius: 4px; background: #15171c; color: #c9cbd1; }
+.commit-assumption-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.commit-assumption-actions button { padding: 5px 8px; color: #c9cbd1; }
+.commit-order-body { min-height: 0; overflow: auto; padding: 16px 20px; }
+.commit-order-body p { color: #a3adbc; line-height: 1.6; }
+.commit-order-body ol { padding-left: 24px; }
+.commit-order-body ol li { padding: 9px 0; }
+.commit-order-body ol li > span { display: inline-flex; flex-direction: column; max-width: calc(100% - 84px); overflow-wrap: anywhere; vertical-align: middle; }
+.commit-order-body ol li small { color: #a3adbc; margin-top: 4px; }
+.commit-order-body ol li > div { display: inline-flex; gap: 6px; margin-left: 12px; vertical-align: middle; }
+.commit-order-body details ul { padding-left: 20px; }
+.commit-order-body details li { margin-block: 8px; overflow-wrap: anywhere; }
+.commit-order-body details li span { display: block; color: #a3adbc; }
+.commit-order .commit-footer { justify-content: flex-end; }
+
+@media (max-height: 550px) {
+  .app.has-commit:not(.stage-mode) .main { padding-top: 12px; overflow: hidden; }
+  .app.has-commit:not(.stage-mode) .main .stage { flex: 1 1 0; min-height: 0; }
+  .app.has-commit:not(.stage-mode) .main .stage .timeline { min-height: 0; }
+  .app.has-commit:not(.stage-mode) .main .desk { flex: 0 1 auto; max-height: none; }
+  .app.has-commit:not(.stage-mode) .main .desk-scroll { flex: 1 1 auto; min-height: 0; }
+}

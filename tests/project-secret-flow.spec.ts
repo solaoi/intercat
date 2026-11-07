@@ -45,7 +45,7 @@ test('saved project secret survives restart, reaches a new worker and is removed
       for (const card of worker?.approvals ?? []) {
         if (approved.has(card.id)) continue; approved.add(card.id);
         expect(/^(?:python3|python|\/usr\/bin\/python3) verify_(?:token|absent)\.py$/u.test(card.subject)).toBe(true);
-        await page!.evaluate(async ({ worker, card }) => window.intercat.answerWorker({ opId: await window.intercat.createOperationId(), trackId: worker.trackId, approvalId: card.id, requirement: card.requirement, allow: true }), { worker: worker!, card });
+        await page!.evaluate(async ({ worker, card }) => window.intercat.answerWorker({ opId: await window.intercat.createOperationId(), trackId: worker.trackId, approvalId: card.id, requirement: card.requirement, response: { action: 'allow' } }), { worker: worker!, card });
       }
       if (['failed', 'lost', 'needs-recovery'].includes(worker?.phase ?? '')) throw new Error(`Worker failed: ${worker?.detail}`);
       const workspace = state.workspaces?.find(workspace => workspace.trackId === track);

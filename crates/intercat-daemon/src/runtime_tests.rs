@@ -932,7 +932,7 @@ class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
   body=json.dumps({'accepting':True,'modelLoaded':True}).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
  def do_POST(self):
-  self.rfile.read(int(self.headers['Content-Length']));body=json.dumps({'stages':{'decision':{'selected':' A'}},'inferenceMs':1}).encode();self.send_response(200);self.send_header('X-Intercat-Inference','started');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+  self.rfile.read(int(self.headers['Content-Length']));body=json.dumps({'cachePrefix':False,'stages':{'decision':{'selected':' A'}},'inferenceMs':1}).encode();self.send_response(200);self.send_header('X-Intercat-Inference','started');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
 server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
 print(json.dumps({'host':'127.0.0.1','port':server.server_port}),flush=True)
 server.serve_forever()
@@ -1059,13 +1059,12 @@ async fn real_budget_omitted_history_recovers_and_runs_the_next_input_once() -> 
             ),
         )
         .await?;
-    async fn request(
+    async fn receive(
         host: &mut Host,
         method: &str,
-        params: Value,
+        pending: crate::msp::PendingRequest,
         frames: &mut Vec<Value>,
     ) -> Result<Value> {
-        let pending = host.connection.client.query(method, params).await?;
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 match host.connection.next_event().await {
@@ -1091,7 +1090,8 @@ async fn real_budget_omitted_history_recovers_and_runs_the_next_input_once() -> 
         eprintln!("Opening offline seed session");
         seed.connection.client.initialize().await?;
         let mut frames=vec![];
-        let started=request(&mut seed,"session/start",json!({"commandId":Uuid::now_v7(),"workspaceRoot":workspace.path,"providerId":"echo","approvalMode":"promptUnmatched","recoveryMode":"on"}),&mut frames).await?;
+        let pending = seed.connection.client.query("session/start", json!({"commandId":Uuid::now_v7(),"workspaceRoot":workspace.path,"providerId":"echo","approvalMode":"promptUnmatched","recoveryMode":"on"})).await?;
+        let started = receive(&mut seed, "session/start", pending, &mut frames).await?;
         assert_eq!(started["session"]["providerId"],"echo","Never submit this fixture to a paid provider");
         let session=started["session"]["sessionId"].as_str().ok_or("seed session")?.to_owned();
         let mut seed_count=0;
@@ -1099,8 +1099,13 @@ async fn real_budget_omitted_history_recovers_and_runs_the_next_input_once() -> 
         for index in 0..96 {
             let command=Uuid::now_v7();
             let params=json!({"commandId":command,"sessionId":session,"input":[{"type":"text","text":format!("offline seed {index}\n{}","x".repeat(65480))}],"displayText":"d".repeat(65500)});
-            journal.intent(&command.to_string(),"turn.start",params.clone()).await?;
-            let ack=request(&mut seed,"turn/start",params,&mut frames).await?;
+            let prepared = journal.screen_start(params).await?;
+            journal.intent(&command.to_string(), "turn.start", prepared.params().clone()).await?;
+            let pending = seed.connection.client.query_start(
+                prepared,
+                crate::msp::StartGuard::Stopped(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            ).await?;
+            let ack = receive(&mut seed, "turn/start", pending, &mut frames).await?;
             journal.finish(&command.to_string(),"dispatched").await?;
             tokio::time::timeout(std::time::Duration::from_secs(30),async {
                 while !frames.iter().any(|f|f["method"]=="turn/completed"&&f["params"]["turnId"]==ack["turnId"]) {
@@ -1125,7 +1130,8 @@ async fn real_budget_omitted_history_recovers_and_runs_the_next_input_once() -> 
             seed_count=index+1;
             if seed_count%16==0 {eprintln!("Primed {seed_count} offline turns");}
             if seed_count>=64 && seed_count%16==0 {
-                let resumed=request(&mut seed,"session/resume",json!({"commandId":Uuid::now_v7(),"sessionId":session,"excludeItems":false,"history":"snapshot"}),&mut frames).await?;
+                let pending = seed.connection.client.query("session/resume", json!({"commandId":Uuid::now_v7(),"sessionId":session,"excludeItems":false,"history":"snapshot"})).await?;
+                let resumed = receive(&mut seed, "session/resume", pending, &mut frames).await?;
                 if resumed["history"]["mode"]=="none" {budget_read=Some(resumed);break;}
             }
         }
@@ -1887,7 +1893,7 @@ async fn real_report_secret_restarts_the_host_and_runs_with_a_masked_environment
                     let id=card["id"].as_str().unwrap(); if !approved.insert(id.to_owned()){continue;}
                     let subject=card["subject"].as_str().unwrap();
                     if !["python3 verify_token.py","python verify_token.py","/usr/bin/python3 verify_token.py"].contains(&subject){return Err(format!("Unexpected test command: {subject}").into());}
-                    port.answer(Uuid::now_v7(),id.into(),card["requirement"].clone(),true).await?;
+                    port.answer(Uuid::now_v7(),id.into(),card["requirement"].clone(),crate::approval::Response::Allow).await?;
                 }
                 if project.join("verified.txt").exists() && worker["activeTurn"].is_null() && worker["checkpointPending"]==false && worker["checkpoint"]["turnId"]!=first["workers"][0]["checkpoint"]["turnId"] {return Ok::<_,Box<dyn std::error::Error+Send+Sync>>(state);}
                 if matches!(worker["phase"].as_str(),Some("failed"|"lost"|"needs-recovery")){return Err("Worker failed while using the test token".into());}
@@ -1926,7 +1932,7 @@ async fn real_report_secret_restarts_the_host_and_runs_with_a_masked_environment
                     let id=card["id"].as_str().unwrap();if !approved.insert(id.to_owned()){continue;}
                     let subject=card["subject"].as_str().unwrap();
                     if !["python3 verify_absence.py","python verify_absence.py","/usr/bin/python3 verify_absence.py"].contains(&subject){return Err(format!("Unexpected absence-check command: {subject}").into());}
-                    port.answer(Uuid::now_v7(),id.into(),card["requirement"].clone(),true).await?;
+                    port.answer(Uuid::now_v7(),id.into(),card["requirement"].clone(),crate::approval::Response::Allow).await?;
                 }
                 if project.join("absent.txt").exists() && worker["activeTurn"].is_null() && worker["checkpointPending"]==false && worker["checkpoint"]["turnId"]!=provided_state["workers"][0]["checkpoint"]["turnId"] {return Ok::<_,Box<dyn std::error::Error+Send+Sync>>(state);}
                 if matches!(worker["phase"].as_str(),Some("failed"|"lost"|"needs-recovery")){return Err("Worker failed during the absence check".into());}

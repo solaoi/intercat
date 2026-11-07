@@ -589,6 +589,7 @@ async fn old_report_questions_are_carried_forward_without_blocking_the_new_sessi
         kind: "question".into(),
         text: "Which option should we use?".into(),
         state: "open".into(),
+        assumed: None,
         reply_utterance_id: None,
     };
     db.execute(

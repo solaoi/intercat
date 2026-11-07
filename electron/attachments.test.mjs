@@ -40,3 +40,43 @@ test('cancelling the native chooser never starts an import', async () => {
   const run = referenceImporter({ choose: async () => null, operationId: () => assert.fail(), client: async () => assert.fail() });
   assert.equal(await run(), null);
 });
+
+test('a dropped file retries its saved operation without opening the chooser', async () => {
+  const calls = [];
+  let identifiers = 0;
+  const run = referenceImporter({
+    choose: async () => assert.fail('a drop must not open the chooser'),
+    operationId: () => `drop-${++identifiers}`,
+    client: async () => ({ request: async (_method, request) => {
+      calls.push(request);
+      if (calls.length === 1) throw new Error('acknowledgement lost');
+      return { id: request.opId, name: 'dropped.txt', byteLen: 4, sha256: 'a'.repeat(64) };
+    } }),
+  });
+  await assert.rejects(run(false, '/dummy/dropped.txt'), /acknowledgement lost/);
+  await run(false, '/dummy/dropped.txt');
+  assert.equal(identifiers, 1);
+  assert.deepEqual(calls[0], calls[1]);
+});
+
+test('a new drop replaces a failed file only after its import has settled', async () => {
+  let release;
+  const settled = new Promise(resolve => { release = resolve; });
+  let identifiers = 0;
+  const calls = [];
+  const run = referenceImporter({
+    choose: async () => assert.fail(), operationId: () => `drop-${++identifiers}`,
+    client: async () => ({ request: async (_method, request) => {
+      calls.push(request);
+      if (calls.length === 1) { await settled; throw new Error('first failed'); }
+      return { id: request.opId, name: 'second.txt', byteLen: 4, sha256: 'a'.repeat(64) };
+    } }),
+  });
+  const first = run(false, '/dummy/first.txt');
+  await assert.rejects(run(false, '/dummy/second.txt'), /already being saved/);
+  release();
+  await assert.rejects(first, /first failed/);
+  await run(false, '/dummy/second.txt');
+  assert.deepEqual(calls.map(call => call.path), ['/dummy/first.txt', '/dummy/second.txt']);
+  assert.equal(identifiers, 2);
+});

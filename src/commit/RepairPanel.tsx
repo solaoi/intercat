@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import type { Approval, Prompt, PromptResponse, OutputPreview, SecretEntry, SecretInputState } from '../bridge';
+import type { Approval, ApprovalResponse, Prompt, PromptResponse, OutputPreview, SecretEntry, SecretInputState } from '../bridge';
 import { ProgressOutput } from '../desk/ProgressOutput';
 import { ApprovalCard } from '../desk/ApprovalCard';
+import { approvalContext } from '../desk/ApprovalDrafts';
 import { QuestionCard } from '../desk/QuestionCard';
 import { SecretForm } from '../desk/SecretForm';
 import { MarkdownMessage } from '../markdown/MarkdownMessage';
@@ -32,8 +33,12 @@ export function RepairPanel({ run, label, preview, secretInputs, changed }: { se
   async function control(kind: 'resume' | 'discard') {
     await action(async () => window.intercat.controlRepair({ opId: await window.intercat.createOperationId(), id: run.id, revision: run.revision, action: kind }));
   }
-  async function answer(card: Approval, allow: boolean) {
-    await action(async () => window.intercat.answerRepair({ opId: await window.intercat.createOperationId(), id: run.id, approvalId: card.id, requirement: card.requirement, allow }));
+  async function answer(opId: string, card: Approval, response: ApprovalResponse) {
+    setBusy(true);
+    try {
+      await window.intercat.answerRepair({ opId, id: run.id, approvalId: card.id, requirement: card.requirement, response });
+      await changed();
+    } finally { setBusy(false); }
   }
   async function respond(prompt: Prompt, response: PromptResponse) {
     await action(async () => window.intercat.respondToRepair({ opId: await window.intercat.createOperationId(), id: run.id, promptId: prompt.request.userInputId, revision: prompt.revision, response }));
@@ -58,7 +63,7 @@ export function RepairPanel({ run, label, preview, secretInputs, changed }: { se
     </div></header>
     <div className="commit-repair-body">
       {run.prompts.map(prompt => <QuestionCard pendingSecret={preparing} provideSecret={(prompt,entry) => provideSecret(entry,prompt)} key={`${prompt.request.userInputId}:${prompt.revision}`} stopping={stopping} prompt={prompt} label={title} respond={respond} />)}
-      {run.approvals.map(card => <ApprovalCard key={`${card.id}:${JSON.stringify(card.requirement)}`} stopping={stopping} detail={null} card={card} label={title} answer={answer} />)}
+      {run.approvals.map(card => <ApprovalCard key={`${card.id}:${JSON.stringify(card.requirement)}`} stopping={stopping} detail={null} card={card} label={title} draftContext={approvalContext({ kind: 'repair', runId: run.id }, run.track, run.session, title, card)} answer={answer} />)}
       <ProgressOutput label={title} preview={preview} session={run.session} />
       {run.output && <MarkdownMessage label={`${title} result`} text={run.output} />}
       {preparing && <p role="status">Saving the repair and preparing its secret…</p>}

@@ -34,7 +34,13 @@ impl Mask {
     pub fn redact(&self, text: &str) -> String {
         self.redact_text(text).0
     }
+    pub(crate) fn redact_document(&self, text: &str) -> String {
+        self.redact_with_limit(text, None).0
+    }
     fn redact_text(&self, text: &str) -> (String, bool) {
+        self.redact_with_limit(text, Some(1024 * 1024))
+    }
+    fn redact_with_limit(&self, text: &str, limit: Option<usize>) -> (String, bool) {
         if self.fingerprints.is_empty() {
             return (text.into(), false);
         }
@@ -55,14 +61,14 @@ impl Mask {
             masking = released.masking;
             total = total.saturating_add(released.text.len());
             output.push_str(&released.text);
-            if output.len() > 1024 * 1024 {
+            if limit.is_some_and(|limit| output.len() > limit) {
                 // A cut can bisect an as-yet unrecognized provider credential
                 // before the full-content scanner sees it. Omit the oversized
                 // field instead of exposing unscannable head/tail fragments.
                 return ("[truncated]".into(), true);
             }
         }
-        (output, total > 1024 * 1024)
+        (output, limit.is_some_and(|limit| total > limit))
     }
     pub fn redact_value(&self, value: &mut Value) -> crate::Result<()> {
         if self.fingerprints.is_empty() {
@@ -632,6 +638,21 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+    #[test]
+    fn pasted_documents_keep_their_full_text_when_masking_crosses_chunks() {
+        let secret = "private-paste-fixture";
+        let text = format!("{}{}{}", "a".repeat(65_530), secret, "z".repeat(1_100_000));
+        let mask = mask(&[("PASTE_KEY", secret)]);
+        let safe = mask.redact_document(&text);
+        assert!(!safe.contains(secret));
+        assert!(safe.contains("<secret:PASTE_KEY>"));
+        assert!(safe.ends_with(&"z".repeat(100)));
+        assert_eq!(
+            safe.len(),
+            text.len() - secret.len() + "<secret:PASTE_KEY>".len()
+        );
+        assert_eq!(mask.redact(&text), "[truncated]");
     }
     fn item(method: &str, id: &str, revision: u64, text: &str) -> Value {
         json!({"method":method,"params":{"sessionId":"s","item":{"itemId":id,"turnId":"t","kind":"agentMessage","revision":revision,"text":text,"status":if method=="item/completed"{"completed"}else{"inProgress"}}}})

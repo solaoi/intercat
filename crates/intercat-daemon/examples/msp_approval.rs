@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
                                 Uuid::now_v7(),
                                 card["id"].as_str().unwrap().into(),
                                 card["requirement"].clone(),
-                                false,
+                                intercat_daemon::approval::Response::Deny,
                             )
                             .await?;
                     }

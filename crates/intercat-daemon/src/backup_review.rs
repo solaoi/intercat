@@ -65,6 +65,7 @@ pub struct Plan {
     pub(crate) known_summary: Vec<String>,
     pub(crate) expected_hosts: Vec<(String, Identity)>,
     pub(crate) originals: Vec<crate::attachment_store::Stored>,
+    pub(crate) screenings: Vec<crate::attachment_screening::Revision>,
     pub(crate) catalog: crate::secrets::Seal,
     pub(crate) choices: Vec<crate::backup_choices::Record>,
     pub(crate) file_reviews: std::collections::BTreeMap<String, Uuid>,
@@ -169,6 +170,7 @@ pub(crate) fn plan(db: &Connection, receipt: &Receipt, key: &crate::secrets::Key
         known_summary: ids("SELECT id FROM operations WHERE kind='handoff.summary'")?,
         expected_hosts,
         originals,
+        screenings: crate::attachment_screening::all(db)?,
         catalog: catalog.current,
         choices: crate::backup_choices::load(db, key)?,
         file_reviews,
@@ -182,6 +184,7 @@ impl Plan {
             &self.fingerprints,
             &self.workspaces,
             &self.originals,
+            &self.screenings,
             &self.expected_hosts,
         ))?)
         .iter()
@@ -327,6 +330,7 @@ pub(crate) async fn review_files(
     let source = crate::backup_attachments::Source {
         store: journal.attachment_store(),
         records: plan.originals.clone(),
+        screenings: plan.screenings.clone(),
         roots: workspace.attachment_roots.clone(),
         required: workspace.attachment_ids.clone(),
     };

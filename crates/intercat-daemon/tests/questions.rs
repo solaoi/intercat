@@ -111,7 +111,7 @@ async fn a_recovered_answer_waits_for_host_resolution_and_cannot_be_sent_again()
                 Uuid::now_v7(),
                 "recovered".into(),
                 request["currentRequirementId"].clone(),
-                true
+                intercat_daemon::approval::Response::Allow
             )
             .await
             .is_err()
@@ -140,6 +140,127 @@ fn approval(id: &str, argv: &[&str]) -> Value {
 }
 
 #[tokio::test]
+async fn approval_feedback_is_a_durable_denial_even_when_the_text_asks_to_allow() -> Result<()> {
+    use intercat_daemon::approval::{ReplyMode, Response as ApprovalResponse};
+    let mut h = Harness::new().await?;
+    let mut request = approval("feedback", &["git", "push", "origin", "main"]);
+    request["availableChoices"].as_array_mut().unwrap().push(json!({"scope":"once","decision":"abort","choiceId":"with-feedback","acceptsFeedback":true}));
+    h.send(json!({"method":"approval/request","params":request}))
+        .await?;
+    for _ in 0..100 {
+        if h.state().await?["approvals"][0]["replyMode"] == "feedback" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(h.state().await?["approvals"][0]["replyMode"], "feedback");
+    let lock = rusqlite::Connection::open(h._root.path().join("events.sqlite"))?;
+    lock.execute_batch("BEGIN IMMEDIATE")?;
+    let id = Uuid::now_v7();
+    let response = ApprovalResponse::Reply {
+        text: "Yes, run it".into(),
+        mode: ReplyMode::Feedback,
+    };
+    let port = h.port.clone();
+    let requirement = request["currentRequirementId"].clone();
+    let sent = response.clone();
+    let answer =
+        tokio::spawn(async move { port.answer(id, "feedback".into(), requirement, sent).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), h.read())
+            .await
+            .is_err()
+    );
+    lock.execute_batch("ROLLBACK")?;
+    let command = h.read().await?;
+    assert_eq!(command["method"], "approval/decide");
+    assert_eq!(command["params"]["choiceId"], "with-feedback");
+    assert_eq!(command["params"]["feedback"], "Yes, run it");
+    assert!(command["params"].get("response").is_none());
+    assert_eq!(h.journal.operation(id).await?.unwrap()["state"], "prepared");
+    h.send(json!({"id":command["id"],"result":{"commandId":id,"approvalId":"feedback","status":"accepted","terminal":true}})).await?;
+    answer.await??;
+    for _ in 0..100 {
+        if h.journal.operation(id).await?.unwrap()["state"] == "complete" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        intercat_daemon::approval::replay(
+            &h.journal,
+            id,
+            &intercat_daemon::secret_input::Owner::Work
+                .key(h.state().await?["trackId"].as_str().unwrap()),
+            "feedback",
+            &request["currentRequirementId"],
+            &response
+        )
+        .await?
+    );
+    h.close().await
+}
+
+#[tokio::test]
+async fn approval_without_feedback_interrupts_before_waiting_for_the_writer() -> Result<()> {
+    use intercat_daemon::approval::{ReplyMode, Response as ApprovalResponse};
+    let turn = Uuid::now_v7();
+    let recovery = intercat_daemon::reconcile::State {
+        resume_turn: Some(turn),
+        ..Default::default()
+    };
+    let mut h = Harness::build(false, Some(recovery)).await?;
+    let mut request = approval("restart", &["git", "push", "origin", "main"]);
+    request["turnId"] = json!(turn);
+    h.send(json!({"method":"approval/request","params":request}))
+        .await?;
+    for _ in 0..100 {
+        if h.state().await?["approvals"][0]["id"] == "restart" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let lock = rusqlite::Connection::open(h._root.path().join("events.sqlite"))?;
+    lock.execute_batch("BEGIN IMMEDIATE")?;
+    let id = Uuid::now_v7();
+    let port = h.port.clone();
+    let requirement = request["currentRequirementId"].clone();
+    let answer = tokio::spawn(async move {
+        port.answer(
+            id,
+            "restart".into(),
+            requirement,
+            ApprovalResponse::Reply {
+                text: "Explain before continuing.".into(),
+                mode: ReplyMode::Restart,
+            },
+        )
+        .await
+    });
+    let interrupted = h.read().await?;
+    assert_eq!(interrupted["method"], "turn/interrupt");
+    assert_eq!(interrupted["params"]["turnId"], turn.to_string());
+    assert!(!answer.is_finished());
+    lock.execute_batch("ROLLBACK")?;
+    answer.await??;
+    assert_eq!(
+        h.journal.operation(id).await?.unwrap()["kind"],
+        "approval.reply"
+    );
+    let input = h
+        .journal
+        .read_utterance(Uuid::new_v5(&id, b"approval-reply").to_string())
+        .await?;
+    assert_eq!(input["state"], "redirecting");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), h.read())
+            .await
+            .is_err()
+    );
+    h.close().await
+}
+
+#[tokio::test]
 async fn a_boundary_hold_keeps_current_approval_actionable() -> Result<()> {
     let mut h = Harness::new().await?;
     let request = approval("boundary-push", &["git", "push", "origin", "HEAD:probe"]);
@@ -156,7 +277,12 @@ async fn a_boundary_hold_keeps_current_approval_actionable() -> Result<()> {
     let requirement = request["currentRequirementId"].clone();
     let reply = tokio::spawn(async move {
         answer
-            .answer(Uuid::now_v7(), "boundary-push".into(), requirement, false)
+            .answer(
+                Uuid::now_v7(),
+                "boundary-push".into(),
+                requirement,
+                intercat_daemon::approval::Response::Deny,
+            )
             .await
     });
     let sent = h.read().await?;
@@ -250,7 +376,7 @@ async fn deletion_permission_waits_for_a_durable_snapshot_and_manual_permission_
             id,
             "delete-two".into(),
             request["currentRequirementId"].clone(),
-            true,
+            intercat_daemon::approval::Response::Allow,
         )
         .await
     });
@@ -294,8 +420,15 @@ async fn approval_policy_is_saved_before_send_and_cannot_bypass_an_unsupported_a
     let port = h.port.clone();
     let id = Uuid::now_v7();
     let requirement = first["currentRequirementId"].clone();
-    let answer =
-        tokio::spawn(async move { port.answer(id, "one".into(), requirement, true).await });
+    let answer = tokio::spawn(async move {
+        port.answer(
+            id,
+            "one".into(),
+            requirement,
+            intercat_daemon::approval::Response::Allow,
+        )
+        .await
+    });
     let command = h.read().await?;
     assert_eq!(command["method"], "approval/decide");
     assert_eq!(command["params"]["choiceId"], "yes");
@@ -328,7 +461,7 @@ async fn approval_policy_is_saved_before_send_and_cannot_bypass_an_unsupported_a
                 Uuid::now_v7(),
                 "three".into(),
                 third["currentRequirementId"].clone(),
-                true
+                intercat_daemon::approval::Response::Allow
             )
             .await
             .is_err()
@@ -336,8 +469,13 @@ async fn approval_policy_is_saved_before_send_and_cannot_bypass_an_unsupported_a
     let port = h.port.clone();
     let requirement = third["currentRequirementId"].clone();
     let answer = tokio::spawn(async move {
-        port.answer(Uuid::now_v7(), "three".into(), requirement, false)
-            .await
+        port.answer(
+            Uuid::now_v7(),
+            "three".into(),
+            requirement,
+            intercat_daemon::approval::Response::Deny,
+        )
+        .await
     });
     let command = h.read().await?;
     assert_eq!(command["params"]["choiceId"], "no");

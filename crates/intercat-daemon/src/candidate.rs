@@ -30,6 +30,7 @@ pub enum CheckCommand {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    pub environment: Option<crate::check_environment::Frozen>,
     pub scanner: crate::secret_scan::Engine,
     pub command: CheckCommand,
     pub npm: Option<crate::dependencies::NpmTool>,
@@ -49,7 +50,10 @@ impl Settings {
                 .collect(),
         )
     }
-    pub fn capture(job: &Job) -> Result<Self> {
+    pub fn capture(job: &Job, environment: crate::check_environment::Selection) -> Result<Self> {
+        if let Some(file) = &environment.file {
+            crate::check_environment::validate_file(file, &job.project)?;
+        }
         let source =
             Repository::worktree_source(&job.project.root, Some(job.project.base.parse()?))?;
         let path = std::env::var("PATH")?;
@@ -85,6 +89,7 @@ impl Settings {
         toolchain.sort();
         toolchain.dedup();
         Ok(Self {
+            environment: Some(crate::check_environment::Frozen::capture(environment)?),
             scanner: crate::secret_scan::Engine::capture()?,
             command: CheckCommand::Auto,
             npm,
@@ -95,6 +100,17 @@ impl Settings {
             checkout: Configuration::capture(&source)?,
             skip_hooks: false,
         })
+    }
+    pub fn environment_values(&self) -> Result<BTreeMap<String, String>> {
+        self.environment
+            .as_ref()
+            .map(crate::check_environment::Frozen::values)
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+    pub fn scanner(&self) -> Result<crate::secret_scan::Scanner> {
+        self.scanner
+            .start(&self.environment_values()?.into_values().collect::<Vec<_>>())
     }
 }
 
@@ -287,8 +303,21 @@ async fn build_from(
     inputs: Inputs<'_>,
     cancel: watch::Receiver<bool>,
 ) -> Result<Candidate> {
-    let scanner = settings.scanner.start(&[])?;
-    let result = build_inner(job, root, cache_root, settings, inputs, cancel, &scanner).await;
+    let environment = settings.environment_values()?;
+    let scanner = settings
+        .scanner
+        .start(&environment.values().cloned().collect::<Vec<_>>())?;
+    let result = build_inner(
+        job,
+        root,
+        cache_root,
+        settings,
+        inputs,
+        cancel,
+        &scanner,
+        &environment,
+    )
+    .await;
     // Error messages can contain hook output as well as ordinary Check output.
     // Only the redacted representation is allowed into a result/event.
     match result {
@@ -355,6 +384,7 @@ async fn build_from(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_inner(
     job: &Job,
     root: &Path,
@@ -363,6 +393,7 @@ async fn build_inner(
     inputs: Inputs<'_>,
     cancel: watch::Receiver<bool>,
     scanner: &crate::secret_scan::Scanner,
+    environment: &BTreeMap<String, String>,
 ) -> Result<Candidate> {
     let plan = job.plan.as_ref().ok_or("No frozen integration plan.")?;
     let _merged_tree: ObjectId = plan
@@ -544,6 +575,7 @@ async fn build_inner(
             None,
         ));
     }
+    let messages = crate::integration_assumptions::messages(job, inputs.messages);
     for track in job.tracks.iter().skip(start_at).filter(|t| t.included) {
         if *cancel.borrow() {
             return Ok(candidate.fail(State::Cancelled, "Candidate build cancelled.", None));
@@ -667,7 +699,15 @@ async fn build_inner(
         let hooks = if settings.skip_hooks {
             checkout.root.join("control/empty-hooks")
         } else {
-            match hooks::prepare(&checkout, &source, tree) {
+            match hooks::prepare(
+                &checkout,
+                &source,
+                tree,
+                settings
+                    .environment
+                    .as_ref()
+                    .and_then(|value| value.selection.file.as_deref()),
+            ) {
                 Ok(hooks) => hooks.directory,
                 Err(error) => {
                     return Ok(candidate.fail(
@@ -682,7 +722,7 @@ async fn build_inner(
             .last_clip
             .map(|clip| format!("{}:{clip}", track.label))
             .unwrap_or_else(|| format!("{}@{}", track.label, track.checkpoint_count));
-        let body = inputs.messages.get(&track.id).unwrap_or(&track.title);
+        let body = messages.get(&track.id).unwrap_or(&track.title);
         let message = format!(
             "{}\n\nIntercat: {} · {}/{}\n",
             body.trim_end(),
@@ -879,6 +919,7 @@ async fn build_inner(
         let output = checkout
             .run_check(
                 command,
+                environment,
                 cancel.clone(),
                 Duration::from_millis(settings.timeout_ms),
             )

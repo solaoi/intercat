@@ -1039,7 +1039,7 @@ async fn real_repair_scheduler_shares_capacity_stops_follows_up_and_admits_check
                             run.id,
                             approval.id.clone(),
                             approval.requirement.clone(),
-                            true,
+                            intercat_daemon::approval::Response::Allow,
                         )
                         .await?;
                 }
@@ -1514,7 +1514,9 @@ async fn repair_run_reserves_the_candidate_and_never_changes_the_main_worker() -
     assert_eq!(held.phase, Phase::Held);
     assert_eq!(journal.repair_control(stop).await?.revision, held.revision);
     let current = journal.snapshot().await?;
-    assert_eq!(current["workers"][0], serde_json::to_value(main)?);
+    let mut expected = serde_json::to_value(main)?;
+    expected["model"] = serde_json::Value::Null;
+    assert_eq!(current["workers"][0], expected);
     assert_eq!(current["repairRuns"][0]["id"], run.id.to_string());
     let discarded = journal
         .repair_control(Command {
@@ -2393,8 +2395,13 @@ async fn real_repair_uses_project_secrets_and_resumes_without_a_removed_value() 
                     if card.subject != format!("/usr/bin/python3 {script}") {
                         return Err("Unexpected repair command.".into());
                     }
-                    port.answer(Uuid::now_v7(), card.id, card.requirement, true)
-                        .await?;
+                    port.answer(
+                        Uuid::now_v7(),
+                        card.id,
+                        card.requirement,
+                        intercat_daemon::approval::Response::Allow,
+                    )
+                    .await?;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             }
@@ -2681,7 +2688,7 @@ async fn real_repair_push_waits_for_its_own_approval_and_denial_preserves_remote
                 Uuid::now_v7(),
                 card.id.clone(),
                 card.requirement.clone(),
-                false,
+                intercat_daemon::approval::Response::Deny,
             )
             .await,
         )
@@ -2869,6 +2876,7 @@ async fn repair_replays_later_contributions_without_putting_them_in_the_owners_c
                 f.source.join("file.txt").display(),
                 candidate_root.join("repo/file.txt").display()
             ),
+            &std::collections::BTreeMap::new(),
             watch::channel(false).1,
             std::time::Duration::from_secs(5),
         )
@@ -3448,6 +3456,11 @@ impl Fixture {
         repo.sync_objects(&[marker])?;
         repo.compare_and_swap(&format!("refs/intercat/{slug}/session"), None, marker)?;
         let job = Job {
+            order_review: None,
+            assumptions: Vec::new(),
+            assumptions_changed: false,
+            assumptions_pending: 0,
+            assumptions_failed: 0,
             id: Uuid::now_v7(),
             revision: 1,
             status: Status::Preparing,
@@ -3527,6 +3540,7 @@ impl Fixture {
         self.job.plan = Some(integration::freeze(&self.job)?);
         self.job.plan = Some(integration::plan(&self.job)?);
         Ok(Settings {
+            environment: None,
             scanner: intercat_daemon::secret_scan::Engine::capture()?,
             npm: None,
             registry_origins: vec!["https://registry.npmjs.org/".into()],
@@ -4369,7 +4383,7 @@ async fn real_repair_secret(msp_question: bool) -> Result<()> {
                     for card in current.approvals {
                         if allowed.insert((card.id.clone(),card.requirement.to_string())) {
                             if card.subject!=format!("/usr/bin/python3 {script}") {return Err(format!("Unexpected repair command: {}",card.subject).into());}
-                            runtime.service.answer(Uuid::now_v7(),run.id,card.id,card.requirement,true).await?;
+                            runtime.service.answer(Uuid::now_v7(),run.id,card.id,card.requirement,intercat_daemon::approval::Response::Allow).await?;
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -4780,5 +4794,149 @@ async fn attachment_filter_does_not_hide_check_changes_to_unregistered_directori
     let result = f.build(&settings).await?;
     assert_eq!(result.state, State::CheckMutated, "{result:?}");
     f.unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_check_environment_reaches_only_the_check_and_masks_both_outputs() -> Result<()> {
+    let mut f = Fixture::new(&[]).await?;
+    f.track("A", &[("file.txt", Some("A\n"), false)])?;
+    let environment = f.source.join(".env.test");
+    fs::write(
+        &environment,
+        "CHECK_VALUE='private-check-fixture-value'\nMULTILINE=\"line one\\nline two\"\n",
+    )?;
+    let mut settings = f.settings(Some("test ! -e .env.test || exit 7; test \"$CHECK_VALUE\" = private-check-fixture-value || exit 8; printf '%s\\n' \"$CHECK_VALUE\"; printf '%s\\n' \"$MULTILINE\" >&2; exit 1"))?;
+    settings.environment = Some(intercat_daemon::check_environment::Frozen::capture(
+        intercat_daemon::check_environment::Selection {
+            revision: 1,
+            file: Some(environment),
+        },
+    )?);
+    let result = f.build(&settings).await?;
+    assert_eq!(result.state, State::CheckFailed);
+    let check = result.check.as_ref().unwrap();
+    assert_eq!(check.code, Some(1));
+    let serialized = serde_json::to_string(&result)?;
+    assert!(!serialized.contains("private-check-fixture-value"));
+    assert!(!serialized.contains("line one"));
+    assert!(!serialized.contains("line two"));
+    assert!(check.stdout.contains("["));
+    f.unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn exact_check_value_blocks_the_first_commit_even_when_a_later_track_removes_it() -> Result<()>
+{
+    for command in [None, Some("exit 77")] {
+        let mut f = Fixture::new(&[]).await?;
+        let value = "ordinary-value-known-only-to-check";
+        f.track("A", &[("fixture.txt", Some(value), false)])?;
+        f.track("B", &[("fixture.txt", None, false)])?;
+        f.job.tracks[1].initial_base = f.job.tracks[0].checkpoint.as_ref().unwrap().sha.clone();
+        let file = f.source.join(".env.ci");
+        fs::write(&file, format!("CHECK_VALUE='{value}'\n"))?;
+        let mut settings = f.settings(command)?;
+        assert!(
+            !Repository::open(&f.source)?
+                .tree_files(
+                    f.job
+                        .plan
+                        .as_ref()
+                        .unwrap()
+                        .tree
+                        .as_ref()
+                        .unwrap()
+                        .parse()?
+                )?
+                .contains_key("fixture.txt")
+        );
+        settings.environment = Some(intercat_daemon::check_environment::Frozen::capture(
+            intercat_daemon::check_environment::Selection {
+                revision: 1,
+                file: Some(file),
+            },
+        )?);
+        let result = f.build(&settings).await?;
+        assert_eq!(result.state, State::SecretFound);
+        assert!(result.check.is_none());
+        assert!(result.commits.is_empty());
+        assert_eq!(
+            result.blocked_commit.as_ref().unwrap().track,
+            f.job.tracks[0].id
+        );
+        assert!(
+            result.secret_scans[0]
+                .findings
+                .iter()
+                .any(|finding| finding.rule == "check-environment-value")
+        );
+        assert!(!serde_json::to_string(&result)?.contains(value));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn changed_check_environment_requires_new_settings_and_tracked_files_are_rejected()
+-> Result<()> {
+    let mut f = Fixture::new(&[("tracked.env", "CHECK_VALUE=public\n", false)]).await?;
+    f.track("A", &[("file.txt", Some("A\n"), false)])?;
+    assert!(
+        intercat_daemon::check_environment::validate_file(
+            &f.source.join("tracked.env"),
+            &f.job.project
+        )
+        .is_err()
+    );
+    let file = f.source.join(".env.ci");
+    fs::write(&file, "CHECK_VALUE=first\n")?;
+    let mut settings = f.settings(Some("test \"$CHECK_VALUE\" = second"))?;
+    settings.environment = Some(intercat_daemon::check_environment::Frozen::capture(
+        intercat_daemon::check_environment::Selection {
+            revision: 1,
+            file: Some(file.clone()),
+        },
+    )?);
+    fs::write(&file, "CHECK_VALUE=second\n")?;
+    let error = f
+        .build(&settings)
+        .await
+        .err()
+        .ok_or("Expected changed environment rejection")?;
+    assert!(error.to_string().contains("Re-check"));
+    assert!(!error.to_string().contains("second"));
+    settings.environment = Some(intercat_daemon::check_environment::Frozen::capture(
+        intercat_daemon::check_environment::Selection {
+            revision: 1,
+            file: Some(file),
+        },
+    )?);
+    assert_eq!(f.build(&settings).await?.state, State::Checked);
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_environment_file_is_not_copied_with_untracked_hook_helpers() -> Result<()> {
+    let mut f = Fixture::new(&[]).await?;
+    f.track("A", &[("file.txt", Some("A\n"), false)])?;
+    fs::create_dir_all(f.source.join(".githooks"))?;
+    let file = f.source.join(".githooks/private.env");
+    fs::write(&file, "CHECK_VALUE=hook-fixture-value\n")?;
+    executable(
+        &f.source.join(".githooks/pre-commit"),
+        "#!/bin/sh\ntest ! -e .githooks/private.env\n",
+    )?;
+    git(&f.source, &["config", "core.hooksPath", ".githooks"], None);
+    let mut settings = f.settings(Some(
+        "test ! -e .githooks/private.env && test \"$CHECK_VALUE\" = hook-fixture-value",
+    ))?;
+    settings.environment = Some(intercat_daemon::check_environment::Frozen::capture(
+        intercat_daemon::check_environment::Selection {
+            revision: 1,
+            file: Some(file),
+        },
+    )?);
+    assert_eq!(f.build(&settings).await?.state, State::Checked);
     Ok(())
 }

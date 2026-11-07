@@ -117,6 +117,7 @@ impl Server {
                 io::Error::other("RPC directory must be owned by this user and mode 0700").into(),
             );
         }
+        journal.attach_privacy_editor(editor.clone())?;
         let path = directory.join("rpc.sock");
         match fs::symlink_metadata(&path) {
             Ok(metadata)
@@ -150,6 +151,15 @@ impl Server {
             self.wake.clone(),
         )
         .await?;
+        let descriptions =
+            crate::descriptions::Service::start(self.journal.clone(), self.editor.clone());
+        let report_analysis =
+            crate::report_analysis::Service::start(self.journal.clone(), self.editor.clone());
+        let assumptions =
+            crate::assumptions::Service::start(self.journal.clone(), self.editor.clone());
+        let inferred_corrections = crate::input_inference::Service::start(self.journal.clone());
+        let quiet_proposals = crate::quiet_proposals::Service::start(self.journal.clone());
+        let clip_files = crate::clip_files::Service::start(self.journal.clone());
         let preparation =
             crate::preparation::Preparation::start(&self.workspace_root, self.journal.clone())?;
         let preparation_status = preparation.status.clone();
@@ -238,9 +248,15 @@ impl Server {
         tokio::join!(
             context.integration.shutdown(),
             runtime.shutdown(),
-            repairs.shutdown()
+            repairs.shutdown(),
+            quiet_proposals.stop(),
+            clip_files.stop()
         );
         processor.shutdown().await?;
+        report_analysis.shutdown().await;
+        descriptions.shutdown().await;
+        assumptions.shutdown().await;
+        inferred_corrections.shutdown().await;
         preparation.shutdown().await;
         Ok(())
     }
@@ -381,7 +397,7 @@ async fn connection(stream: UnixStream, token: Arc<Token>, context: Context) -> 
             result=requests.join_next(),if !requests.is_empty()=>{if let Some(result)=result { result??; }},
             request=read_frame(&mut reader)=>{
                 let request=request?;
-                let slot=if matches!(request.method.as_str(), "worker.stop" | "repair.stop" | "system.pause" | "system.shutdown" | "system.outputFlows") || (matches!(request.method.as_str(), "worker.respond" | "repair.respond") && request.params["response"]["action"]=="stop") {None}else{Some(permits.clone().try_acquire_owned().map_err(|_|io::Error::other("Too many concurrent requests."))?)};
+                let slot=if matches!(request.method.as_str(), "worker.stop" | "utterance.stop" | "repair.stop" | "system.pause" | "system.shutdown" | "system.outputFlows") || (matches!(request.method.as_str(), "worker.respond" | "repair.respond") && request.params["response"]["action"]=="stop") {None}else{Some(permits.clone().try_acquire_owned().map_err(|_|io::Error::other("Too many concurrent requests."))?)};
                 let context=context.clone();let write=write.clone();
                 requests.spawn(async move {
                     let _slot=slot;
@@ -442,6 +458,46 @@ async fn dispatch(
         ));
     }
     match request.method.as_str() {
+        "check-environment.get" => {
+            let selection = journal
+                .check_environment()
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            let snapshot = journal
+                .snapshot()
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            let project =
+                serde_json::from_value::<crate::project::Project>(snapshot["project"].clone()).ok();
+            let available = project.is_some();
+            let candidates = tokio::task::spawn_blocking(move || {
+                project
+                    .map(|project| {
+                        [".env.test", ".env.ci"]
+                            .into_iter()
+                            .filter_map(|name| {
+                                crate::check_environment::validate_file(
+                                    &project.root.join(name),
+                                    &project,
+                                )
+                                .ok()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .await
+            .map_err(|_| (-32603, "Check environment unavailable".into()))?;
+            Ok(json!({"selection":selection,"candidates":candidates,"available":available}))
+        }
+        "check-environment.change" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            let selection = journal
+                .change_check_environment(params)
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            Ok(serde_json::to_value(selection).unwrap())
+        }
         #[cfg(all(feature = "fault-injection", debug_assertions))]
         "test.writer" => {
             let request = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
@@ -582,7 +638,7 @@ async fn dispatch(
                 id: uuid::Uuid,
                 approval_id: String,
                 requirement: Value,
-                allow: bool,
+                response: crate::approval::Response,
             }
             let params: Params =
                 serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
@@ -595,7 +651,7 @@ async fn dispatch(
                     params.id,
                     params.approval_id,
                     params.requirement,
-                    params.allow,
+                    params.response,
                 )
                 .await
                 .map_err(|e| (-32005, e.to_string()))?;
@@ -649,8 +705,10 @@ async fn dispatch(
             match &params.action {
                 crate::integration::Action::Open {
                     tracks: Some(tracks),
-                } if tracks.len() > 256
-                    || tracks.iter().any(|t| uuid::Uuid::parse_str(t).is_err()) =>
+                }
+                | crate::integration::Action::Order { tracks, .. }
+                    if tracks.len() > 256
+                        || tracks.iter().any(|t| uuid::Uuid::parse_str(t).is_err()) =>
                 {
                     return Err(invalid());
                 }
@@ -665,7 +723,7 @@ async fn dispatch(
             integration
                 .command(params)
                 .await
-                .and_then(|job| Ok(serde_json::to_value(job)?))
+                .and_then(|job| crate::integration::project(&job))
                 .map_err(|e| (-32000, e.to_string()))
         }
         "deletion.restore" => {
@@ -697,6 +755,58 @@ async fn dispatch(
             .map(|result| serde_json::to_value(result).unwrap())
             .map_err(|e| (-32005, e.to_string()))
         }
+        "confirmation.change" => {
+            let params: crate::confirmation::Change =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .change_confirmation(params)
+                .await
+                .and_then(|status| serde_json::to_value(status).map_err(Into::into))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "utterance.confirm" => {
+            let params: crate::confirmation::Accept =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            let before = journal
+                .read_utterance(params.utterance_id.to_string())
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            let track = before["decision"]["trackId"].as_str().map(str::to_owned);
+            let generation = track
+                .as_ref()
+                .and_then(|track| runtime.start_generation(track).ok());
+            let result = journal
+                .confirm_input(params.clone())
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            if result["decision"]["kind"] == "trim" && result["state"] == "redirecting" {
+                let resumed = match (track, generation) {
+                    (Some(track), Some(generation)) => {
+                        runtime
+                            .start_correction(
+                                uuid::Uuid::new_v5(&params.op_id, b"confirmation.resume"),
+                                &track,
+                                generation,
+                            )
+                            .await
+                    }
+                    _ => Err("The correction's worker is not connected.".into()),
+                };
+                if let Err(error) = resumed {
+                    let _ = journal
+                        .resolve_input(
+                            uuid::Uuid::new_v5(&params.op_id, b"confirmation.hold"),
+                            params.utterance_id.to_string(),
+                            result["revision"].as_i64().unwrap(),
+                            crate::decision::Resolution::Hold,
+                        )
+                        .await;
+                    return Err((-32005, error.to_string()));
+                }
+            }
+            wake.notify_one();
+            Ok(result)
+        }
         "policy.stops" => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -715,6 +825,73 @@ async fn dispatch(
                 .map(|stops| serde_json::json!({"stops":stops}))
                 .map_err(|e| (-32005, e.to_string()))
         }
+        "utterance.origin" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields, rename_all = "camelCase")]
+            struct Params {
+                utterance_id: uuid::Uuid,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            let origin = journal
+                .read_input_origin(params.utterance_id)
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            serde_json::to_value(origin).map_err(|error| (-32005, error.to_string()))
+        }
+        "utterance.changes" => {
+            let identity = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            let changes = crate::input_origin::changes(journal, identity)
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            serde_json::to_value(changes).map_err(|error| (-32005, error.to_string()))
+        }
+        "utterance.diff" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            let diff = crate::input_origin::diff(journal, params)
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            serde_json::to_value(diff).map_err(|error| (-32005, error.to_string()))
+        }
+        "utterance.stop" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields, rename_all = "camelCase")]
+            struct Params {
+                op_id: uuid::Uuid,
+                track_id: String,
+                identity: crate::input_origin::Identity,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.op_id.get_version_num() != 7 {
+                return Err(invalid());
+            }
+            runtime
+                .stop_input_origin(params.op_id, params.track_id, params.identity)
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            Ok(Value::Null)
+        }
+        "utterance.misread" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .mark_misread(params)
+                .await
+                .map_err(|e| (-32005, e.to_string()))
+        }
+        "utterance.read" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields, rename_all = "camelCase")]
+            struct Params {
+                utterance_id: uuid::Uuid,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .read_utterance(params.utterance_id.to_string())
+                .await
+                .map_err(|e| (-32005, e.to_string()))
+        }
         "timeline.detail" => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -728,6 +905,50 @@ async fn dispatch(
                 .await
                 .map_err(|e| (-32005, e.to_string()))
         }
+        "timeline.observe" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                owner: uuid::Uuid,
+                revision: i64,
+                view: Option<crate::clip_summaries::View>,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.owner.get_version_num() != 7
+                || params.revision < 1
+                || params.view.as_ref().is_some_and(|view| {
+                    uuid::Uuid::parse_str(&view.track_id).is_err()
+                        || view
+                            .repair_run_id
+                            .as_ref()
+                            .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+                })
+            {
+                return Err(invalid());
+            }
+            journal
+                .observe_timeline(params.owner, params.revision, params.view)
+                .await
+                .map(|()| Value::Null)
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "editor.log" => {
+            let query: crate::editor_log::Query =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .editor_log(query)
+                .await
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "editor.away" => {
+            let query: crate::editor_away::Query =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .editor_away(query)
+                .await
+                .map_err(|error| (-32005, error.to_string()))
+        }
         "timeline.window" => {
             let params: crate::timeline::Window =
                 serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
@@ -735,6 +956,30 @@ async fn dispatch(
                 .timeline_window(params)
                 .await
                 .map_err(|e| (-32005, e.to_string()))
+        }
+        "proposal.respond" => {
+            let command: crate::proposals::Command =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if command.op_id.get_version_num() != 7 {
+                return Err(invalid());
+            }
+            let result = journal
+                .answer_proposal(command)
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            wake.notify_one();
+            Ok(result)
+        }
+        "assumption.respond" => {
+            let command: crate::assumptions::Command =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if command.op_id.get_version_num() != 7 || command.revision < 1 {
+                return Err(invalid());
+            }
+            journal
+                .answer_assumption(command)
+                .await
+                .map_err(|error| (-32005, error.to_string()))
         }
         "report.respond" => {
             #[derive(Deserialize)]
@@ -857,7 +1102,7 @@ async fn dispatch(
                 track_id: String,
                 approval_id: String,
                 requirement: Value,
-                allow: bool,
+                response: crate::approval::Response,
             }
             let params: Params =
                 serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
@@ -870,7 +1115,7 @@ async fn dispatch(
                     &params.track_id,
                     params.approval_id,
                     params.requirement,
-                    params.allow,
+                    params.response,
                 )
                 .await
                 .map_err(|error| (-32005, error.to_string()))?;
@@ -1099,6 +1344,14 @@ async fn dispatch(
                 .map(|r| r.status())
                 .map_err(|e| (-32002, e.to_string()))
         }
+        "branch.points" => {
+            let query = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .branch_points(query)
+                .await
+                .map(|page| serde_json::to_value(page).unwrap())
+                .map_err(|e| (-32002, e.to_string()))
+        }
         "branch.prepare" => {
             let branch = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
             runtime
@@ -1267,6 +1520,24 @@ async fn dispatch(
                 .map_err(|_| (-32003, "No Editor download is running".into()))?;
             Ok(serde_json::to_value(editor.status()).unwrap())
         }
+        "editor.calibration" => journal
+            .editor_calibration_state()
+            .await
+            .map(|state| serde_json::to_value(state).unwrap())
+            .map_err(|_| (-32603, "Calibration unavailable".into())),
+        "editor.calibrate" => {
+            let change = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .apply_editor_calibration(change)
+                .await
+                .map(|state| serde_json::to_value(state).unwrap())
+                .map_err(|_| {
+                    (
+                        -32002,
+                        "Calibration is invalid or changed. Reload before applying.".into(),
+                    )
+                })
+        }
         "editor.configure" => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -1296,7 +1567,46 @@ async fn dispatch(
             }
             Ok(serde_json::to_value(editor.status()).unwrap())
         }
-        "attachment.import" => {
+        "privacy.change" => {
+            let params: crate::privacy_policy::Change =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .change_privacy(params)
+                .await
+                .and_then(|state| serde_json::to_value(state).map_err(Into::into))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "privacy.preview" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                id: String,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .preview_privacy_file(params.id)
+                .await
+                .map_err(|error| (-32002, error.to_string()))
+        }
+        "privacy.original" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                id: i64,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.id <= 0 || params.id > 9_007_199_254_740_991 {
+                return Err(invalid());
+            }
+            journal
+                .privacy_original(params.id)
+                .await
+                .map(|text| json!({"textBase64":base64::Engine::encode(&base64::prelude::BASE64_STANDARD,text)}))
+                .map_err(|error| (-32002, error.to_string()))
+        }
+        "attachment.import" | "attachment.paste" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase", deny_unknown_fields)]
             struct Params {
@@ -1308,11 +1618,87 @@ async fn dispatch(
             if params.op_id.get_version_num() != 7 || !params.path.is_absolute() {
                 return Err(invalid());
             }
-            journal
-                .import_attachment(params.op_id, params.path)
-                .await
+            let saved = if request.method == "attachment.paste" {
+                journal.import_pasted_text(params.op_id, params.path).await
+            } else {
+                journal.import_attachment(params.op_id, params.path).await
+            };
+            saved
                 .and_then(|value| serde_json::to_value(value).map_err(Into::into))
                 .map_err(|_| (-32002, "reference file could not be saved".into()))
+        }
+        "attachment.paste.refresh" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .refresh_pasted_text(params)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(Into::into))
+                .map_err(|_| (-32002, "pasted reference could not be screened".into()))
+        }
+        "attachment.paste.list" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct Params {
+                track_id: String,
+                after: Option<uuid::Uuid>,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.track_id.is_empty() || params.track_id.len() > 128 {
+                return Err(invalid());
+            }
+            journal
+                .pasted_references(params.track_id, params.after)
+                .await
+                .and_then(|value| serde_json::to_value(value).map_err(Into::into))
+                .map_err(|_| (-32002, "pasted references could not be loaded".into()))
+        }
+        "attachment.paste.read" => {
+            use base64::Engine as _;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                id: uuid::Uuid,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            let original = journal
+                .read_pasted_text(params.id)
+                .await
+                .map_err(|_| (-32002, "pasted text could not be read".into()))?;
+            Ok(
+                serde_json::json!({"textBase64":base64::engine::general_purpose::STANDARD.encode(original.as_bytes())}),
+            )
+        }
+        "draft.read" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                session: String,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .read_drafts(params.session)
+                .await
+                .map_err(|error| (-32002, error.to_string()))
+        }
+        "draft.save" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .save_drafts(params)
+                .await
+                .map_err(|error| (-32002, error.to_string()))
+        }
+        "utterance.edit" => {
+            let params: crate::edit_hold::Request =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            let result = journal
+                .edit_input(params)
+                .await
+                .map_err(|error| (-32002, error.to_string()))?;
+            wake.notify_one();
+            Ok(result)
         }
         "utterance.create" => {
             #[derive(Deserialize)]
@@ -1326,25 +1712,37 @@ async fn dispatch(
                 selected: Option<String>,
                 #[serde(rename = "attachmentIds")]
                 attachment_ids: Vec<uuid::Uuid>,
+                sources: Option<Vec<crate::request_sources::Source>>,
             }
             let params: Params =
                 serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
             if params.op_id.get_version_num() != 7
-                || params.text.trim().is_empty()
+                || (params.text.trim().is_empty()
+                    && params.sources.as_ref().is_none_or(Vec::is_empty))
                 || params.text.len() > 32 * 1024
             {
                 return Err(invalid());
             }
             let result = journal
-                .stage_utterance(
-                    params.op_id,
-                    params.text,
-                    params.target,
-                    params.selected,
-                    params.attachment_ids,
-                )
+                .stage_document(crate::request_sources::Submission {
+                    op_id: params.op_id,
+                    text: params.text,
+                    target: params.target,
+                    selected_track_id: params.selected,
+                    attachment_ids: params.attachment_ids,
+                    sources: params.sources,
+                })
                 .await
                 .map_err(|_| (-32002, "operation could not be accepted".to_owned()))?;
+            wake.notify_one();
+            Ok(result)
+        }
+        "timeline.history" => {
+            let request = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            let result = journal
+                .edit_history(request)
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
             wake.notify_one();
             Ok(result)
         }
@@ -1365,6 +1763,16 @@ async fn dispatch(
                 .start_held_input(params.op_id, params.utterance_id, params.revision)
                 .await
                 .map_err(|error| (-32005, error.to_string()))
+        }
+        "utterance.rephrase" => {
+            let params: crate::rephrases::Submission =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            let result = journal
+                .submit_rephrase(params)
+                .await
+                .map_err(|error| (-32002, error.to_string()))?;
+            wake.notify_one();
+            Ok(result)
         }
         "utterance.resolve" => {
             #[derive(Deserialize)]
@@ -1400,7 +1808,9 @@ async fn dispatch(
                         "request changed or could not be saved; refresh before answering".into(),
                     )
                 })?;
-            if result["decision"]["kind"] == "trim" && result["state"] == "placed" {
+            if result["decision"]["kind"] == "trim"
+                && matches!(result["state"].as_str(), Some("placed" | "redirecting"))
+            {
                 let resumed = match start_guard {
                     Some((track, Ok(generation))) => {
                         runtime

@@ -38,7 +38,9 @@ fn git(root: &Path, args: &[&str]) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let failed_check = std::env::args().nth(2).as_deref() == Some("--failed-check");
+    let assumptions = std::env::args().nth(2).as_deref() == Some("--assumptions");
     let unborn = std::env::args().nth(2).as_deref() == Some("--unborn");
+    let check_environment = std::env::args().nth(2).as_deref() == Some("--check-environment");
     let root = PathBuf::from(
         std::env::args_os()
             .nth(1)
@@ -55,7 +57,11 @@ async fn main() -> Result<()> {
         fs::write(source.join("README.md"), "# Commit fixture\n")?;
         fs::write(
             source.join("package.json"),
-            r#"{"name":"commit-fixture","version":"1.0.0","scripts":{"test":"node --check index.js"}}"#,
+            serde_json::to_vec(
+                &json!({"name":"commit-fixture","version":"1.0.0","scripts":{"test": if check_environment {
+                "node -e \"if (require('crypto').createHash('sha256').update(process.env.CHECK_FIXTURE_VALUE || '').digest('hex') !== '86307c0bcff580d82e69864103665490065ed68927389261ddaf47d021e3b5be' || require('fs').existsSync('.env.test')) process.exit(19); console.log(process.env.CHECK_FIXTURE_VALUE)\" && node --check index.js"
+            } else { "node --check index.js" }}}),
+            )?,
         )?;
         git(&source, &["add", "."])?;
         git(&source, &["commit", "-qm", "base"])?;
@@ -140,7 +146,42 @@ async fn main() -> Result<()> {
                 "# Commit fixture\n\nThe exported value is now 2.\n",
             )?;
         }
-        checkpoint::save(workspace, Uuid::now_v7(), None, false, journal.clone()).await?;
+        let track = workspace.track_id.clone();
+        let turn = Uuid::now_v7();
+        checkpoint::save(workspace, turn, None, false, journal.clone()).await?;
+        if assumptions {
+            let session = format!("assumption-{track}");
+            journal
+                .try_msp(
+                    track,
+                    session.clone(),
+                    intercat_daemon::clock::Stamp::now(),
+                    json!({"method":"item/updated","params":{"sessionId":session,"item":{
+                    "itemId":"assumed","turnId":turn,"kind":"agentMessage","revision":1,
+                    "status":"completed","text":"I assumed SQLite for the local cache."}}}),
+                    None,
+                    None,
+                )?
+                .await??;
+            let ticket = journal.claim_assumptions().await?.unwrap();
+            let result = ticket
+                .sources
+                .iter()
+                .map(|source| intercat_daemon::assumptions::Extracted {
+                    source: source.id.clone(),
+                    question: "Which database should store the cache?".into(),
+                    options: ["SQLite".into(), "PostgreSQL".into()],
+                    assumed: "SQLite".into(),
+                    evidence: "I assumed SQLite".into(),
+                })
+                .collect();
+            journal
+                .finish_assumptions(
+                    ticket,
+                    intercat_daemon::assumptions::Finish::Complete(result),
+                )
+                .await?;
+        }
     }
     println!("{}", json!({"source":source,"data":data}));
     Ok(())

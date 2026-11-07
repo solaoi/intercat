@@ -529,9 +529,10 @@ async fn projecting_a_snapshot_user_message_does_not_mark_input_delivered_or_rep
     read["history"]["snapshot"]["state"]["items"] = json!([{"itemId":"user","kind":"userMessage","revision":1,"status":"completed","recordedAt":"2026-11-05T00:00:00Z","text":"waiting","commandId":command,"turnId":turn}]);
     seed(&journal, read.clone()).await?;
     seed(&journal, read).await?;
+    // A snapshot alone cannot present the app's pending statement as landed.
     assert_eq!(
         window(&journal).await?["marks"].as_array().unwrap().len(),
-        1
+        0
     );
     assert_eq!(
         journal.operation(command).await?.unwrap()["state"],
@@ -550,6 +551,12 @@ async fn projecting_a_snapshot_user_message_does_not_mark_input_delivered_or_rep
         db.query_row("SELECT count(*) FROM effects", [], |r| r.get::<_, i64>(0))?,
         0
     );
+    journal
+        .input_execution(input.to_string(), 1, "landed")
+        .await?;
+    let marks = window(&journal).await?["marks"].clone();
+    assert_eq!(marks.as_array().unwrap().len(), 1);
+    assert_eq!(marks[0]["inputId"], input.to_string());
     Ok(())
 }
 

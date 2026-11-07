@@ -18,6 +18,7 @@ pub struct Approval {
     pub reason: Reason,
     pub can_allow: bool,
     pub can_deny: bool,
+    pub reply_mode: Option<crate::approval::ReplyMode>,
     #[serde(default)]
     pub deletion: Option<crate::deletion::Summary>,
 }
@@ -70,11 +71,17 @@ pub enum Command {
         target: StopTarget,
         generation: u64,
     },
+    StopOrigin {
+        id: Uuid,
+        session: String,
+        turn: Uuid,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Answer {
         id: Uuid,
         approval: String,
         requirement: Value,
-        allow: bool,
+        response: crate::approval::Response,
         reply: oneshot::Sender<Result<()>>,
     },
 }
@@ -272,6 +279,27 @@ impl Port {
     pub fn stop_captured(&self, id: Uuid, turn: Option<Uuid>) -> Result<()> {
         self.stop_target(id, StopTarget::Turn(turn), true)
     }
+    pub async fn stop_origin(&self, id: Uuid, session: &str, turn: Uuid) -> Result<()> {
+        let (client, current) = self
+            .emergency
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("The original worker is not connected.")?;
+        if current != session || client.is_closed() {
+            return Err("The original worker session is not connected.".into());
+        }
+        // The MSP request names the original turn even when actor state is delayed.
+        client.interrupt_now(session, Some(turn))?;
+        let (reply, result) = oneshot::channel();
+        self.tx.send(Command::StopOrigin {
+            id,
+            session: session.into(),
+            turn,
+            reply,
+        })?;
+        result.await?
+    }
     fn stop_target(&self, id: Uuid, target: StopTarget, stop_processes: bool) -> Result<()> {
         let generation = self.mark_stop(target, !stop_processes);
         let connected = if let Some((client, session)) = self.emergency.lock().unwrap().as_ref()
@@ -413,7 +441,7 @@ impl Port {
         id: Uuid,
         approval: String,
         requirement: Value,
-        allow: bool,
+        response: crate::approval::Response,
     ) -> Result<()> {
         self.require_connection()?;
         let (reply, result) = oneshot::channel();
@@ -421,7 +449,7 @@ impl Port {
             id,
             approval,
             requirement,
-            allow,
+            response,
             reply,
         })?;
         result.await?
@@ -477,6 +505,10 @@ struct Input {
     sent: bool,
 }
 enum Work {
+    ApprovalReplySaved {
+        result: Result<()>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     SecretAccepted {
         install: crate::secret_input::Install,
         result: Result<()>,
@@ -497,11 +529,6 @@ enum Work {
         result: Box<Result<(crate::policy::Verdict, Option<crate::deletion::Snapshot>)>>,
     },
     ReportObserved(Result<crate::reports::Observation>),
-    ReportAnalyzed {
-        id: String,
-        revision: i64,
-        result: Result<i64>,
-    },
     PromptSaved {
         result: Result<crate::journal::Admission>,
         method: &'static str,
@@ -515,7 +542,10 @@ enum Work {
     },
     Scanned(std::io::Result<crate::process::Scan>),
     Snapshot(Result<Value>),
-    Reserved(Result<crate::journal::Admission>, Option<Value>),
+    Reserved(
+        Result<crate::journal::Admission>,
+        Option<crate::screening::Command>,
+    ),
     Started(Result<Value>),
     Persisted(Result<()>),
     CheckpointSaved(Result<crate::checkpoint::Checkpoint>),
@@ -671,21 +701,6 @@ fn persist_answer(
         });
     });
 }
-pub(crate) fn offered(request: &Value, allow: bool) -> Option<String> {
-    request["availableChoices"]
-        .as_array()?
-        .iter()
-        .find(|choice| {
-            choice["scope"] == "once"
-                && if allow {
-                    choice["decision"] == "approved"
-                } else {
-                    choice["decision"] == "denied" || choice["decision"] == "abort"
-                }
-        })
-        .and_then(|choice| choice["choiceId"].as_str())
-        .map(str::to_owned)
-}
 fn short_text(text: &str) -> String {
     text.chars().take(32768).collect()
 }
@@ -813,11 +828,11 @@ pub async fn run(
     let mut approval_queue = std::collections::VecDeque::<Value>::new();
     let mut pending_writes = 0_usize;
     let mut pending_approvals = 0_usize;
+    let mut saving_approval_reply = false;
     let mut scan_busy = false;
     let mut scan_timer = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut report_observations = 0usize;
     let mut report_barrier = 0i64;
-    let mut report_analyses = std::collections::HashSet::<(String, i64)>::new();
     let mut final_reports = std::collections::HashSet::<Uuid>::new();
     let mut redirected = std::collections::HashSet::new();
     loop {
@@ -830,7 +845,7 @@ pub async fn run(
             let id=params["approvalId"].as_str().ok_or("Missing approval ID")?.to_owned();
             state.approvals.retain(|card|card.id!=id);state.phase="approval".into();state.detail=None;write_state(jobs, journal,state,&tx)?;pending_writes+=1;
             if approval_stages.is_decided(&id,&params["currentRequirementId"]) {
-                state.approvals.push(Approval{id,requirement:params["currentRequirementId"].clone(),subject:params["subject"]["command"].as_str().unwrap_or("Recovered action").into(),reason:crate::policy::Reason{kind:"reconnecting".into(),message:"The previous answer is still awaiting host confirmation. Stop or reconnect before answering again.".into()},can_allow:false,can_deny:false,deletion:None});
+                state.approvals.push(Approval{id,requirement:params["currentRequirementId"].clone(),subject:params["subject"]["command"].as_str().unwrap_or("Recovered action").into(),reason:crate::policy::Reason{kind:"reconnecting".into(),message:"The previous answer is still awaiting host confirmation. Stop or reconnect before answering again.".into()},can_allow:false,can_deny:false,reply_mode:None,deletion:None});
                 write_state(jobs, journal,state,&tx)?;pending_writes+=1;continue;
             }
             let request=params.clone();let path=path.to_path_buf();let track=state.track_id.clone();let journal=journal.clone();let tx=tx.clone();
@@ -944,11 +959,13 @@ pub async fn run(
         run.set_hold(Hold::Stopping, context.port.stopped.load(Ordering::Acquire)||context.port.global_pause.paused());
         run.set_hold(Hold::Boundary, context.port.boundary_hold.load(Ordering::Acquire));
         let redirects = crate::redirect::stopping(&snapshot, &state.track_id);
-        let redirecting = !redirects.is_empty();
+        let redirecting = !redirects.is_empty() || saving_approval_reply;
         run.set_hold(Hold::Redirect, redirecting);
         for redirect in redirects {
-            if context.port.stopped.load(Ordering::Acquire) || !redirected.insert((redirect.input_id, redirect.revision)) { continue; }
+            if context.port.stopped.load(Ordering::Acquire) || redirected.contains(&(redirect.input_id.clone(), redirect.revision)) { continue; }
             if redirect.session_id == session && state.active_turn == Some(redirect.turn_id) {
+                let Some(redirect) = journal.claim_redirect(redirect.input_id.clone(), redirect.revision).await? else { continue; };
+                redirected.insert((redirect.input_id, redirect.revision));
                 for prompt in &state.prompts {
                     let (method, params) = prompt.command(Uuid::now_v7(), &crate::questions::Response::Stop { answers: vec![] })?;
                     client.control_now(method, params)?;
@@ -972,33 +989,6 @@ pub async fn run(
                     .any(|r| r["trackId"] == state.track_id)
             });
         run.set_hold(Hold::Report, report_waiting);
-        if report_observations == 0 && snapshot["sequence"].as_i64().unwrap_or(0) >= report_barrier
-        {
-            for report in snapshot["reports"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|r| r["trackId"] == state.track_id)
-            {
-                let report: crate::reports::Report = serde_json::from_value(report.clone())?;
-                if report_analyses.insert((report.id.clone(), report.revision)) {
-                    let journal = journal.clone();
-                    let editor = context.editor.clone();
-                    let tx = tx.clone();
-                    jobs.spawn(async move {
-                        let analysis = crate::reports::analyze(&report, &editor).await;
-                        let result = journal
-                            .analyze_report(report.id.clone(), report.revision, analysis)
-                            .await;
-                        let _ = tx.send(Work::ReportAnalyzed {
-                            id: report.id,
-                            revision: report.revision,
-                            result,
-                        });
-                    });
-                }
-            }
-        }
         if state.active_turn.is_none()
             && input.is_none()
             && !state.checkpoint_pending
@@ -1031,7 +1021,7 @@ pub async fn run(
                         .into_iter()
                         .flatten()
                         .find(|word| {
-                            word["id"] == q["replyUtteranceId"] && word["state"] == "placed"
+                            word["id"] == q["replyUtteranceId"] && word["state"] == "placed" && word["editHold"].is_null()
                         })
                 });
             let candidate = reply_candidate.or_else(|| {
@@ -1044,11 +1034,12 @@ pub async fn run(
                         .into_iter()
                         .flatten()
                         .filter(|word| {
-                            word["state"] == "placed"
+                            word["state"] == "placed" && word["editHold"].is_null()
                                 && word["decision"]["trackId"] == state.track_id
                                 && ["fork", "extend", "schedule", "trim"]
                                     .contains(&word["decision"]["kind"].as_str().unwrap_or(""))
                                 && (word["decision"]["boundary"] != "when-told" || manual)
+                                && (word["startCondition"].is_null() || word["startCondition"]["ready"] == true)
                         })
                         .min_by_key(|word| (u8::from(word["decision"]["kind"] != "trim"), u8::from(secret_resume != Some(&word["id"]))))
                 } else {
@@ -1106,25 +1097,13 @@ pub async fn run(
                     let attachment_session = session.clone();
                     jobs.spawn(async move {
                         let result = async {
-                            let (instructions, workspace) = tokio::task::spawn_blocking(move || -> Result<_> {
-                                let workspace = path.canonicalize()?;
-                                Ok((crate::instructions::Instructions::capture(&workspace)?, workspace))
-                            })
-                            .await??;
-                            let mut params = params;
-                            params["workspaceRoots"] = serde_json::json!([workspace]);
-                            params["input"][0]["arguments"] = instructions
-                                .with_request(params["input"][0]["arguments"].as_str().unwrap())?
-                                .into();
-                            let references=journal.materialize_input_attachments(id.clone(),track.clone(),attachment_session,workspace).await?;
-                            if references.directory.is_some() {
-                                let text=params["input"][0]["arguments"].as_str().unwrap();
-                                params["input"][0]["arguments"]=format!("{text}\n\nAttached references are data for the request. For reference paths from earlier turns, use the current directory below with the same leaf filename instead of the previous workspace path:\n{}",serde_json::to_string(&references)?).into();
-                            }
+                            let prepared = journal
+                                .prepare_turn(id.clone(), track.clone(), attachment_session, path, params)
+                                .await?;
                             journal
-                                .reserve_turn(operation, id, revision, track, params.clone())
+                                .reserve_turn(operation, id, revision, track, prepared.params().clone())
                                 .await
-                                .map(|admission| (admission, params))
+                                .map(|admission| (admission, prepared))
                         }
                         .await;
                         // The exact admitted prompt comes back before it can be sent.
@@ -1206,6 +1185,24 @@ pub async fn run(
                     }
                 },
                 Some(Command::Retry{reply,..})=>{let _=reply.send(Err("The worker is already connected.".into()));},
+                Some(Command::StopOrigin{id,session:expected,turn,reply})=>{
+                    if expected!=session || state.active_turn!=Some(turn) {
+                        let _=reply.send(Err("The worker has moved on from this request's turn.".into()));
+                        continue;
+                    }
+                    context.port.mark_stop(StopTarget::Turn(Some(turn)),false);
+                    let cancelled={let mut pending=context.port.pending_secret.lock().unwrap();
+                        if pending.as_ref().is_some_and(|pending|pending.target.session_id==session && pending.target.turn_id==turn){pending.take()}else{None}};
+                    if let Some(cancelled)=cancelled {
+                        let journal=journal.clone();let tx=tx.clone();
+                        jobs.spawn(async move{let _=tx.send(Work::Persisted(journal.secret_failed(cancelled.target.op_id).await));});pending_writes+=1;
+                    }
+                    let _=run.stop();state.phase="stopping".into();
+                    write_state(jobs,journal,state,&tx)?;pending_writes+=1;
+                    let journal=journal.clone();let tx=tx.clone();let track=state.track_id.clone();
+                    jobs.spawn(async move{let _=tx.send(Work::Persisted(journal.append("worker.stop",serde_json::json!({"opId":id,"trackId":track,"sessionId":expected,"turnId":turn})).await.map(|_|())));});pending_writes+=1;
+                    let _=reply.send(Ok(()));
+                },
                 Some(Command::Stop{id,target,generation})=>{
                     let cancelled=context.port.pending_secret.lock().unwrap().take();
                     if let Some(cancelled)=cancelled {
@@ -1237,15 +1234,32 @@ pub async fn run(
                     let journal=journal.clone();let tx=tx.clone();let track=state.track_id.clone();
                     jobs.spawn(async move{let result=journal.intent(&id.to_string(),"worker.start",serde_json::json!({"trackId":track})).await;let _=tx.send(Work::Release{result,id,generation,reply});});
                 },
-                Some(Command::Answer{id,approval,requirement,allow,reply})=>{
+                Some(Command::Answer{id,approval,requirement,response,reply})=>{
                     if approval_stages.is_decided(&approval,&requirement) { let _=reply.send(Err("The previous answer is still awaiting host confirmation.".into()));continue; }
                     let request=approval_stages.get(&approval).filter(|request|request["currentRequirementId"]==requirement);
                     if redirecting || context.port.stopped.load(Ordering::Acquire)||request.is_none(){let _=reply.send(Err(std::io::Error::other("Approval is no longer actionable.").into()));continue;}
                     let request=request.unwrap();
+                    let allow=matches!(response,crate::approval::Response::Allow);
                     if allow && !state.approvals.iter().any(|card|card.id==approval && card.requirement==requirement && card.can_allow) {
                         let _=reply.send(Err(std::io::Error::other("This action cannot be allowed from this card.").into()));continue;
                     }
-                    let Some(choice)=offered(request,allow) else {let _=reply.send(Err(std::io::Error::other("Approval choice is unavailable.").into()));continue;};
+                    let prepared=match response.prepare(request) {Ok(prepared)=>prepared,Err(error)=>{let _=reply.send(Err(error));continue;}};
+                    let (choice,feedback)=match prepared {
+                        crate::approval::Prepared::Decision{choice,feedback}=>(choice,feedback),
+                        crate::approval::Prepared::Restart{text}=>{
+                            let Some(turn_id)=state.active_turn else {let _=reply.send(Err("The approval turn has already ended.".into()));continue;};
+                            if let Err(error)=client.interrupt_now(&session,Some(turn_id)) {let _=reply.send(Err(error));continue;}
+                            redirected.insert((Uuid::new_v5(&id,b"approval-reply").to_string(),1));
+                            saving_approval_reply=true;pending_approvals+=1;
+                            run.set_hold(Hold::Redirect,true);
+                            state.phase="stopping".into();state.detail=Some("Stopping before sending your reply.".into());
+                            write_state(jobs,journal,state,&tx)?;pending_writes+=1;
+                            let request=crate::approval_reply::Request{op_id:id,owner:crate::secret_input::Owner::Work,track_id:state.track_id.clone(),session_id:session.clone(),turn_id,approval_id:approval,requirement,text};
+                            let journal=journal.clone();let tx=tx.clone();
+                            jobs.spawn(async move {let result=journal.queue_approval_reply(request).await;let _=tx.send(Work::ApprovalReplySaved{result,reply});});
+                            continue;
+                        }
+                    };
                     let before=if allow&&crate::deletion::requested(request,path) {
                         let Some(workspace)=snapshot["workspaces"].as_array().into_iter().flatten().find(|w|w["trackId"]==state.track_id).cloned() else {let _=reply.send(Err("Worker workspace is unavailable.".into()));continue;};
                         let workspace:crate::preparation::Workspace=serde_json::from_value(workspace)?;
@@ -1253,11 +1267,16 @@ pub async fn run(
                         Some(BeforeDelete::Fresh{workspace:Box::new(workspace),request:request.clone(),parent})
                     }else{None};
                     if !approval_stages.begin(&approval,&requirement) {let _=reply.send(Err("The approval was already answered.".into()));continue;}
-                    pending_approvals+=1;persist_answer(jobs, journal,&tx,serde_json::json!({"commandId":id,"sessionId":session,"approvalId":approval,"requirementId":requirement,"choiceId":choice}),Some(reply),before);
+                    pending_approvals+=1;persist_answer(jobs, journal,&tx,serde_json::json!({"commandId":id,"sessionId":session,"approvalId":approval,"requirementId":requirement,"choiceId":choice,"feedback":feedback,"response":response,"scope":crate::secret_input::Owner::Work.key(&state.track_id)}),Some(reply),before);
                 },
                 None=>return Err(std::io::Error::other("Worker controls closed.").into()),
             },
             work=rx.recv()=>match work.unwrap() {
+                Work::ApprovalReplySaved{result,reply}=>{
+                    saving_approval_reply=false;pending_approvals=pending_approvals.saturating_sub(1);dirty=true;
+                    if result.is_err() {context.port.hold_starts();}
+                    let _=reply.send(result);
+                },
                 Work::SecretAccepted{install,result,reply}=>{
                     preparing_secret=None;pending_writes=pending_writes.saturating_sub(1);
                     if let Err(error)=result {
@@ -1293,16 +1312,15 @@ pub async fn run(
                     let (verdict,deletion)=(*result)?;
                     let id=request["approvalId"].as_str().unwrap().to_owned();
                     if redirecting || context.port.stopped.load(Ordering::Acquire) || !approval_stages.current(&request) {continue;}
-                    let review=verdict.review.or_else(||offered(&request,true).is_none().then(||crate::policy::Reason{kind:"unknown".into(),message:"The worker did not offer a one-time approval. Review or stop this action.".into()}));
+                    let review=verdict.review.or_else(||crate::approval::offered(&request,true).is_none().then(||crate::policy::Reason{kind:"unknown".into(),message:"The worker did not offer a one-time approval. Review or stop this action.".into()}));
                     if let Some(reason)=review {
                         let subject=request["subject"]["command"].as_str().map(str::to_owned).unwrap_or_else(||request["subject"].to_string());
                         state.approvals.retain(|card|card.id!=id);
-                        state.approvals.push(Approval{id,requirement:request["currentRequirementId"].clone(),subject,reason,can_allow:verdict.allow_once&&offered(&request,true).is_some(),can_deny:offered(&request,false).is_some(),deletion:deletion.as_ref().map(|s|s.summary())});
+                        state.approvals.push(Approval{id,requirement:request["currentRequirementId"].clone(),subject,reason,can_allow:verdict.allow_once&&crate::approval::offered(&request,true).is_some(),can_deny:crate::approval::offered(&request,false).is_some(),reply_mode:Some(crate::approval::reply_mode(&request)),deletion:deletion.as_ref().map(|s|s.summary())});
                         state.phase="approval".into();write_state(jobs, journal,state,&tx)?;pending_writes+=1;
-                    }else if let Some(choice)=offered(&request,true) && approval_stages.begin(&id,&request["currentRequirementId"]){pending_approvals+=1;persist_answer(jobs, journal,&tx,serde_json::json!({"commandId":Uuid::now_v7(),"sessionId":session,"approvalId":id,"requirementId":request["currentRequirementId"],"choiceId":choice}),None,deletion.as_ref().map(|s|BeforeDelete::Saved(s.id)));}
+                    }else if let Some(choice)=crate::approval::offered(&request,true) && approval_stages.begin(&id,&request["currentRequirementId"]){pending_approvals+=1;persist_answer(jobs, journal,&tx,serde_json::json!({"commandId":Uuid::now_v7(),"sessionId":session,"approvalId":id,"requirementId":request["currentRequirementId"],"choiceId":choice}),None,deletion.as_ref().map(|s|BeforeDelete::Saved(s.id)));}
                 },
                 Work::ReportObserved(result)=>{report_observations=report_observations.saturating_sub(1);report_barrier=report_barrier.max(result?.sequence);dirty=true;},
-                Work::ReportAnalyzed{id,revision,result}=>{report_analyses.remove(&(id,revision));report_barrier=report_barrier.max(result?);dirty=true;},
                 Work::PromptSaved{result,method,params,reply}=>{
                     match result {
                         Err(error)=>{let _=reply.send(Err(error));return Err(std::io::Error::other("The question answer could not be saved.").into());},
@@ -1339,11 +1357,21 @@ pub async fn run(
                     snapshot=value;snapshot_busy=false;
                 },
                 Work::Reserved(result,params)=>{
-                    if let Some(params)=params{input.as_mut().unwrap().params=params;}
+                    if let Some(prepared)=&params{input.as_mut().unwrap().params=prepared.params().clone();}
                     let current=input.as_ref().unwrap();
                     match result {
                         Ok(Admission::New) if !current.invalidated&&!context.port.stopped.load(Ordering::Acquire)&&context.editor.status().model_loaded&&run.start_persisted(current.operation)==Some(Effect::SendStart(current.operation))=>{
-                            let client=client.clone();let tx=tx.clone();let params=current.params.clone();let guard=context.port.start_guard();jobs.spawn(async move{let result=match guard {Some(guard)=>client.start(params,guard).await,None=>Err(crate::msp::StartCancelled.into())};let _=tx.send(Work::Started(result));});
+                            let client = client.clone();
+                            let tx = tx.clone();
+                            let prepared = params.ok_or("The start has no screened request.")?;
+                            let guard = context.port.start_guard();
+                            jobs.spawn(async move {
+                                let result = match guard {
+                                    Some(guard) => client.start(prepared, guard).await,
+                                    None => Err(crate::msp::StartCancelled.into()),
+                                };
+                                let _ = tx.send(Work::Started(result));
+                            });
                             input.as_mut().unwrap().sent=true;
                         },
                         Ok(Admission::New)=>{
@@ -1351,7 +1379,21 @@ pub async fn run(
                         },
                         Ok(_)=>return Err(std::io::Error::other("A turn start was already admitted; recovery is required.").into()),
                         Err(error) if error.is::<crate::journal::StartSuperseded>()=>{run.start_failed(current.operation);input=None;*permit=None;dirty=true;state.phase="ready".into();write_state(jobs, journal,state,&tx)?;pending_writes+=1;},
-                        Err(_)=>{run.start_failed(current.operation);input=None;*permit=None;run.set_hold(Hold::Log,true);dirty=true;state.phase="held".into();state.detail=Some("Request changed or could not be recorded. Review it before starting again.".into());write_state(jobs, journal,state,&tx)?;pending_writes+=1;},
+                        Err(error) => {
+                            run.start_failed(current.operation);
+                            input = None;
+                            *permit = None;
+                            run.set_hold(Hold::Log, true);
+                            dirty = true;
+                            state.phase = "held".into();
+                            state.detail = Some(if error.is::<crate::attachment_screening::ReviewRequired>() {
+                                "Pasted references need screening. Open Reference screening, then Start.".into()
+                            } else {
+                                "Request changed or could not be recorded. Review it before starting again.".into()
+                            });
+                            write_state(jobs, journal, state, &tx)?;
+                            pending_writes += 1;
+                        },
                     }
                 },
                 Work::Started(result)=>{
@@ -1402,7 +1444,7 @@ pub async fn run(
                         pending_writes+=1;
                         continue;
                     }
-                    let client=client.clone();let tx=tx.clone();jobs.spawn(async move{let result=client.request("approval/decide",params.clone()).await;let _=tx.send(Work::ApprovalDone{result,params,reply});});
+                    let client=client.clone();let tx=tx.clone();let journal=journal.clone();jobs.spawn(async move{let result=async {let screened=journal.screen_start(crate::approval::wire_params(&params)).await?;client.decide(screened).await}.await;let _=tx.send(Work::ApprovalDone{result,params,reply});});
                 },
                 Work::ApprovalDone{result,params,reply}=>{
                     pending_approvals=pending_approvals.saturating_sub(1);
@@ -1608,6 +1650,13 @@ mod continuity_tests {
         let (port, _commands) = Port::new(std::sync::Arc::new(crate::dispatch_control::Gate::new(
             false,
         )));
+        let root = tempfile::tempdir().unwrap();
+        let journal = crate::journal::Journal::open(
+            root.path().join("db"),
+            crate::secrets::Key::new([7; 32]),
+        )
+        .await
+        .unwrap();
         let generation = port.stop_generation.load(Ordering::Acquire);
         let old = port.start_guard().unwrap();
         port.hold_starts();
@@ -1620,7 +1669,13 @@ mod continuity_tests {
         assert!(
             connection
                 .client
-                .start(serde_json::json!({"commandId":"old"}), old)
+                .start(
+                    journal
+                        .screen_start(serde_json::json!({"commandId":"old"}))
+                        .await
+                        .unwrap(),
+                    old
+                )
                 .await
                 .unwrap_err()
                 .is::<crate::msp::StartCancelled>()
@@ -1628,7 +1683,13 @@ mod continuity_tests {
         let client = connection.client.clone();
         let submitted = tokio::spawn(async move {
             client
-                .start(serde_json::json!({"commandId":"new"}), fresh)
+                .start(
+                    journal
+                        .screen_start(serde_json::json!({"commandId":"new"}))
+                        .await
+                        .unwrap(),
+                    fresh,
+                )
                 .await
         });
         let mut requests = BufReader::new(requests);
@@ -1792,6 +1853,148 @@ mod continuity_tests {
         continuity.settle().await?;
         Ok(())
     }
+    #[tokio::test]
+    async fn origin_stop_checks_actor_identity_before_holding_and_targets_only_the_original_turn()
+    -> Result<()> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        for current_matches in [false, true] {
+            let root = tempfile::tempdir()?;
+            let journal = crate::journal::Journal::open(
+                root.path().join("db"),
+                crate::secrets::Key::new([7; 32]),
+            )
+            .await?;
+            let (read, responses) = tokio::io::duplex(4096);
+            let (write, requests) = tokio::io::duplex(4096);
+            let mut connection = crate::msp::Connection::new(read, write);
+            let (port, commands) = Port::new(Arc::new(crate::dispatch_control::Gate::new(false)));
+            port.attach(connection.client.clone(), "session".into());
+            let original = Uuid::now_v7();
+            let active = if current_matches {
+                original
+            } else {
+                Uuid::now_v7()
+            };
+            let mut context = Context {
+                project_secrets: crate::project_secrets::Store::default(),
+                port: port.clone(),
+                commands,
+                editor: crate::editor::Manager::new(root.path(), &root.path().join("editor.log"))?,
+                capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+            };
+            let mut state = crate::runtime::WorkerState {
+                track_id: "track".into(),
+                phase: "working".into(),
+                session_id: Some("session".into()),
+                secret_revision: None,
+                identity: None,
+                detail: None,
+                active_turn: Some(active),
+                approvals: vec![],
+                output: None,
+                checkpoint_pending: false,
+                checkpoint: None,
+                prompts: vec![],
+            };
+            let identity = crate::process::identity(std::process::id())?;
+            let tracker = Arc::new(Mutex::new(crate::process::Tracker::new(
+                "origin-stop-test".into(),
+                identity,
+            )?));
+            let (_stop, mut stopping) = tokio::sync::watch::channel(false);
+            let mut continuity = Continuity::default();
+            let controller = async {
+                let result = port.stop_origin(Uuid::now_v7(), "session", original).await;
+                let held = port.locally_held();
+                let mut requests = BufReader::new(requests);
+                let mut line = String::new();
+                requests.read_line(&mut line).await?;
+                let packet: Value = serde_json::from_str(&line)?;
+                assert_eq!(packet["method"], "turn/interrupt");
+                assert_eq!(packet["params"]["sessionId"], "session");
+                assert_eq!(packet["params"]["turnId"], original.to_string());
+                assert_eq!(result.is_ok(), current_matches);
+                assert_eq!(held, current_matches);
+                drop(responses);
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+            };
+            let runner = run(
+                WorkerIo {
+                    connection: &mut connection,
+                    tracker,
+                    identity,
+                    recovery: None,
+                    continuity: &mut continuity,
+                },
+                &journal,
+                root.path(),
+                &mut state,
+                &mut context,
+                &mut stopping,
+            );
+            let (_, controlled) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(runner, controller)
+            })
+            .await?;
+            controlled?;
+            continuity.settle().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn origin_stop_reaches_msp_before_the_actor_can_consume_its_control() -> Result<()> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (read, _responses) = tokio::io::duplex(4096);
+        let (write, requests) = tokio::io::duplex(4096);
+        let connection = crate::msp::Connection::new(read, write);
+        let (port, mut commands) = Port::new(Arc::new(crate::dispatch_control::Gate::new(false)));
+        port.attach(connection.client.clone(), "original-session".into());
+        let original = Uuid::now_v7();
+        let caller = port.clone();
+        let pending = tokio::spawn(async move {
+            caller
+                .stop_origin(Uuid::now_v7(), "original-session", original)
+                .await
+        });
+        let mut requests = BufReader::new(requests);
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            requests.read_line(&mut line),
+        )
+        .await??;
+        let packet: Value = serde_json::from_str(&line)?;
+        assert_eq!(packet["params"]["sessionId"], "original-session");
+        assert_eq!(packet["params"]["turnId"], original.to_string());
+        assert!(!port.locally_held());
+        match commands.recv().await.unwrap() {
+            Command::StopOrigin { reply, .. } => {
+                let _ = reply.send(Err("The worker moved on.".into()));
+            }
+            _ => panic!("unexpected control"),
+        }
+        assert!(pending.await?.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn origin_stop_rejects_a_replaced_session_without_local_side_effects() -> Result<()> {
+        let (read, _responses) = tokio::io::duplex(4096);
+        let (write, _requests) = tokio::io::duplex(4096);
+        let connection = crate::msp::Connection::new(read, write);
+        let (port, _commands) = Port::new(Arc::new(crate::dispatch_control::Gate::new(false)));
+        port.attach(connection.client.clone(), "replacement-session".into());
+        assert!(
+            port.stop_origin(Uuid::now_v7(), "original-session", Uuid::now_v7())
+                .await
+                .is_err()
+        );
+        assert!(!port.locally_held());
+        assert_eq!(port.stop_generation.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
     #[test]
     fn new_input_resumes_only_its_saved_local_hold_and_never_a_newer_stop() {
         let gate = Arc::new(crate::dispatch_control::Gate::new(false));

@@ -1,4 +1,5 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, MenuItem, net, protocol, session, shell } from 'electron';
+import { privacyPreview, privacyText } from './privacy.mjs';
+import { app, BrowserWindow, dialog, ipcMain, Menu, MenuItem, net, powerMonitor, protocol, session, shell } from 'electron';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { connectDaemon, operationId, uiToken } from './daemon.mjs';
@@ -10,6 +11,9 @@ import { rebuildProjectFingerprints, reviewBackup, applyBackup } from './fingerp
 import { changeProjectSecret, synchronizeProjectSecrets, projectSecretSettings, projectSecretIssue } from './project-secrets.mjs';
 import { reviewExternal, confirmExternal } from './external-content.mjs';
 import { quitController } from './quit.mjs';
+import { draftStore } from './drafts.mjs';
+import { pastedTextStore } from './pasted-text.mjs';
+import { editorPresentation } from './editor-presentation.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const assets = path.join(root, 'dist');
@@ -20,6 +24,9 @@ app.setName('Intercat');
 const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) app.quit();
 const preview = process.argv.includes('--preview');
+const presentation = editorPresentation({ directory: app.getPath('userData') });
+const drafts = draftStore(connection);
+const pastedText = pastedTextStore({ directory: path.join(app.getPath('userData'), 'pasted-text'), client: connection });
 let daemon;
 let blockedConnection;
 function connection() {
@@ -40,6 +47,40 @@ function authorize(event) {
   const url = new URL(event.senderFrame?.url ?? 'about:blank');
   if (event.senderFrame !== event.sender.mainFrame || url.protocol !== 'intercat:' || url.host !== 'app') throw new Error('Untrusted IPC sender');
 }
+const windowOwners = new Map();
+const viewRevisions = new Map();
+async function disconnectWindow(contents) {
+  const owner = windowOwners.get(contents.id);
+  if (!owner) return;
+  windowOwners.delete(contents.id);
+  const revision = (viewRevisions.get(owner) ?? 0) + 1;
+  viewRevisions.delete(owner);
+  try {
+    const client = daemon ? await daemon : null;
+    if (!client) return;
+    await Promise.allSettled([
+      client.request('utterance.edit', { owner, action: { kind: 'disconnect' } }),
+      client.request('timeline.observe', { owner, revision, view: null }),
+    ]);
+  }
+  catch { /* Observations expire, and interrupted edits become held. */ }
+}
+function windowOwner(contents) {
+  if (windowOwners.has(contents.id)) return windowOwners.get(contents.id);
+  const owner = operationId();
+  windowOwners.set(contents.id, owner);
+  const disconnected = () => {
+    if (windowOwners.get(contents.id) !== owner) return;
+    contents.off('destroyed', disconnected);
+    contents.off('render-process-gone', disconnected);
+    contents.off('did-start-navigation', disconnected);
+    void disconnectWindow(contents);
+  };
+  contents.once('destroyed', disconnected);
+  contents.once('render-process-gone', disconnected);
+  contents.once('did-start-navigation', disconnected);
+  return owner;
+}
 async function status() {
   if (preview) return { connected: false, mode: 'preview' };
   try { const client = await connection(); return { connected: true, ...(await client.request('system.status')), projectSecretIssue: projectSecretIssue(client) }; }
@@ -52,6 +93,21 @@ async function status() {
 ipcMain.handle('intercat:status', async event => {
   authorize(event);
   return status();
+});
+ipcMain.handle('intercat:drafts-read', async (event, session) => {
+  authorize(event);
+  if (preview) throw new Error('Draft storage is unavailable in preview.');
+  return drafts.read(session);
+});
+ipcMain.handle('intercat:drafts-write', async (event, request) => {
+  authorize(event);
+  if (preview) throw new Error('Draft storage is unavailable in preview.');
+  return drafts.write(request, event.sender.id);
+});
+ipcMain.handle('intercat:drafts-discard', async (event, session) => {
+  authorize(event);
+  if (preview) throw new Error('Draft storage is unavailable in preview.');
+  return drafts.discard(session, event.sender.id);
 });
 ipcMain.handle('intercat:external-review', async (event, request) => {
   authorize(event);
@@ -112,6 +168,13 @@ ipcMain.handle('intercat:pickup-cancel', async (event, request) => {
     || ![request.opId, request.recoveryId, request.trackId, request.sessionId].every(value => typeof value === 'string' && value.length <= 128)) throw new Error('Invalid cancellation request');
   return cancelFileRecovery(await connection(), request);
 });
+ipcMain.handle('intercat:branch-points', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'before,trackId'
+    || typeof request.trackId !== 'string' || !request.trackId.length || request.trackId.length > 128
+    || request.before !== null && (!Number.isSafeInteger(request.before) || request.before <= 0)) throw new Error('Invalid branch point query');
+  return (await connection()).request('branch.points', request);
+});
 ipcMain.handle('intercat:branch', async (event, request) => {
   authorize(event);
   if (preview || !request || Object.keys(request).sort().join(',') !== 'opId,parentTrackId,turnId'
@@ -134,17 +197,54 @@ for (const [channel, method, keys] of [
   ['repair-refresh', 'repair.refresh', 'jobId,opId,repairId,revision'],
   ['repair-control', 'repair.control', 'action,id,opId,revision'],
   ['repair-stop', 'repair.stop', 'id,opId'],
-  ['repair-answer', 'repair.answer', 'allow,approvalId,id,opId,requirement'],
+  ['repair-answer', 'repair.answer', 'approvalId,id,opId,requirement,response'],
   ['repair-respond', 'repair.respond', 'id,opId,promptId,response,revision'],
 ]) ipcMain.handle(`intercat:${channel}`, async (event, request) => {
   authorize(event);
   if (preview || !request || Object.keys(request).sort().join(',') !== keys || typeof request.opId !== 'string') throw new Error('Invalid repair request');
   return (await connection()).request(method, request);
 });
+ipcMain.handle('intercat:editor-log', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'before,trackId'
+    || typeof request.trackId !== 'string' || !request.trackId.length || request.trackId.length > 128
+    || request.before !== null && (!Number.isSafeInteger(request.before) || request.before <= 0)) throw new Error('Invalid Editor log query');
+  return (await connection()).request('editor.log', request);
+});
+ipcMain.handle('intercat:editor-presentation', event => {
+  authorize(event);
+  return presentation.read(event.sender.id);
+});
+ipcMain.handle('intercat:editor-character', (event, value) => {
+  authorize(event);
+  return presentation.setCharacter(value);
+});
+ipcMain.handle('intercat:editor-return-read', (event, id) => {
+  authorize(event);
+  if (typeof id !== 'string' || id.length > 128) throw new Error('Invalid Editor return');
+  presentation.acknowledge(event.sender.id, id);
+});
+ipcMain.handle('intercat:editor-away', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'before,from,to'
+    || !Number.isSafeInteger(request.from) || !Number.isSafeInteger(request.to) || request.from < 0 || request.to <= request.from
+    || request.before !== null && (!Number.isSafeInteger(request.before) || request.before <= 0)) throw new Error('Invalid Editor away query');
+  return (await connection()).request('editor.away', request);
+});
 ipcMain.handle('intercat:timeline-window', async (event, request) => {
   authorize(event);
   if (!request || Object.keys(request).sort().join(',') !== 'end,since,start,tracks' || !Array.isArray(request.tracks)) throw new Error('Invalid timeline window');
   return preview ? { revision: 0, reset: true, clips: [], removed: [] } : (await connection()).request('timeline.window', request);
+});
+ipcMain.handle('intercat:timeline-observe', async (event, view) => {
+  authorize(event);
+  if (view !== null && (!view || Object.keys(view).sort().join(',') !== 'repairRunId,trackId'
+      || typeof view.trackId !== 'string' || (view.repairRunId !== null && typeof view.repairRunId !== 'string'))) throw new Error('Invalid timeline observation');
+  if (preview) return null;
+  const owner = windowOwner(event.sender);
+  const revision = (viewRevisions.get(owner) ?? 0) + 1;
+  viewRevisions.set(owner, revision);
+  return (await connection()).request('timeline.observe', { owner, revision, view });
 });
 ipcMain.handle('intercat:output-flows', async event => {
   authorize(event);
@@ -166,6 +266,22 @@ ipcMain.handle('intercat:worker-secret', async (event, request) => {
 ipcMain.handle('intercat:operation-id', event => { authorize(event); return operationId(); });
 ipcMain.handle('intercat:project-secret-usage', async event => { authorize(event); return preview ? [] : (await connection()).request('secret.project.usage', {}); });
 ipcMain.handle('intercat:project-secret-settings', async event => { authorize(event); return projectSecretSettings(await connection()); });
+ipcMain.handle('intercat:check-environment', async event => {
+  authorize(event);
+  if (preview) return { selection: { revision: 0, file: null }, candidates: [], available: false };
+  return (await connection()).request('check-environment.get', {});
+});
+ipcMain.handle('intercat:check-environment-choose', async event => {
+  authorize(event);
+  const window = BrowserWindow.fromWebContents(event.sender);
+  const selected = await dialog.showOpenDialog(window, { title: 'Choose an untracked Check environment file', properties: ['openFile', 'showHiddenFiles'] });
+  return selected.canceled ? null : selected.filePaths[0] ?? null;
+});
+ipcMain.handle('intercat:check-environment-change', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'file,opId,revision' || (request.file !== null && typeof request.file !== 'string') || !Number.isSafeInteger(request.revision)) throw new Error('Invalid Check environment change.');
+  return (await connection()).request('check-environment.change', request);
+});
 ipcMain.handle('intercat:project-secret-retry', async event => {
   authorize(event); const client = await connection();
   await synchronizeProjectSecrets(client, operationId());
@@ -199,10 +315,67 @@ ipcMain.handle('intercat:stops', async (event, request) => {
   if (preview || !request || Object.keys(request).sort().join(',') !== 'opId,stops' || !['irreversible-only','every-approval'].includes(request.stops)) throw new Error('Invalid stops setting');
   return (await connection()).request('policy.stops', request);
 });
+ipcMain.handle('intercat:confirmation-change', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'action,opId,revision' || typeof request.opId !== 'string' || !Number.isSafeInteger(request.revision) || request.revision < 0) throw new Error('Invalid confirmation preference');
+  return (await connection()).request('confirmation.change', request);
+});
+ipcMain.handle('intercat:utterance-confirm', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'decisionId,opId,revision,utteranceId' || !['decisionId', 'opId', 'utteranceId'].every(key => typeof request[key] === 'string' && /^[0-9a-f-]{36}$/.test(request[key])) || !Number.isSafeInteger(request.revision) || request.revision < 1) throw new Error('Invalid interpretation confirmation');
+  return (await connection()).request('utterance.confirm', request);
+});
+function validOrigin(identity) {
+  return identity && Object.keys(identity).sort().join(',') === 'sessionId,turnId,utteranceId'
+    && ['turnId', 'utteranceId'].every(key => typeof identity[key] === 'string' && /^[0-9a-f-]{36}$/.test(identity[key]))
+    && typeof identity.sessionId === 'string' && identity.sessionId.length > 0 && identity.sessionId.length <= 512;
+}
+ipcMain.handle('intercat:utterance-origin', async (event, utteranceId) => {
+  authorize(event);
+  if (preview || typeof utteranceId !== 'string' || !/^[0-9a-f-]{36}$/.test(utteranceId)) throw new Error('Invalid request');
+  return (await connection()).request('utterance.origin', { utteranceId });
+});
+ipcMain.handle('intercat:utterance-changes', async (event, identity) => {
+  authorize(event);
+  if (preview || !validOrigin(identity)) throw new Error('Invalid request turn');
+  return (await connection()).request('utterance.changes', identity);
+});
+ipcMain.handle('intercat:utterance-diff', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'checkpoint,identity,path' || !validOrigin(request.identity)
+    || typeof request.checkpoint !== 'string' || typeof request.path !== 'string') throw new Error('Invalid saved changes');
+  return (await connection()).request('utterance.diff', request);
+});
+ipcMain.handle('intercat:utterance-stop', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'identity,opId,trackId' || !validOrigin(request.identity)
+    || typeof request.opId !== 'string' || typeof request.trackId !== 'string') throw new Error('Invalid request stop');
+  return (await connection()).request('utterance.stop', request);
+});
+ipcMain.handle('intercat:utterance-misread', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'opId,revision,utteranceId'
+    || typeof request.opId !== 'string' || typeof request.utteranceId !== 'string' || !Number.isSafeInteger(request.revision)) throw new Error('Invalid correction');
+  return (await connection()).request('utterance.misread', request);
+});
+ipcMain.handle('intercat:utterance-read', async (event, utteranceId) => {
+  authorize(event);
+  if (preview || typeof utteranceId !== 'string' || !/^[0-9a-f-]{36}$/.test(utteranceId)) throw new Error('Invalid request');
+  return (await connection()).request('utterance.read', { utteranceId });
+});
 ipcMain.handle('intercat:clip-detail', async (event, clipId) => {
   authorize(event);
   if (preview || typeof clipId !== 'string' || !/^[0-9a-f-]{36}$/.test(clipId)) throw new Error('Invalid step');
   return (await connection()).request('timeline.detail', { clipId });
+});
+ipcMain.handle('intercat:proposal-answer', async (event, request) => {
+  authorize(event);
+  if (preview) throw new Error('Proposals are unavailable in preview.');
+  return (await connection()).request('proposal.respond', request);
+});
+ipcMain.handle('intercat:assumption-answer', async (event, request) => {
+  authorize(event);
+  return (await connection()).request('assumption.respond', request);
 });
 ipcMain.handle('intercat:report-response', async (event, request) => {
   authorize(event);
@@ -251,7 +424,7 @@ ipcMain.handle('intercat:worker-retry', async (event, request) => {
 for (const action of ['start', 'stop', 'hold', 'answer', 'respond']) {
   ipcMain.handle(`intercat:worker-${action}`, async (event, request) => {
     authorize(event);
-    const keys = action === 'answer' ? 'allow,approvalId,opId,requirement,trackId' : action === 'respond' ? 'opId,promptId,response,revision,trackId' : action === 'stop' ? 'opId,trackId,turnId' : 'opId,trackId';
+    const keys = action === 'answer' ? 'approvalId,opId,requirement,response,trackId' : action === 'respond' ? 'opId,promptId,response,revision,trackId' : action === 'stop' ? 'opId,trackId,turnId' : 'opId,trackId';
     if (preview || !request || Object.keys(request).sort().join(',') !== keys || typeof request.trackId !== 'string' || typeof request.opId !== 'string') throw new Error('Invalid request');
     if (action === 'stop' && request.turnId !== null && (typeof request.turnId !== 'string' || !/^[a-f0-9-]{36}$/.test(request.turnId))) throw new Error('Invalid turn');
     return (await connection()).request(`worker.${action}`, request);
@@ -269,10 +442,67 @@ ipcMain.handle('intercat:attach-reference', async (event, reselect) => {
   if (preview || typeof reselect !== 'boolean') throw new Error('Connect a project to attach a reference.');
   return importReference(reselect);
 });
+ipcMain.handle('intercat:attach-dropped-reference', async (event, selectedPath) => {
+  authorize(event);
+  if (preview || typeof selectedPath !== 'string' || selectedPath.length > 4096 || !path.isAbsolute(selectedPath)) throw new Error('Drop a file from your computer.');
+  return importReference(false, selectedPath);
+});
+ipcMain.handle('intercat:privacy-change', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'mode,opId,revision' || !['basic','full'].includes(request.mode) || typeof request.opId !== 'string' || !Number.isSafeInteger(request.revision) || request.revision < 0) throw new Error('Invalid privacy setting');
+  return (await connection()).request('privacy.change', request);
+});
+ipcMain.handle('intercat:privacy-preview', async (event, texts) => {
+  authorize(event);
+  if (preview) throw new Error('Privacy preview is unavailable in preview mode.');
+  return privacyPreview({ directory: path.join(app.getPath('userData'), 'daemon', 'privacy-previews'), client: connection, texts });
+});
+ipcMain.handle('intercat:privacy-original', async (event, id) => {
+  authorize(event);
+  if (preview || !Number.isSafeInteger(id) || id <= 0) throw new Error('Invalid privacy value.');
+  return privacyText((await (await connection()).request('privacy.original', { id })).textBase64);
+});
+ipcMain.handle('intercat:paste-stage', async (event, request) => {
+  authorize(event);
+  if (preview) throw new Error('Connect a project to paste a reference.');
+  return pastedText.stage(request);
+});
+ipcMain.handle('intercat:paste-finish', async (event, id) => {
+  authorize(event);
+  if (preview) throw new Error('Connect a project to paste a reference.');
+  return pastedText.finish(id);
+});
+ipcMain.handle('intercat:paste-read', async (event, id) => {
+  authorize(event);
+  if (preview) throw new Error('Connect a project to read a reference.');
+  return pastedText.read(id);
+});
+ipcMain.handle('intercat:paste-refresh', async (event, request) => {
+  authorize(event);
+  if (preview) throw new Error('Connect a project to screen a reference.');
+  return pastedText.refresh(request);
+});
+ipcMain.handle('intercat:paste-list', async (event, request) => {
+  authorize(event);
+  if (preview) throw new Error('Connect a project to list references.');
+  return pastedText.references(request);
+});
 ipcMain.handle('intercat:stage', async (event, request) => {
   authorize(event);
-  if (preview || !request || Object.keys(request).sort().join(',') !== 'attachmentIds,opId,selectedTrackId,target,text' || !Array.isArray(request.attachmentIds) || request.attachmentIds.length > 128 || request.attachmentIds.some(id => typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) || typeof request.text !== 'string' || !request.text.trim() || Buffer.byteLength(request.text) > 32 * 1024 || typeof request.opId !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(request.opId)) throw new Error('Invalid request');
+  const keys = request && Object.keys(request).filter(key => key !== 'sources').sort().join(',');
+  if (preview || !request || keys !== 'attachmentIds,opId,selectedTrackId,target,text' || (request.sources !== undefined && (!Array.isArray(request.sources) || request.sources.length > 128)) || !Array.isArray(request.attachmentIds) || request.attachmentIds.length > 128 || request.attachmentIds.some(id => typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) || typeof request.text !== 'string' || (!request.text.trim() && !request.sources?.length) || Buffer.byteLength(request.text) > 32 * 1024 || typeof request.opId !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(request.opId)) throw new Error('Invalid request');
   return (await connection()).request('utterance.create', request);
+});
+ipcMain.handle('intercat:history', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'action,opId') throw new Error('Invalid history action');
+  return { connected: true, ...await (await connection()).request('timeline.history', request) };
+});
+ipcMain.handle('intercat:native-history', (event, direction) => {
+  authorize(event);
+  if (direction === 'undo') event.sender.undo();
+  else if (direction === 'redo') event.sender.redo();
+  else throw new Error('Invalid text edit');
 });
 ipcMain.handle('intercat:cut', async (event, id) => {
   authorize(event);
@@ -284,10 +514,24 @@ ipcMain.handle('intercat:start-held', async (event, request) => {
   if (preview || !request || Object.keys(request).sort().join(',') !== 'opId,revision,utteranceId' || typeof request.opId !== 'string' || typeof request.utteranceId !== 'string' || !Number.isSafeInteger(request.revision) || request.revision < 1) throw new Error('Invalid held request');
   return (await connection()).request('utterance.start', request);
 });
+ipcMain.handle('intercat:rephrase', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'opId,revision,text,utteranceId') throw new Error('Invalid rephrased request');
+  return (await connection()).request('utterance.rephrase', request);
+});
 ipcMain.handle('intercat:resolve', async (event, request) => {
   authorize(event);
   if (preview || !request || Object.keys(request).sort().join(',') !== 'opId,resolution,revision,utteranceId' || typeof request.utteranceId !== 'string' || request.utteranceId.length > 64 || !Number.isSafeInteger(request.revision) || request.revision < 1) throw new Error('Invalid request');
   return (await connection()).request('utterance.resolve', request);
+});
+ipcMain.handle('intercat:edit-request', async (event, action) => {
+  authorize(event);
+  if (preview || !action || !['begin', 'renew', 'apply', 'end'].includes(action.kind)) throw new Error('Invalid request edit');
+  const contents = event.sender;
+  const owner = windowOwner(contents);
+  const client = await connection();
+  if (contents.isDestroyed() || windowOwners.get(contents.id) !== owner) throw new Error('The editing window closed.');
+  return client.request('utterance.edit', { owner, action });
 });
 ipcMain.handle('intercat:preparation-retry', async (event, opId) => {
   authorize(event);
@@ -297,6 +541,8 @@ ipcMain.handle('intercat:preparation-retry', async (event, opId) => {
 
 app.whenReady().then(() => {
   if (!singleInstance) return;
+  powerMonitor.on('lock-screen', () => presentation.lock(true));
+  powerMonitor.on('unlock-screen', () => presentation.lock(false));
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   session.defaultSession.setPermissionCheckHandler(() => false);
   protocol.handle('intercat', async (request) => {
@@ -315,7 +561,11 @@ app.whenReady().then(() => {
   } catch { return new Response(null, { status: 404 }); }
   });
   createWindow();
-  const menu = Menu.getApplicationMenu() ?? Menu.buildFromTemplate([{ role: 'appMenu' }, { role: 'editMenu' }, { role: 'viewMenu' }, { role: 'windowMenu' }]);
+  const standardEdit = Menu.buildFromTemplate([{ role: 'editMenu' }]).items[0].submenu.items;
+  const editItems = standardEdit.map(item => item.role === 'undo' || item.role === 'redo'
+    ? { id: `timeline-${item.role}`, label: item.label, accelerator: item.role === 'undo' ? 'CommandOrControl+Z' : 'Shift+CommandOrControl+Z', click: (_clicked, window) => { if (window instanceof BrowserWindow) window.webContents.send('intercat:history-shortcut', item.role); } }
+    : item);
+  const menu = Menu.buildFromTemplate([{ role: 'appMenu' }, { label: 'Edit', submenu: editItems }, { role: 'viewMenu' }, { role: 'windowMenu' }]);
   menu.append(new MenuItem({ label: 'Agents', submenu: [
     { label: 'Stop all turns', enabled: !preview, accelerator: 'Alt+Command+.', click: () => { void connection().then(client => client.request('system.pause', { opId: operationId(), paused: true })).catch(error => dialog.showErrorBox('Could not stop all turns', error.message)); } },
     { label: 'Stop all turns and processes…', enabled: !preview, click: () => { void quitting.stopProcesses().catch(error => dialog.showErrorBox('Could not stop processes', error.message)); } },
@@ -330,6 +580,19 @@ function createWindow() {
     width: 1440, height: 900, minWidth: 1040, minHeight: 720,
     backgroundColor: '#0c0d10', titleBarStyle: 'hiddenInset',
     webPreferences: { preload: path.join(root, 'electron/preload.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false, webSecurity: true, spellcheck: false },
+  });
+  presentation.attach(window, state => {
+    if (!window.webContents.isDestroyed()) window.webContents.send('intercat:editor-presentation-changed', state);
+  });
+  let closing = false;
+  let checkingDrafts = false;
+  window.on('close', event => {
+    if (closing) return;
+    event.preventDefault();
+    if (checkingDrafts) return;
+    checkingDrafts = true;
+    void Promise.all([drafts.flush(), pastedText.flush()]).then(() => disconnectWindow(window.webContents)).then(() => { closing = true; window.close(); })
+      .catch(error => { checkingDrafts = false; dialog.showErrorBox('Could not save drafts', error.message); });
   });
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', (event, url) => { if (!url.startsWith('intercat://app/')) event.preventDefault(); });

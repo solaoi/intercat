@@ -4,14 +4,25 @@ import argparse
 from concurrent.futures import TimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from uuid import UUID
 
 from .contract import DecisionRequest
 from .engine import Engine
 from .lifetime import watch_parent
-from .scheduler import Scheduler
+from .scheduler import PRIORITIES, Scheduler
 
 
 def create_server(scheduler, port=0):
+    def reading_identity(key, index):
+        if key is None and index is None:
+            return None
+        if not isinstance(key, str) or len(key) > 64 or isinstance(index, bool) or not isinstance(index, (int, str)):
+            raise ValueError("invalid reading identity")
+        index = int(index)
+        if not 1 <= index <= 2**63 - 1:
+            raise ValueError("invalid reading index")
+        return str(UUID(key)), index
+
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
             super().setup()
@@ -55,22 +66,56 @@ def create_server(scheduler, port=0):
             if not self.authorized():
                 self.reply(403, {"error": "loopback clients only"})
                 return
-            if self.path != "/decide":
+            if self.path not in {"/decide", "/tokens", "/generate", "/privacy", "/cancel-reading"}:
                 self.reply(404, {"error": "not found"})
                 return
             if not scheduler.ready.done() or scheduler.ready.exception() or scheduler.closed:
                 self.reply(503, {"error": "editor unavailable"})
                 return
             try:
+                priority = self.headers.get("X-Intercat-Priority", "input")
+                if priority not in PRIORITIES:
+                    raise ValueError("invalid inference priority")
+                timeout_ms = int(self.headers.get("X-Intercat-Timeout-Ms", "120000"))
+                if not 1 <= timeout_ms <= 120000:
+                    raise ValueError("timeout must be between 1 and 120000 milliseconds")
                 size = int(self.headers.get("Content-Length", "0"))
-                if not 0 < size <= 1024 * 1024:
-                    raise ValueError("request body must contain 1–1048576 bytes")
+                # The token probe must accept the complete 25 MiB request,
+                # including escapes in both the JSON tail and HTTP envelope.
+                limit = 176 * 1024 * 1024 if self.path == "/tokens" else 1024 * 1024
+                if not 0 < size <= limit:
+                    raise ValueError(f"request body must contain 1–{limit} bytes")
                 if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                     raise ValueError("Content-Type must be application/json")
                 value = json.loads(self.rfile.read(size))
-                request = DecisionRequest.parse(value)
-                future = scheduler.submit("decide", request)
-                if not future.started.wait(timeout=120):
+                if self.path == "/cancel-reading":
+                    if not isinstance(value, dict) or set(value) != {"input", "index"}:
+                        raise ValueError("invalid reading cancellation")
+                    identity = reading_identity(value["input"], value["index"])
+                    if identity is None:
+                        raise ValueError("missing reading identity")
+                    scheduler.cancel_reading(*identity)
+                    self.reply(200, {"cancelled": True})
+                    return
+                reading = reading_identity(self.headers.get("X-Intercat-Reading"), self.headers.get("X-Intercat-Reading-Index"))
+                if self.path == "/tokens":
+                    if not isinstance(value, dict) or set(value) != {"text"} or not isinstance(value["text"], str):
+                        raise ValueError("token counting requires a text string")
+                    future = scheduler.submit("tokens", value["text"], priority, timeout=timeout_ms / 1000, reading=reading)
+                elif self.path in {"/generate", "/privacy"}:
+                    if not isinstance(value, dict) or set(value) != {"prefix", "tail", "maxTokens"}:
+                        raise ValueError("generation requires prefix, tail and maxTokens")
+                    if any(not isinstance(value[field], str) for field in ("prefix", "tail")):
+                        raise ValueError("generation context must be text")
+                    if type(value["maxTokens"]) is not int or not 1 <= value["maxTokens"] <= 512:
+                        raise ValueError("generation requires 1–512 output tokens")
+                    suffix = "\nFindings:\n" if self.path == "/privacy" else "\nDescription:\n"
+                    payload = {"prompt": value["prefix"] + value["tail"] + suffix, "maxTokens": value["maxTokens"]}
+                    future = scheduler.submit("generate", payload, priority if self.path == "/privacy" else "background", timeout=timeout_ms / 1000, reading=reading)
+                else:
+                    request = DecisionRequest.parse(value)
+                    future = scheduler.submit("decide", request, priority, timeout=timeout_ms / 1000, reading=reading)
+                if not future.started.wait(timeout=timeout_ms / 1000):
                     future.cancel()
                     self.reply(504, {"error": "queue timed out"})
                     return

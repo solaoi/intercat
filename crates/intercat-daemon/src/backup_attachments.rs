@@ -86,18 +86,27 @@ fn inventory(store: &Store) -> Result<BTreeMap<String, Stamp>> {
 pub(crate) struct Originals {
     report: Review,
     records: BTreeMap<Uuid, Stored>,
-    digests: BTreeMap<Uuid, Vec<u8>>,
+    digests: BTreeMap<Uuid, Vec<Vec<u8>>>,
     pub material: Vec<u8>,
 }
-pub(crate) fn originals(store: &Store, records: &[Stored]) -> Result<Originals> {
+pub(crate) fn originals(
+    store: &Store,
+    records: &[Stored],
+    screenings: &[crate::attachment_screening::Revision],
+) -> Result<Originals> {
     if records.len() > LIMIT {
         return Err("Too many recorded originals to review.".into());
     }
     let before = inventory(store)?;
-    let known = records
+    let mut known = records
         .iter()
         .map(|s| s.attachment.id.to_string())
         .collect::<BTreeSet<_>>();
+    known.extend(
+        screenings
+            .iter()
+            .map(|revision| revision.copy.attachment.id.to_string()),
+    );
     let mut report = Review {
         originals: records.len(),
         complete: true,
@@ -124,10 +133,50 @@ pub(crate) fn originals(store: &Store, records: &[Stored]) -> Result<Originals> 
         }
         match store.load(id) {
             Ok((stored, bytes)) if &stored == expected => {
-                digests.insert(id, Sha256::digest(bytes).to_vec());
+                digests.insert(id, vec![Sha256::digest(bytes).to_vec()]);
             }
             _ => report.invalid_originals.push(id),
         }
+    }
+    let originals = records
+        .iter()
+        .map(|stored| (stored.attachment.id, stored))
+        .collect::<BTreeMap<_, _>>();
+    let mut checked = BTreeSet::new();
+    for revision in screenings {
+        let id = revision.original.attachment.id;
+        if !digests.contains_key(&id) || originals.get(&id).copied() != Some(&revision.original) {
+            report.invalid_originals.push(id);
+            continue;
+        }
+        let copy_id = revision.copy.attachment.id;
+        if copy_id == id {
+            continue;
+        }
+        if checked.insert(copy_id) {
+            total = total
+                .checked_add(before.get(&copy_id.to_string()).map_or(0, |value| value.4))
+                .ok_or("Attachment review size overflow.")?;
+            if total > BYTE_LIMIT {
+                return Err(
+                    "Private originals and screened copies exceed the review byte limit.".into(),
+                );
+            }
+        }
+        match store.load(copy_id) {
+            Ok((stored, bytes)) if stored == revision.copy => {
+                digests
+                    .get_mut(&id)
+                    .unwrap()
+                    .push(Sha256::digest(bytes).to_vec());
+            }
+            _ => report.invalid_originals.push(id),
+        }
+    }
+    report.invalid_originals.sort_unstable();
+    report.invalid_originals.dedup();
+    for id in &report.invalid_originals {
+        digests.remove(id);
     }
     if before != inventory(store)? {
         return Err("Private originals changed during review.".into());
@@ -137,7 +186,7 @@ pub(crate) fn originals(store: &Store, records: &[Stored]) -> Result<Originals> 
         && report.invalid_originals.is_empty()
         && report.unrecorded_originals.is_empty();
     Ok(Originals {
-        material: serde_json::to_vec(&(records, before))?,
+        material: serde_json::to_vec(&(records, screenings, before))?,
         records: records
             .iter()
             .map(|s| (s.attachment.id, s.clone()))
@@ -217,7 +266,7 @@ pub(crate) fn compare(
             path: Some(path.clone()),
             attachment_id: Some(id),
             state: match originals.digests.get(&id) {
-                Some(digest) if entry.matches(digest) => "matched",
+                Some(digests) if digests.iter().any(|digest| entry.matches(digest)) => "matched",
                 Some(_) => "changed",
                 None => "original-unverified",
             }
@@ -246,6 +295,57 @@ pub(crate) fn compare(
 pub(crate) struct Source {
     pub store: Store,
     pub records: Vec<Stored>,
+    pub screenings: Vec<crate::attachment_screening::Revision>,
     pub roots: Vec<String>,
     pub required: Vec<Uuid>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{attachment_screening::Revision, secrets::Key};
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+
+    #[test]
+    fn approved_copies_are_verified_with_their_original_and_corruption_is_rejected() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = Store {
+            root: root.path().join("attachments"),
+            key: Arc::new(Key::new([7; 32])),
+        };
+        let original = store.import_text(
+            Uuid::now_v7(),
+            &root.path().join("paste.txt"),
+            "Original private value",
+            "Original private value",
+        )?;
+        let copy = store.screened_copy(&original, "Original <secret:TOKEN>")?;
+        let revision = Revision {
+            original: original.clone(),
+            copy: copy.clone(),
+        };
+        let checked = originals(
+            &store,
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&revision),
+        )?;
+        assert!(checked.report.complete);
+        assert_eq!(checked.report.verified_originals, 1);
+        assert_eq!(checked.digests[&original.attachment.id].len(), 2);
+        let path = store.root.join(copy.attachment.id.to_string());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        fs::write(&path, "corrupt copy")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
+        let checked = originals(
+            &store,
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&revision),
+        )?;
+        assert!(!checked.report.complete);
+        assert_eq!(
+            checked.report.invalid_originals,
+            vec![original.attachment.id]
+        );
+        Ok(())
+    }
 }

@@ -408,7 +408,7 @@ pub fn change(db: &mut Connection, change: Change, key: &crate::secrets::Key) ->
                 params![recovery.request.track_id, serde_json::to_string(&current)?],
             )?;
             // Nothing may dispatch automatically after cancellation.
-            tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='File recovery was cancelled. This request remains held.' WHERE (json_extract(decision,'$.trackId')=?1 OR provisional=?1) AND state IN ('staged','reading','placed','starting','sent')",[&recovery.request.track_id])?;
+            tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='File recovery was cancelled. This request remains held.' WHERE (json_extract(decision,'$.trackId')=?1 OR provisional=?1) AND state IN ('staged','reading','placed','starting','sent') AND coalesce(json_extract(decision,'$.kind'),'')<>'park'",[&recovery.request.track_id])?;
             recovery.workspace.state = "ready".into();
             tx.execute(
                 "UPDATE workspaces SET record=?2 WHERE track_id=?1",
@@ -519,7 +519,7 @@ pub fn change(db: &mut Connection, change: Change, key: &crate::secrets::Key) ->
             let input = Uuid::new_v5(&id, b"pickup-handoff").to_string();
             // Inputs can arrive while the files are being captured. Keep them
             // for the user; the first dispatched input must be this handoff.
-            tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='File recovery must deliver its handoff first. This request remains held.' WHERE (json_extract(decision,'$.trackId')=?1 OR provisional=?1) AND state IN ('staged','reading','placed','starting','sent')",[&recovery.request.track_id])?;
+            tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='File recovery must deliver its handoff first. This request remains held.' WHERE (json_extract(decision,'$.trackId')=?1 OR provisional=?1) AND state IN ('staged','reading','placed','starting','sent') AND coalesce(json_extract(decision,'$.kind'),'')<>'park'",[&recovery.request.track_id])?;
             crate::report_store::retire_session(
                 &tx,
                 &recovery.request.track_id,

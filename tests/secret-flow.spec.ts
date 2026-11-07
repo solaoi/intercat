@@ -49,7 +49,7 @@ test('real UI provides a one-time secret through Keychain receipts and restarts 
       for (const card of worker?.approvals ?? []) {
         if (approved.has(card.id)) continue; approved.add(card.id);
         expect(['python3 verify_token.py', 'python verify_token.py', '/usr/bin/python3 verify_token.py']).toContain(card.subject);
-        await page.evaluate(async ({ worker, card }) => window.intercat.answerWorker({ opId: await window.intercat.createOperationId(), trackId: worker.trackId, approvalId: card.id, requirement: card.requirement, allow: true }), { worker: worker!, card });
+        await page.evaluate(async ({ worker, card }) => window.intercat.answerWorker({ opId: await window.intercat.createOperationId(), trackId: worker.trackId, approvalId: card.id, requirement: card.requirement, response: { action: 'allow' } }), { worker: worker!, card });
       }
       if (['failed', 'lost', 'needs-recovery'].includes(worker?.phase ?? '')) throw new Error(`Worker failed: ${worker?.detail}`);
       return await exists(path.join(workspace, 'verified.txt')) && worker?.activeTurn === null && worker?.checkpointPending === false && worker?.checkpoint?.turnId !== first.workers![0].checkpoint?.turnId;

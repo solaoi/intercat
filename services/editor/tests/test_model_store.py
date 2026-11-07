@@ -71,7 +71,16 @@ class ModelStoreTests(unittest.TestCase):
         self.assertEqual(outside.read_bytes(), b"private")
 
     def test_normal_completion_does_not_wait_for_the_lifetime_pipe(self):
-        code = "from unittest.mock import patch; import sys; from intercat_editor import model_store; sys.argv=['model_store','--root',sys.argv[1]]; patcher=patch.object(model_store,'install',lambda root,emit: None); patcher.start(); model_store.main()"
+        code = """from unittest.mock import patch
+import sys, types
+from intercat_editor import model_store
+sys.argv=['model_store','--root',sys.argv[1]]
+core=types.ModuleType('mlx.core')
+core.metal=types.SimpleNamespace(is_available=lambda: True)
+mlx=types.ModuleType('mlx'); mlx.core=core
+with patch.dict(sys.modules, {'mlx':mlx,'mlx.core':core,'mlx_lm':types.SimpleNamespace(load=lambda *_: None)}), patch.object(model_store.subprocess,'check_output',return_value=str(64*1024**3)), patch.object(model_store,'install',lambda root,emit: None):
+    model_store.main()
+"""
         process = subprocess.Popen([sys.executable, '-c', code, str(self.root)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             self.assertEqual(process.wait(timeout=5), 0, process.stderr.read().decode())

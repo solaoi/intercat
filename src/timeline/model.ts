@@ -1,3 +1,5 @@
+import type { ClipWarning, TrackCompletion } from '../bridge';
+
 export type TrackStatus = 'working' | 'waiting' | 'done' | 'stopped';
 export interface Clip {
   id: string;
@@ -7,6 +9,9 @@ export interface Clip {
   kind: 'read' | 'think' | 'edit' | 'shell';
   ordinal?: number;
   effectCount?: number;
+  assumptionCount?: number;
+  assumptionTimes?: number[];
+  warnings?: ClipWarning[];
   running?: boolean;
   generationEnd?: number | null;
   approximate?: boolean;
@@ -20,6 +25,8 @@ export interface Track {
   title: string;
   folder: string;
   status: TrackStatus;
+  completion?: TrackCompletion | null;
+  nextWaitsForAnswer?: boolean;
   color: number;
   clips: Clip[];
   planned: PlannedTurn[];
@@ -86,9 +93,9 @@ export function cutPlannedTurn(tracks: Track[], id: string): Track[] {
 
 export function geometry(width: number) {
   const laneWidth = Math.max(0, width - LABEL_WIDTH);
-  const futureCount = laneWidth >= 900 ? 2 : 1;
-  const tileWidth = 152;
-  const futureWidth = futureCount * (tileWidth + 8) + 16;
+  const futureCount = laneWidth < 49 ? 0 : laneWidth >= 900 ? 2 : 1;
+  const tileWidth = futureCount ? Math.min(152, (laneWidth - 17) / futureCount - 8) : 0;
+  const futureWidth = futureCount ? futureCount * (tileWidth + 8) + 16 : 0;
   return { laneWidth, futureCount, tileWidth, futureWidth, timeWidth: Math.max(1, laneWidth - futureWidth) };
 }
 

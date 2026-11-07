@@ -1,9 +1,10 @@
+import { mockDrafts } from './support/drafts';
 import { closeWindow } from './support/close';
 import { timelineClips } from './support/timeline';
 import { _electron as electron, expect, test, type ElectronApplication, type Page } from '@playwright/test';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -17,6 +18,7 @@ let evidenceDatabase: { source: string; target: string } | undefined;
 test.beforeEach(async () => {
   data = await mkdtemp(path.join(tmpdir(), 'intercat-commit-ui-'));
   app = await electron.launch({ args: ['.', '--preview', `--user-data-dir=${path.join(data, 'ui')}`], env: Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)) });
+  await mockDrafts(app);
   await app.firstWindow();
 });
 test.afterEach(async () => {
@@ -28,7 +30,7 @@ test.afterEach(async () => {
 
 function fixture(): IntegrationJob {
   const changes = [{ path: 'index.js', before: { object: 'b'.repeat(40), mode: 33188 }, after: { object: 'c'.repeat(40), mode: 33188 } }];
-  return { id: '01a1a200-0000-7000-8000-000000000001', revision: 1, status: 'checked', sessionName: 'Commit fixture', slug: 'commit-fixture', project: { name: 'Fixture', root: '/fixture', path: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'refs/heads/main' }, error: null,
+  return { assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0, id: '01a1a200-0000-7000-8000-000000000001', revision: 1, status: 'checked', sessionName: 'Commit fixture', slug: 'commit-fixture', project: { name: 'Fixture', root: '/fixture', path: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'refs/heads/main' }, error: null,
     tracks: [{ id: '01a1a200-0000-7000-8000-000000000002', label: 'A', title: 'Update the exported value', included: true, checkpointCount: 1, lastClip: null, checkpoint: { sha: 'c'.repeat(40) } }],
     plan: { targetRef: 'refs/heads/intercat/commit-fixture', tree: 'd'.repeat(40), rows: [{ track: '01a1a200-0000-7000-8000-000000000002', state: 'included', changes, conflicts: [] }] }, messages: {}, keptSecrets: [], contributions: {},
     candidate: { revision: 1, state: 'checked', generation: 1, head: 'e'.repeat(40), tree: 'd'.repeat(40), settingsHash: 'f'.repeat(64), commits: [{ track: '01a1a200-0000-7000-8000-000000000002', sha: 'e'.repeat(40), parent: 'a'.repeat(40), tree: 'd'.repeat(40), author: 'Worker A', message: 'Update the exported value\n\nIntercat: fixture/A@1\n', changes }], blockedCommit: null, secretScans: [], check: { command: 'npm test', code: 0, stdout: 'Check passed\n', stderr: '', truncated: false }, reason: null, failedTrack: null, hooksSkipped: false, dependencyRuns: [] } };
@@ -51,6 +53,11 @@ async function mock(job: IntegrationJob, loseKeep = false) {
       if (request.action.action === 'refresh') state.integration.contributions = {};
       if (request.action.action === 'editMessage') { state.integration.messages[request.action.track] = request.action.message; state.integration.revision++; state.integration.candidate!.head = '1'.repeat(40); }
       if (request.action.action === 'keepSecret') { state.integration.keptSecrets.push(request.action.finding); state.integration.revision++; state.integration.status = 'checked'; state.integration.candidate!.state = 'checked'; state.integration.candidate!.blockedCommit = null; }
+      if (request.action.action === 'retryAssumptions') { state.integration.assumptionsFailed = 0; state.integration.assumptionsPending = 1; state.integration.revision++; }
+      if (request.action.action === 'keepAssumption') {
+        const assumption = state.integration.assumptions.find(value => value.id === request.action.assumption)!;
+        assumption.state = 'kept'; assumption.revision++; state.integration.revision++;
+      }
       if (request.action.action === 'commit') state.integration.status = 'done';
       state.sequence++;
       replies.set(request.opId, structuredClone(state.integration));
@@ -120,6 +127,56 @@ async function selectDiffLine(page: Page) {
   await page.keyboard.press('Home');
   await page.keyboard.press('Shift+End');
   await expect(page.getByLabel('Commit context')).toContainText('index.js:1');
+}
+
+for (const mode of ['feedback', 'restart'] as const) for (const zoom of [1, 2]) {
+  test(`repair approval ${mode} retains its reply and owner at ${zoom * 100}%`, async () => {
+    const job = fixture(); job.status = 'failed'; job.candidate!.state = 'check-failed';
+    await mock(job); await repairHandlers();
+    const page = await app.firstWindow();
+    await page.getByRole('button', { name: 'Commit', exact: true }).click();
+    await page.getByRole('tab', { name: 'Check', exact: true }).click();
+    await page.getByRole('button', { name: 'Ask Worker A to fix', exact: true }).click();
+    await app.evaluate(({ ipcMain, BrowserWindow }, { mode, zoom }) => {
+      const memory = globalThis as typeof globalThis & { commitState: { repairRuns: RepairRun[]; sequence: number }; repairCalls: { method: string; request: Record<string, unknown> }[] };
+      const run = memory.commitState.repairRuns[0];
+      run.approvals = [{ id: 'repair-approval', requirement: { sourceIndex: 1 }, subject: 'git push origin main', reason: { kind: 'push', message: 'Review this repair step' }, canAllow: true, canDeny: true, replyMode: mode }];
+      memory.commitState.sequence++;
+      let attempts = 0;
+      ipcMain.removeHandler('intercat:repair-answer'); ipcMain.handle('intercat:repair-answer', (_event, request) => {
+        memory.repairCalls.push({ method: 'answer', request });
+        if (++attempts === 1) throw new Error('Lost repair acknowledgement');
+        run.approvals = []; memory.commitState.sequence++;
+      });
+      const window = BrowserWindow.getAllWindows()[0];
+      window.setSize(1040, 720); window.webContents.setZoomFactor(zoom);
+    }, { mode, zoom });
+    const card = page.getByRole('group', { name: 'Approval for A · for the commit', exact: true });
+    await card.getByRole('button', { name: 'Reply', exact: true }).click();
+    const input = card.getByRole('textbox', { name: 'Reply to A · for the commit approval', exact: true });
+    const submit = card.getByRole('button', { name: mode === 'feedback' ? 'Decline and reply' : 'Stop and send', exact: true });
+    await input.fill('Keep this repair reply separate');
+    await submit.scrollIntoViewIfNeeded();
+    await expect(input).toBeInViewport({ ratio: 1 });
+    await expect(submit).toBeInViewport({ ratio: 1 });
+    await submit.click();
+    await expect(card.getByRole('alert')).toContainText('Lost repair acknowledgement');
+    await submit.scrollIntoViewIfNeeded();
+    await expect(input).toBeInViewport({ ratio: 1 });
+    await expect(submit).toBeInViewport({ ratio: 1 });
+    const pixels = await app.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));
+    await writeFile(test.info().outputPath('repair-reply.png'), Buffer.from(pixels, 'base64'));
+    await page.getByRole('button', { name: 'Hide commit review', exact: true }).click();
+    const recovery = page.getByRole('region', { name: 'Saved approval replies' });
+    await expect(recovery).toContainText('Keep this repair reply separate');
+    await page.reload();
+    await expect(recovery).toContainText('Keep this repair reply separate');
+    await recovery.getByRole('button', { name: 'Retry response', exact: true }).click();
+    await expect(recovery).toHaveCount(0);
+    const calls = await app.evaluate(() => (globalThis as typeof globalThis & { repairCalls: { method: string; request: Record<string, unknown> }[] }).repairCalls.filter(call => call.method === 'answer'));
+    expect(calls).toHaveLength(2); expect(calls[0]).toEqual(calls[1]);
+    expect(calls[0].request).toMatchObject({ id: '01a1a200-0000-5000-8000-000000000099', approvalId: 'repair-approval', response: { action: 'reply', mode, text: 'Keep this repair reply separate' } });
+  });
 }
 
 test('selected checked diff starts an isolated repair and replays a lost acknowledgement', async () => {
@@ -459,7 +516,7 @@ test('repair approvals and questions keep their own target at 200 percent', asyn
   await panel.getByRole('button', { name: 'Send answers' }).click();
   await expect(panel.getByRole('button', { name: 'Stop repair', exact: true })).toBeVisible();
   const calls = await app.evaluate(() => (globalThis as typeof globalThis & { repairCalls: { method: string; request: Record<string, unknown> }[] }).repairCalls);
-  expect(calls.find(call => call.method === 'answer')!.request).toMatchObject({ id: '01a1a200-0000-5000-8000-000000000099', approvalId: 'repair-approval', requirement: { sourceIndex: 2 }, allow: false });
+  expect(calls.find(call => call.method === 'answer')!.request).toMatchObject({ id: '01a1a200-0000-5000-8000-000000000099', approvalId: 'repair-approval', requirement: { sourceIndex: 2 }, response: { action: 'deny' } });
   expect(calls.find(call => call.method === 'respond')!.request).toMatchObject({ id: '01a1a200-0000-5000-8000-000000000099', promptId: 'repair-question', response: { action: 'answer', answers: [{ questionId: 'choice', selectedLabel: '小さな修正' }] } });
   const bounds = await panel.getByRole('button', { name: 'Stop repair', exact: true }).boundingBox();
   const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight, scrollWidth: document.documentElement.scrollWidth }));
@@ -607,6 +664,15 @@ test('Commit review stays usable at 200 percent and preserves a stale message dr
   await expect(button).toBeEnabled();
   const box = await button.boundingBox();
   const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight, dpr: devicePixelRatio, scrollWidth: document.documentElement.scrollWidth }));
+  const layout = await page.evaluate(() => Object.fromEntries(['.main', '.session-header', '.session-subtitle', '.stage', '.desk', '.desk-scroll', '.composer', '.status-bar'].map(selector => {
+    const element = document.querySelector(selector)!;
+    return [selector, { top: element.getBoundingClientRect().top, height: element.getBoundingClientRect().height, minHeight: getComputedStyle(element).minHeight, flex: getComputedStyle(element).flex }];
+  })));
+  await writeFile(test.info().outputPath('zoom-layout.json'), JSON.stringify({ viewport, button: box, layout }, null, 2));
+  await app.evaluate(async ({ BrowserWindow }, destination) => {
+    const image = await BrowserWindow.getAllWindows()[0].webContents.capturePage();
+    process.getBuiltinModule('fs').writeFileSync(destination, image.toPNG());
+  }, test.info().outputPath('zoom-review.png'));
   expect(box!.x + box!.width).toBeLessThanOrEqual(viewport.width);
   expect(box!.y + box!.height).toBeLessThanOrEqual(viewport.height);
   const composer = await page.getByRole('textbox', { name: 'Request draft' }).boundingBox();
@@ -624,9 +690,9 @@ test('Commit review stays usable at 200 percent and preserves a stale message dr
 });
 
 const dummyToken = 'ghp_' + 'A6k9P2mR7x4T1v8B5n0Q3s6Z9c2Y7w4L8d1H';
-async function realFixture(secret = false, failedCheck = false, unborn = false) {
+async function realFixture(secret = false, failedCheck = false, unborn = false, assumptions = false, checkEnvironment = false) {
   const root = path.join(data, 'fixture');
-  const seeded = JSON.parse(execFileSync('cargo', ['run', '--offline', '-q', '-p', 'intercat-daemon', '--example', 'commit_fixture', '--', root, ...(unborn ? ['--unborn'] : failedCheck ? ['--failed-check'] : [])], { encoding: 'utf8' }));
+  const seeded = JSON.parse(execFileSync('cargo', ['run', '--offline', '-q', '-p', 'intercat-daemon', '--example', 'commit_fixture', '--', root, ...(checkEnvironment ? ['--check-environment'] : assumptions ? ['--assumptions'] : unborn ? ['--unborn'] : failedCheck ? ['--failed-check'] : [])], { encoding: 'utf8' }));
   execFileSync('cargo', ['build', '--offline', '-q', '--bin', 'intercatd']);
   if (secret) {
     const hook = path.join(seeded.source, '.git/hooks/commit-msg');
@@ -676,6 +742,49 @@ async function realFixture(secret = false, failedCheck = false, unborn = false) 
   }, { module: path.resolve('electron/rpc-client.mjs'), daemon: path.resolve('electron/daemon.mjs'), socket: path.join(seeded.data, 'run/rpc.sock'), token });
   return seeded as { source: string; data: string };
 }
+
+test('real repair approval reply declines the push and carries its instruction to completion', async () => {
+  test.skip(process.env.INTERCAT_TEST_APPROVAL_REPLY_UI !== '1', 'Opt-in paid dummy approval reply');
+  test.setTimeout(300000);
+  const seeded = await realFixture();
+  const output = path.resolve(process.env.INTERCAT_APPROVAL_REPLY_OUTPUT!);
+  await mkdir(output, { recursive: true });
+  evidenceDatabase = { source: path.join(seeded.data, 'events.sqlite'), target: path.join(output, 'events.sqlite') };
+  const remote = path.join(data, 'remote.git');
+  execFileSync('/usr/bin/git', ['init', '--bare', '-q', remote]);
+  const page = await app.firstWindow();
+  const opId = await page.evaluate(() => window.intercat.createOperationId());
+  await app.evaluate(async (_, input) => {
+    const client = (globalThis as typeof globalThis & { repairFixtureClient: { request: (method: string, params: unknown) => Promise<unknown> } }).repairFixtureClient;
+    await client.request('worker.configure', { opId: input.opId, source: input.binary, credentials: input.auth });
+  }, { opId, binary: process.env.INTERCAT_TEST_MUSE_BINARY!, auth: process.env.INTERCAT_TEST_MUSE_AUTH! });
+  await page.getByRole('button', { name: 'Commit', exact: true }).click();
+  const sheet = page.getByRole('complementary', { name: 'Commit review' });
+  await expect(sheet).toContainText('Checked and ready', { timeout: 30000 });
+  await selectDiffLine(page);
+  await page.getByRole('textbox', { name: 'Request draft' }).fill(`This is a disposable local approval test. Before editing index.js, use bash to run exactly this command once:\ngit push '${remote}' HEAD:refs/heads/fixture\nWait for its approval result and follow any feedback. Do not write to the remote in another way. Do not make Git commits. Keep README.md unchanged and finish with a brief report.`);
+  await writeFile(path.join(output, 'attempt.json'), JSON.stringify({ attemptedPaidTurns: 1, maximumPaidTurns: 2, previousPaidTurns: 198, scenario: 'repair approval reply' }, null, 2));
+  await page.getByRole('button', { name: /Send to repair/ }).click();
+  const card = sheet.getByRole('group', { name: 'Approval for A · for the commit', exact: true });
+  await expect(card).toBeVisible({ timeout: 120000 });
+  const before = (await page.evaluate(() => window.intercat.getStatus())).repairRuns![0];
+  expect(before.approvals[0].reason.kind).toBe('push');
+  await writeFile(path.join(output, 'approval.json'), JSON.stringify(before, null, 2));
+  await card.getByRole('button', { name: 'Reply', exact: true }).click();
+  await card.getByRole('textbox').fill('Do not push. Set index.js to exactly exports.value = 3; followed by a newline using the file editing tool. Keep README.md unchanged, do not make commits, and finish with a brief report.');
+  await card.getByRole('button', { name: before.approvals[0].replyMode === 'feedback' ? 'Decline and reply' : 'Stop and send', exact: true }).click();
+  await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).repairRuns?.[0]?.phase, { timeout: 150000 }).toBe('done');
+  const after = await page.evaluate(() => window.intercat.getStatus());
+  expect(after.integration!.status).toBe('checked');
+  expect(after.repairRuns![0].id).toBe(before.id);
+  expect(after.repairRuns![0].session).toBe(before.session);
+  expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'show', `${after.integration!.candidate!.head}:index.js`], { encoding: 'utf8' })).toBe('exports.value = 3;\n');
+  expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'show', 'HEAD:index.js'], { encoding: 'utf8' })).toBe('exports.value = 1;\n');
+  expect(execFileSync('/usr/bin/git', ['-C', remote, 'for-each-ref', '--format=%(refname)'], { encoding: 'utf8' }).trim()).toBe('');
+  await writeFile(path.join(output, 'result.json'), JSON.stringify({ before, after, mode: before.approvals[0].replyMode, sourceUnchanged: true, remoteUnchanged: true }, null, 2));
+  const pixels = await app.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));
+  await writeFile(path.join(output, 'completed.png'), Buffer.from(pixels, 'base64'));
+});
 
 test('desktop sends selected checked lines to a real isolated repair', async () => {
   test.skip(process.env.INTERCAT_TEST_CONTEXT_UI !== '1', 'Opt-in paid dummy selected-line repair');
@@ -980,4 +1089,184 @@ for (const kind of ['report', 'msp'] as const) test(`${kind} repair question use
   expect(request).toMatchObject({ owner: { kind: 'repair', runId: '01a1a200-0000-5000-8000-000000000099' }, trackId: job.tracks[0].id, sessionId: 'repair-session', turnId: '01a1a200-0000-7000-8000-000000000077', question: kind === 'msp' ? { kind: 'msp', id: 'repair-prompt', revision: 'a'.repeat(64) } : { kind: 'report', id: '01a1a200-0000-5000-8000-000000000099', revision: 7 }, scope: 'once', name: 'DEMO_TOKEN', value: 'dummy-repair-ui-value' });
   const calls = await app.evaluate(() => (globalThis as typeof globalThis & { repairCalls: { method: string }[] }).repairCalls);
   expect(calls.map(call => call.method)).toEqual(['start']);
+});
+
+for (const zoom of [1, 2]) {
+  test(`Commit assumptions show the count, keep a choice and separate later clips at ${zoom * 100}%`, async () => {
+    const job = fixture();
+    job.assumptions = [{ id: '01a1a200-0000-5000-8000-000000000081', source: 'worker', sourceId: 'saved',
+      trackId: job.tracks[0].id, clipId: 'saved', question: 'キャッシュの保存先にはどのデータベースを使いますか。'.repeat(4),
+      options: ['SQLite', 'PostgreSQL'], text: 'SQLite', evidence: 'I assumed SQLite.', revision: 1,
+      state: 'open', keptAt: null, changedAt: null, changeInputId: null, included: true },
+    { id: '01a1a200-0000-5000-8000-000000000082', source: 'worker', sourceId: 'running',
+      trackId: job.tracks[0].id, clipId: 'running', question: 'Which output format?', options: ['JSON', 'YAML'],
+      text: 'JSON', evidence: 'I assumed JSON.', revision: 1, state: 'open', keptAt: null, changedAt: null, changeInputId: null, included: false }];
+    await mock(job);
+    await app.evaluate(({ BrowserWindow }, factor) => BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(factor), zoom);
+    const page = await app.firstWindow();
+    await page.getByRole('button', { name: 'Commit', exact: true }).click();
+    const sheet = page.getByRole('complementary', { name: 'Commit review' });
+    const assumptions = sheet.getByRole('region', { name: 'Commit assumptions' });
+    await expect(assumptions).toContainText('JSON · settled at the next commit');
+    await expect(assumptions.getByRole('button', { name: 'Keep', exact: true })).toHaveCount(1);
+    const commit = sheet.getByRole('button', { name: 'Commit · keeps 1 assumption', exact: true });
+    await expect(commit).toBeEnabled();
+    await expect(commit).toBeInViewport();
+    const keep = assumptions.getByRole('button', { name: 'Keep', exact: true });
+    await keep.scrollIntoViewIfNeeded();
+    expect(await keep.evaluate(element => getComputedStyle(element).color)).toBe('rgb(201, 203, 209)');
+    await page.waitForTimeout(150);
+    const pixels = await app.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));
+    await writeFile(test.info().outputPath(`assumptions-${zoom}.png`), Buffer.from(pixels, 'base64'));
+    await keep.click();
+    await expect(assumptions).toContainText('kept');
+    await expect(sheet.getByRole('button', { name: 'Commit', exact: true })).toBeEnabled();
+    await expect(assumptions.getByRole('button', { name: 'Change', exact: true })).toHaveCount(0);
+  });
+}
+
+test('Commit assumption Change starts an isolated repair and stale assumptions stop Commit', async () => {
+  const job = fixture();
+  job.assumptions = [{ id: '01a1a200-0000-5000-8000-000000000081', source: 'worker', sourceId: 'saved',
+    trackId: job.tracks[0].id, clipId: 'saved', question: 'Which database?', options: ['SQLite', 'PostgreSQL'],
+    text: 'SQLite', evidence: 'I assumed SQLite.', revision: 3, state: 'open', keptAt: null, changedAt: null, changeInputId: null, included: true }];
+  await mock(job);
+  await repairHandlers();
+  const page = await app.firstWindow();
+  await page.getByRole('button', { name: 'Commit', exact: true }).click();
+  const sheet = page.getByRole('complementary', { name: 'Commit review' });
+  await app.evaluate(() => {
+    const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number } }).commitState;
+    state.integration.assumptionsFailed = 1; state.sequence++;
+  });
+  await sheet.getByRole('button', { name: 'Retry reading', exact: true }).click();
+  await expect(sheet).toContainText('Waiting for assumption reading');
+  await expect(sheet.getByRole('button', { name: 'Commit · keeps 1 assumption', exact: true })).toBeDisabled();
+  await app.evaluate(() => {
+    const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number } }).commitState;
+    state.integration.assumptionsPending = 0;
+    state.integration.assumptionsChanged = true; state.sequence++;
+  });
+  await expect(sheet).toContainText('Assumptions changed · Refresh to review them.');
+  await expect(sheet.getByRole('button', { name: 'Commit · keeps 1 assumption', exact: true })).toBeDisabled();
+  await app.evaluate(() => {
+    const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number } }).commitState;
+    state.integration.assumptionsChanged = false; state.sequence++;
+  });
+  await sheet.getByRole('button', { name: 'Change', exact: true }).click();
+  await sheet.getByRole('textbox', { name: 'Change Worker A assumption' }).fill('Use PostgreSQL.');
+  await sheet.getByRole('button', { name: 'Ask Worker A to change', exact: true }).click();
+  await expect(sheet.getByRole('button', { name: 'Stop repair', exact: true })).toBeVisible();
+  await expect(sheet.getByRole('button', { name: 'Commit · keeps 1 assumption', exact: true })).toBeDisabled();
+  const calls = await app.evaluate(() => (globalThis as typeof globalThis & { repairCalls: { request: RepairRequest }[] }).repairCalls);
+  expect(calls[0].request.track).toBe(job.tracks[0].id);
+  expect(calls[0].request.purpose).toEqual({ kind: 'assumption', id: job.assumptions[0].id, revision: 3, text: 'Use PostgreSQL.' });
+});
+
+test('desktop commits only the included assumptions through the authenticated daemon', async () => {
+  test.setTimeout(120_000);
+  const seeded = await realFixture(false, false, false, true);
+  const page = await app.firstWindow();
+  await page.getByRole('button', { name: 'Commit', exact: true }).click();
+  const sheet = page.getByRole('complementary', { name: 'Commit review' });
+  await expect(sheet.getByRole('button', { name: 'Commit · keeps 2 assumptions', exact: true })).toBeEnabled({ timeout: 30_000 });
+  const assumptions = sheet.getByRole('region', { name: 'Commit assumptions' });
+  await assumptions.getByRole('button', { name: 'Keep', exact: true }).first().click();
+  const commit = sheet.getByRole('button', { name: 'Commit · keeps 1 assumption', exact: true });
+  await expect(commit).toBeEnabled();
+  await sheet.getByRole('tab', { name: 'Message', exact: true }).click();
+  await sheet.getByText('Final message after hooks', { exact: true }).click();
+  await expect(sheet.locator('.commit-message pre')).toContainText('Assumptions kept');
+  await page.screenshot({ path: test.info().outputPath('native-assumptions.png') });
+  await commit.click();
+  await expect(sheet).toContainText('Committed', { timeout: 30_000 });
+  await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).assumptions?.length).toBe(0);
+  const branch = execFileSync('/usr/bin/git', ['for-each-ref', '--format=%(refname)', 'refs/heads/intercat/'], { cwd: seeded.source, encoding: 'utf8' }).trim();
+  const commits = execFileSync('/usr/bin/git', ['log', '--format=%B', branch], { cwd: seeded.source, encoding: 'utf8' });
+  expect(commits.match(/Assumptions kept/g)).toHaveLength(2);
+  await writeFile(test.info().outputPath('commit-messages.txt'), commits);
+});
+
+test('a spoken Commit prepares real saved work and waits for the Commit button', async () => {
+  test.setTimeout(180_000);
+  const seeded = await realFixture();
+  const model = path.join(data, 'model');
+  const python = path.join(data, 'editor.py');
+  await mkdir(model);
+  await writeFile(python, '#!/usr/bin/python3\n' + await readFile('tests/fixtures/park_editor.py', 'utf8'), { mode: 0o700 });
+  await app.evaluate(async ({ ipcMain }, config) => {
+    const client = (globalThis as typeof globalThis & { repairFixtureClient: { request: (method: string, params: unknown) => Promise<unknown> } }).repairFixtureClient;
+    const load = process.getBuiltinModule('module').createRequire(config.daemon);
+    const opId = load(config.daemon).operationId();
+    await client.request('editor.configure', { opId, config: { model: config.model, python: config.python } });
+    ipcMain.removeHandler('intercat:stage');
+    ipcMain.handle('intercat:stage', (_event, request) => client.request('utterance.create', request));
+    ipcMain.removeHandler('intercat:resolve');
+    ipcMain.handle('intercat:resolve', (_event, request) => client.request('utterance.resolve', request));
+    ipcMain.removeHandler('intercat:utterance-read');
+    ipcMain.handle('intercat:utterance-read', (_event, utteranceId) => client.request('utterance.read', { utteranceId }));
+  }, { model, python, daemon: path.resolve('electron/daemon.mjs') });
+  const page = await app.firstWindow();
+  await expect(page.locator('.status-bar')).toContainText('Local editor · ready', { timeout: 60_000 });
+  const refs = () => execFileSync('/usr/bin/git', ['-C', seeded.source, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/intercat/'], { encoding: 'utf8' });
+  const before = refs();
+  const head = execFileSync('/usr/bin/git', ['-C', seeded.source, 'rev-parse', 'HEAD'], { encoding: 'utf8' });
+  await page.getByRole('textbox', { name: 'Request draft', exact: true }).fill('Open commit');
+  await page.getByRole('button', { name: 'Put', exact: true }).click();
+  const sheet = page.getByRole('complementary', { name: 'Commit review', exact: true });
+  await expect(sheet).toContainText('Checked and ready', { timeout: 30_000 });
+  await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).utterances!.find(word => word.text === 'Open commit')?.state).toBe('landed');
+  expect(refs()).toBe(before);
+  expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'rev-parse', 'HEAD'], { encoding: 'utf8' })).toBe(head);
+  await sheet.getByRole('button', { name: 'Commit', exact: true }).click();
+  await expect(sheet).toContainText('Committed', { timeout: 15_000 });
+  expect(refs()).not.toBe(before);
+  expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'rev-parse', 'HEAD'], { encoding: 'utf8' })).toBe(head);
+  await writeFile(test.info().outputPath('spoken-commit.json'), JSON.stringify(await page.evaluate(() => window.intercat.getStatus()), null, 2));
+});
+
+test('Check environment reaches the real Check, stays private, and re-check uses the updated selection', async () => {
+  test.setTimeout(180_000);
+  const seeded = await realFixture(false, false, false, false, true);
+  const file = path.join(await realpath(seeded.source), '.env.test');
+  await writeFile(file, 'CHECK_FIXTURE_VALUE=fixture-value-check-only\n');
+  await app.evaluate(({ ipcMain }) => {
+    const client = (globalThis as typeof globalThis & { repairFixtureClient: { request: (method: string, params?: unknown) => Promise<unknown> } }).repairFixtureClient;
+    ipcMain.removeHandler('intercat:check-environment');
+    ipcMain.handle('intercat:check-environment', () => client.request('check-environment.get', {}));
+    ipcMain.removeHandler('intercat:check-environment-change');
+    ipcMain.handle('intercat:check-environment-change', (_event, request) => client.request('check-environment.change', request));
+    ipcMain.removeHandler('intercat:project-secret-settings');
+    ipcMain.handle('intercat:project-secret-settings', async () => ({ project: (await client.request('system.status') as { projectSecrets: unknown }).projectSecrets, savedNames: [], savedRevision: 0, issue: null }));
+    ipcMain.removeHandler('intercat:project-secret-usage');
+    ipcMain.handle('intercat:project-secret-usage', () => []);
+  });
+  const page = await app.firstWindow();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const environment = page.getByRole('region', { name: 'Check environment', exact: true });
+  await environment.getByRole('button', { name: 'Use .env.test', exact: true }).click();
+  await expect(environment.getByText(file, { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Close settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Commit', exact: true }).click();
+  const sheet = page.getByRole('complementary', { name: 'Commit review' });
+  await expect(sheet).toContainText('Checked and ready', { timeout: 30_000 });
+  await sheet.getByRole('tab', { name: 'Check', exact: true }).click();
+  const initial = (await page.evaluate(() => window.intercat.getStatus())).integration!;
+  expect(initial.candidate!.check!.code).toBe(0);
+  expect(initial.candidate!.check!.stdout).not.toContain('fixture-value-check-only');
+  await sheet.getByRole('button', { name: 'Hide commit review', exact: true }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await environment.getByRole('button', { name: 'Use no file', exact: true }).click();
+  await page.getByRole('button', { name: 'Close settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Commit', exact: true }).click();
+  await expect(sheet).toContainText('Checked with previous settings');
+  await sheet.getByRole('button', { name: 'Re-check', exact: true }).click();
+  await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).integration?.candidate?.check?.code, { timeout: 30_000 }).toBe(19);
+  const changed = (await page.evaluate(() => window.intercat.getStatus())).integration!;
+  expect(changed.candidate!.tree).toBe(initial.candidate!.tree);
+  expect(changed.candidate!.settingsHash).not.toBe(initial.candidate!.settingsHash);
+  expect(changed.tracks.map(track => track.checkpoint?.sha)).toEqual(initial.tracks.map(track => track.checkpoint?.sha));
+  const records = execFileSync('python3', ['-c', 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print("\\n".join(str(r) for table in ("events", "integration_settings") for r in c.execute("select * from "+table)))', path.join(seeded.data, 'events.sqlite')], { encoding: 'utf8' });
+  expect(records).not.toContain('fixture-value-check-only');
+  await writeFile(test.info().outputPath('environment-check.json'), JSON.stringify({ initial, changed }, null, 2));
 });

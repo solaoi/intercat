@@ -9,12 +9,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-enum Entry<'a> {
+pub(crate) enum Entry<'a> {
     Frame(&'a Value, i64),
     Snapshot(&'a crate::session_snapshot::Snapshot, i64),
 }
 
-fn visit_frames(
+pub(crate) fn visit_frames(
     db: &Connection,
     session: &str,
     mut visit: impl FnMut(Entry<'_>) -> Result<()>,

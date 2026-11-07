@@ -1,7 +1,170 @@
 //! Approval-stage identity and refresh ordering, shared by both worker loops.
 use crate::Result;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Response {
+    Allow,
+    Deny,
+    Reply { text: String, mode: ReplyMode },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Prepared {
+    Decision {
+        choice: String,
+        feedback: Option<String>,
+    },
+    Restart {
+        text: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReplyMode {
+    Feedback,
+    Restart,
+}
+
+pub fn reply_mode(request: &Value) -> ReplyMode {
+    if accepts_feedback(request) {
+        ReplyMode::Feedback
+    } else {
+        ReplyMode::Restart
+    }
+}
+
+pub fn wire_params(record: &Value) -> Value {
+    let mut params = record.clone();
+    params.as_object_mut().unwrap().remove("response");
+    params.as_object_mut().unwrap().remove("scope");
+    params
+}
+
+pub async fn replay(
+    journal: &crate::journal::Journal,
+    id: uuid::Uuid,
+    scope: &str,
+    approval: &str,
+    requirement: &Value,
+    response: &Response,
+) -> Result<bool> {
+    let Some(saved) = journal.operation(id).await? else {
+        return Ok(false);
+    };
+    if saved["kind"] == "approval.reply" {
+        let request: crate::approval_reply::Request =
+            serde_json::from_value(saved["payload"].clone())?;
+        if request.owner.key(&request.track_id) != scope {
+            return Err("This reply belongs to another worker.".into());
+        }
+        let text = match response {
+            Response::Reply {
+                text,
+                mode: ReplyMode::Restart,
+            } => text,
+            _ => return Err("Operation ID reused with another response.".into()),
+        };
+        if saved["payload"]["approvalId"] != approval
+            || saved["payload"]["requirement"] != *requirement
+            || saved["payload"]["text"] != *text
+        {
+            return Err("Operation ID reused with a different approval reply.".into());
+        }
+        if saved["state"] == "superseded" {
+            return Err("The approval reply was held because its original repair changed.".into());
+        }
+        return Ok(true);
+    }
+    if saved["kind"] != "approval.decide"
+        || saved["payload"]["scope"] != scope
+        || saved["payload"]["approvalId"] != approval
+        || saved["payload"]["requirementId"] != *requirement
+        || saved["payload"]["response"] != serde_json::to_value(response)?
+    {
+        return Err("Operation ID reused with a different approval response.".into());
+    }
+    if saved["state"] != "complete" {
+        return Err("The previous response is awaiting confirmation. Check the worker before answering again.".into());
+    }
+    Ok(true)
+}
+
+pub fn offered(request: &Value, allow: bool) -> Option<String> {
+    choices(request, allow)
+        .next()
+        .and_then(|choice| choice["choiceId"].as_str())
+        .map(str::to_owned)
+}
+
+fn choices(request: &Value, allow: bool) -> impl Iterator<Item = &Value> {
+    request["availableChoices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(move |choice| {
+            choice["scope"] == "once"
+                && if allow {
+                    choice["decision"] == "approved"
+                } else {
+                    choice["decision"] == "denied" || choice["decision"] == "abort"
+                }
+        })
+}
+
+pub fn accepts_feedback(request: &Value) -> bool {
+    choices(request, false).any(|choice| choice["acceptsFeedback"] == true)
+}
+
+impl Response {
+    pub async fn screen(&self, journal: &crate::journal::Journal) -> Result<()> {
+        if let Self::Reply { text, .. } = self {
+            if text.trim().is_empty() || text.len() > 16 * 1024 || text.contains('\0') {
+                return Err("An approval reply must be nonempty and at most 16 KiB.".into());
+            }
+            let screened = journal
+                .screen_start(serde_json::json!({"text":text}))
+                .await?;
+            if screened.params()["text"] != *text {
+                return Err("Remove the detected secret from this reply before sending it.".into());
+            }
+        }
+        Ok(())
+    }
+    pub fn prepare(&self, request: &Value) -> Result<Prepared> {
+        match self {
+            Self::Allow | Self::Deny => Ok(Prepared::Decision {
+                choice: offered(request, matches!(self, Self::Allow))
+                    .ok_or("Approval choice is unavailable.")?,
+                feedback: None,
+            }),
+            Self::Reply { text, mode } => {
+                if *mode != reply_mode(request) {
+                    return Err(
+                        "The approval reply action changed. Review the current card.".into(),
+                    );
+                }
+                if text.trim().is_empty() || text.len() > 16 * 1024 || text.contains('\0') {
+                    return Err("An approval reply must be nonempty and at most 16 KiB.".into());
+                }
+                match choices(request, false).find(|choice| choice["acceptsFeedback"] == true) {
+                    Some(choice) => Ok(Prepared::Decision {
+                        choice: choice["choiceId"]
+                            .as_str()
+                            .ok_or("Invalid approval choice.")?
+                            .into(),
+                        feedback: Some(text.clone()),
+                    }),
+                    None => Ok(Prepared::Restart { text: text.clone() }),
+                }
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct Stages {
@@ -183,6 +346,88 @@ impl Stages {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reply_uses_a_feedback_capable_denial_even_when_another_choice_is_first() {
+        let request = json!({"availableChoices":[
+            {"choiceId":"allow","scope":"once","decision":"approved"},
+            {"choiceId":"deny","scope":"once","decision":"denied"},
+            {"choiceId":"abort","scope":"once","decision":"abort","acceptsFeedback":true}
+        ]});
+        assert_eq!(
+            Response::Reply {
+                text: "Yes, run it".into(),
+                mode: ReplyMode::Feedback
+            }
+            .prepare(&request)
+            .unwrap(),
+            Prepared::Decision {
+                choice: "abort".into(),
+                feedback: Some("Yes, run it".into())
+            }
+        );
+        assert_eq!(
+            Response::Allow.prepare(&request).unwrap(),
+            Prepared::Decision {
+                choice: "allow".into(),
+                feedback: None
+            }
+        );
+        assert_eq!(
+            Response::Deny.prepare(&request).unwrap(),
+            Prepared::Decision {
+                choice: "deny".into(),
+                feedback: None
+            }
+        );
+    }
+
+    #[test]
+    fn reply_without_feedback_requires_stopping_before_sending_a_new_turn() {
+        let request = json!({"availableChoices":[
+            {"choiceId":"allow","scope":"once","decision":"approved","acceptsFeedback":true},
+            {"choiceId":"deny","scope":"once","decision":"denied"}
+        ]});
+        assert_eq!(
+            Response::Reply {
+                text: "Use another folder.".into(),
+                mode: ReplyMode::Restart
+            }
+            .prepare(&request)
+            .unwrap(),
+            Prepared::Restart {
+                text: "Use another folder.".into()
+            }
+        );
+    }
+
+    #[test]
+    fn reply_rejects_empty_oversized_and_nul_text() {
+        for text in [" ".into(), "x".repeat(16 * 1024 + 1), "x\0y".into()] {
+            assert!(
+                Response::Reply {
+                    text,
+                    mode: ReplyMode::Restart
+                }
+                .prepare(&json!({}))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_changed_feedback_capability_cannot_silently_change_the_selected_action() {
+        let request =
+            json!({"availableChoices":[{"choiceId":"deny","decision":"denied","scope":"once"}]});
+        assert!(
+            Response::Reply {
+                text: "Keep the folder.".into(),
+                mode: ReplyMode::Feedback
+            }
+            .prepare(&request)
+            .is_err()
+        );
+    }
 
     fn request() -> Value {
         json!({"sessionId":"session","approvalId":"approval","turnId":"turn",

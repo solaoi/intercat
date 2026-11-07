@@ -317,7 +317,7 @@ pub(crate) fn change(db: &mut Connection, change: Change, key: &Key) -> Result<S
                         params![track, serde_json::to_string(&worker)?],
                     )?;
                     tx.execute("UPDATE workspaces SET record=json_set(record,'$.state','ready','$.error',NULL) WHERE track_id=?1",[track])?;
-                    tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='Review this request after backup recovery.' WHERE (provisional=?1 OR json_extract(decision,'$.trackId')=?1) AND state IN ('staged','reading','placed','starting','sent')",[track])?;
+                    tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='Review this request after backup recovery.' WHERE (provisional=?1 OR json_extract(decision,'$.trackId')=?1) AND state IN ('staged','reading','placed','starting','sent') AND coalesce(json_extract(decision,'$.kind'),'')<>'park'",[track])?;
                     if pickup {
                         let input =
                             Uuid::new_v5(&id, format!("handoff/{track}").as_bytes()).to_string();
