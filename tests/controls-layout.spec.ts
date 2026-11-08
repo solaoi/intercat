@@ -2,6 +2,7 @@ import { mockDrafts } from './support/drafts';
 import { _electron as electron, expect, test } from '@playwright/test';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { closeWindow } from './support/close';
+import type { Project } from '../src/bridge';
 
 test('worker and composer actions have visible spacing and distinct enabled focus states', async () => {
   const data=await mkdtemp('/private/tmp/ic-controls-');
@@ -13,7 +14,7 @@ test('worker and composer actions have visible spacing and distinct enabled focu
   try {
     const page=await app.firstWindow();
     await app.evaluate(({ipcMain})=>{
-      const state={connected:true,sequence:1,workerConfigured:false,project:{name:"Layout fixture",root:"/fixture"},
+      const state={connected:true,sequence:1,workerConfigured:false,project:{id:'layout-project',name:'Layout fixture',folders:[{id:'layout-folder',name:'Layout fixture',path:'/fixture',root:'/fixture',commonDir:'/fixture/.git',base:'a'.repeat(40),baseBranch:'refs/heads/main'}]} satisfies Project,
         tracks:[{id:'A',label:'A',title:'Login retry',status:'waiting'}],
         workers:[{trackId:'A',phase:'held',sessionId:'session',activeTurn:null,identity:null,detail:null,approvals:[1,2].map(id=>({id:String(id),requirement:{sourceIndex:0},subject:"Review local operation "+id,reason:{kind:"shell",message:"Review this action"},canAllow:true,canDeny:true})),prompts:[],checkpoint:null,checkpointPending:false}],
         utterances:[{id:'initial',text:'ログイン時の再試行処理を修正して、失敗時の表示とテスト結果まで確認する',state:'landed',revision:1,createdAt:1,decision:{kind:'fork',trackId:'A'}}],reports:[{id:"report",trackId:"A",pending:true}],editor:{phase:'ready'}};

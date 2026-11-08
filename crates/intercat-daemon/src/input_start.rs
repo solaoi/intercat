@@ -21,6 +21,11 @@ pub(crate) fn unavailable(
     if crate::edit_hold::active(db, input)? {
         return Ok(Some("Finish editing this request first."));
     }
+    if !crate::dependency_retry::allowed(db, input)? {
+        return Ok(Some(
+            "This dependency retry changed. Review its latest result.",
+        ));
+    }
     let row: Option<(String, i64, Option<String>)> = db
         .query_row(
             "SELECT state,revision,decision FROM utterances WHERE id=?1",
@@ -33,6 +38,14 @@ pub(crate) fn unavailable(
     };
     if crate::confirmation::pending(db, input)?.is_some() {
         return Ok(Some("Confirm this interpretation before starting it."));
+    }
+    let parsed: crate::decision::Decision = serde_json::from_str(&decision)?;
+    if crate::start_condition::projection(db, input, &parsed)?
+        .is_some_and(|value| value["ready"] != true)
+    {
+        return Ok(Some(
+            "The selected work has not finished. Change Read as to choose another start time.",
+        ));
     }
     let decision: Value = serde_json::from_str(&decision)?;
     let waiting = state == "placed" && decision["boundary"] == "when-told";
@@ -66,6 +79,7 @@ pub(crate) fn start(
     }
     let payload = json!({"utteranceId":input,"revision":revision}).to_string();
     db.execute("UPDATE utterances SET state='placed',revision=revision+1,reason=NULL,decision=json_set(decision,'$.boundary','now') WHERE id=?1",[input])?;
+    crate::inheritance_issue::clear(db, input)?;
     db.execute(
         "INSERT INTO operations VALUES(?1,'utterance.start',?2,'complete')",
         params![operation, payload],

@@ -37,6 +37,8 @@ async fn paste(
 }
 fn submission(id: Uuid, text: &str, sources: Vec<Source>) -> Submission {
     Submission {
+        execute_allowed: true,
+        plan_item: None,
         op_id: id,
         text: text.into(),
         target: Target::New,

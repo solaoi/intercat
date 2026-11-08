@@ -3,7 +3,7 @@ use intercat_daemon::{
     decision::{Decision, Kind, Outcome, Target},
     journal::Journal,
     preparation::Preparation,
-    project::{self, Project},
+    project::{self, Folder},
     worktree::GitTool,
 };
 use intercat_git::Repository;
@@ -26,7 +26,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
-async fn fixture() -> Result<(tempfile::TempDir, Journal, Project, Value, String)> {
+async fn fixture() -> Result<(tempfile::TempDir, Journal, Folder, Value, String)> {
     let root = tempfile::tempdir()?;
     let source = root.path().join("source");
     fs::create_dir(&source)?;
@@ -46,7 +46,8 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, Project, Value, String
             "base",
         ],
     );
-    let project = project::inspect(source).await?;
+    let project =
+        project::inspect(uuid::Uuid::now_v7(), "Dummy project".into(), vec![source]).await?;
     let journal = Journal::open(
         root.path().join("events.sqlite"),
         intercat_daemon::secrets::Key::new([7; 32]),
@@ -84,7 +85,13 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, Project, Value, String
         .await?;
     let snapshot = journal.snapshot().await?;
     let track = snapshot["tracks"][0]["id"].as_str().unwrap().to_owned();
-    Ok((root, journal, project, snapshot["session"].clone(), track))
+    Ok((
+        root,
+        journal,
+        project.only_folder()?.clone(),
+        snapshot["session"].clone(),
+        track,
+    ))
 }
 async fn ready(journal: &Journal) -> Result<Value> {
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -114,7 +121,7 @@ async fn reserves_a_distinct_slug_and_prepares_without_starting_a_waiting_reques
     let preparation = Preparation::start(&root.path().join("workspaces"), journal.clone())?;
     let state = ready(&journal).await?;
     assert_eq!(
-        state["session"]["slug"],
+        state["sessionFolders"][0]["slug"],
         format!("{}-2", session["slug"].as_str().unwrap())
     );
     assert_eq!(state["session"]["bound"], true);
@@ -140,7 +147,10 @@ async fn recovers_reserved_names_and_incomplete_checkout_using_the_same_operatio
     let marker = repo.write_blob(format!("Intercat session {session_id}\n").as_bytes())?;
     repo.sync_objects(&[marker])?;
     let marker_ref = format!("refs/intercat/{slug}/session");
-    let reservation = Uuid::new_v5(&session_id, format!("reserve:{slug}").as_bytes());
+    let reservation = Uuid::new_v5(
+        &session_id,
+        format!("reserve:{}:{slug}", project.id()).as_bytes(),
+    );
     journal
         .intent(
             &reservation.to_string(),
@@ -165,7 +175,7 @@ async fn recovers_reserved_names_and_incomplete_checkout_using_the_same_operatio
     fs::remove_file(destination.join("file.txt"))?;
     let preparation = Preparation::start(&workspaces, journal.clone())?;
     let state = ready(&journal).await?;
-    assert_eq!(state["session"]["slug"], slug);
+    assert_eq!(state["sessionFolders"][0]["slug"], slug);
     assert_eq!(fs::read_to_string(destination.join("file.txt"))?, "base\n");
     assert_eq!(
         journal.operation(reservation).await?.unwrap()["state"],

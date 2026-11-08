@@ -90,7 +90,7 @@ def main():
                 time.sleep(.05)
         stream = connection.makefile('rwb')
         rpc('rpc.authenticate', {'token': token})
-        rpc('project.configure', {'opId': operation(), 'path': str(source)})
+        rpc('project.configure', {'opId': operation(), 'name': 'Dummy dispatch project', 'paths': [str(source)]})
         project = rpc('system.status')['projectSecrets']
         check = hmac.new(bytes.fromhex(key), b'intercat.secret-fingerprints.v1', hashlib.sha256).hexdigest()
         catalog = rpc('secret.project.prepare', {'opId': operation(), 'projectId': project['projectId'], 'revision': 0, 'fingerprints': [], 'keyCheck': check})

@@ -10,6 +10,7 @@ pub fn install(db: &Connection) -> Result<()> {
     CREATE TABLE timeline_clips(id TEXT PRIMARY KEY,track TEXT NOT NULL,ordinal INTEGER NOT NULL,record TEXT NOT NULL,UNIQUE(track,ordinal));
     CREATE TABLE timeline_items(session TEXT NOT NULL,item TEXT NOT NULL,clip TEXT NOT NULL,revision INTEGER NOT NULL,record TEXT NOT NULL,summary TEXT NOT NULL,PRIMARY KEY(session,item));
     CREATE INDEX timeline_item_clip ON timeline_items(clip);
+    CREATE INDEX timeline_clip_turn ON timeline_clips(json_extract(record,'$.sessionId'),json_extract(record,'$.turnId'),ordinal);
     CREATE TABLE timeline_marks(session TEXT NOT NULL,item TEXT NOT NULL,track TEXT NOT NULL,position INTEGER NOT NULL,input TEXT,repair TEXT,PRIMARY KEY(session,item));
     CREATE TABLE timeline_outputs(session TEXT NOT NULL,item TEXT NOT NULL,reference TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(session,item,reference));")?;
     db.execute_batch("CREATE TABLE timeline_revision(revision INTEGER NOT NULL);
@@ -96,6 +97,39 @@ fn save_clip(db: &Connection, clip: &Clip) -> Result<()> {
     db.execute("INSERT INTO timeline_clips VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET record=excluded.record",params![clip.id,clip.track_id,clip.ordinal,serde_json::to_string(clip)?])?;
     Ok(())
 }
+pub(crate) fn open_review(db: &Connection, id: &str, track: &str, session: &str) -> Result<()> {
+    let ordinal = db.query_row(
+        "SELECT coalesce(max(ordinal),0)+1 FROM timeline_clips WHERE track=?1",
+        [track],
+        |r| r.get(0),
+    )?;
+    save_clip(
+        db,
+        &Clip {
+            id: id.into(),
+            track_id: track.into(),
+            repair_run_id: None,
+            ordinal,
+            session_id: session.into(),
+            turn_id: None,
+            start: Stamp::now(),
+            end: None,
+            generation_end: None,
+            category: "review".into(),
+            shell_item: None,
+            recovered: false,
+        },
+    )
+}
+pub(crate) fn close_review(db: &Connection, id: &str, interrupted: bool) -> Result<()> {
+    let mut value = clip(db, id)?;
+    if value.end.is_none() {
+        value.end = Some(Stamp::now());
+        value.recovered = interrupted;
+        save_clip(db, &value)?;
+    }
+    Ok(())
+}
 fn open_step(
     db: &Connection,
     session: &str,
@@ -177,6 +211,92 @@ fn terminal(item: &Value) -> bool {
     item["status"].as_str().is_some_and(|s| s != "inProgress")
 }
 
+fn open_background_shells(db: &Connection, current: &Clip, at: &Stamp) -> Result<()> {
+    let records = db
+        .prepare("SELECT record FROM timeline_items WHERE clip=?1")?
+        .query_map([&current.id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for record in records {
+        let item: Value = serde_json::from_str(&record)?;
+        if item["kind"] != "toolCall" || item["tool"] != "bash" || terminal(&item) {
+            continue;
+        }
+        let item_id = item["itemId"].as_str().ok_or("Missing shell item ID.")?;
+        let id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("{}/{item_id}/shell", current.session_id).as_bytes(),
+        )
+        .to_string();
+        if get_json(db, "SELECT record FROM timeline_clips WHERE id=?1", [&id])?.is_some() {
+            continue;
+        }
+        let ordinal = db.query_row(
+            "SELECT coalesce(max(ordinal),0)+1 FROM timeline_clips WHERE track=?1",
+            [&current.track_id],
+            |row| row.get(0),
+        )?;
+        save_clip(
+            db,
+            &Clip {
+                id,
+                track_id: current.track_id.clone(),
+                repair_run_id: current.repair_run_id.clone(),
+                ordinal,
+                session_id: current.session_id.clone(),
+                turn_id: current.turn_id.clone(),
+                start: at.clone(),
+                end: None,
+                generation_end: Some(at.clone()),
+                category: "shell".into(),
+                shell_item: Some(item_id.into()),
+                recovered: current.recovered,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// A PostToolBatch record, joined by every call ID, closes exactly one step.
+pub(crate) fn close_captured_batch(
+    db: &Connection,
+    source: &crate::step_sources::Source,
+    id: &str,
+) -> Result<()> {
+    let mut current = clip(db, id)?;
+    if current.category != "step" || current.recovered || current.end.is_some() {
+        return Ok(());
+    }
+    let Some(raw) = get_json(
+        db,
+        "SELECT record FROM timeline_turns WHERE session=?1 AND turn=?2",
+        params![source.session, source.turn],
+    )?
+    else {
+        return Ok(());
+    };
+    let mut turn: Turn = serde_json::from_value(raw)?;
+    if turn.current.as_deref() != Some(id) {
+        return Err("Captured batch does not belong to the current step.".into());
+    }
+    let at = current
+        .generation_end
+        .as_ref()
+        .filter(|at| at.timeline_ms > source.at.timeline_ms)
+        .unwrap_or(&source.at)
+        .clone();
+    current.end = Some(at.clone());
+    save_clip(db, &current)?;
+    open_background_shells(db, &current, &at)?;
+    if !turn.terminal {
+        open_step(db, &source.session, &source.turn, &mut turn, &at)?;
+    }
+    db.execute(
+        "UPDATE timeline_turns SET record=?3 WHERE session=?1 AND turn=?2",
+        params![source.session, source.turn, serde_json::to_string(&turn)?],
+    )?;
+    Ok(())
+}
+
 fn save_item(
     db: &Connection,
     session: &str,
@@ -199,6 +319,9 @@ pub(crate) fn project_snapshot(
 ) -> Result<()> {
     let repair = repair_owner(db, session, track)?;
     for item in &view.items {
+        if crate::step_sources::internal_hook(db, track, item)? {
+            continue;
+        }
         let item_id = item["itemId"]
             .as_str()
             .filter(|id| !id.is_empty())
@@ -277,6 +400,7 @@ pub(crate) fn project_snapshot(
             db.execute("INSERT INTO timeline_marks VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session,item) DO NOTHING",params![session,item_id,track,current.start.timeline_ms,input,repair])?;
         }
     }
+    crate::plan_assumptions::adopt(db, session)?;
     Ok(())
 }
 
@@ -310,6 +434,9 @@ pub fn fold(
         return Ok(());
     }
     let item = &p["item"];
+    if crate::step_sources::internal_hook(db, track, item)? {
+        return Ok(());
+    }
     let Some(turn_id) = p["turnId"].as_str().or_else(|| item["turnId"].as_str()) else {
         if matches!(method, "item/started" | "item/updated" | "item/completed") {
             update_unassociated_snapshot_item(db, session, item)?;
@@ -351,42 +478,10 @@ pub fn fold(
             if let Some(id) = &turn.current {
                 let mut current = clip(db, id)?;
                 current.recovered |= frame["_intercatRecovered"] == true;
-                current.end = Some(at.clone());
+                current.end.get_or_insert_with(|| at.clone());
                 save_clip(db, &current)?;
                 // An unfinished shell belongs to its own interval after foreground ends.
-                for item in items(db, id)?
-                    .iter()
-                    .filter(|i| i["kind"] == "toolCall" && i["tool"] == "bash" && !terminal(i))
-                {
-                    let item_id = item["itemId"].as_str().ok_or("Missing shell item ID.")?;
-                    let shell_id = Uuid::new_v5(
-                        &Uuid::NAMESPACE_OID,
-                        format!("{session}/{item_id}/shell").as_bytes(),
-                    )
-                    .to_string();
-                    let ordinal: i64 = db.query_row(
-                        "SELECT coalesce(max(ordinal),0)+1 FROM timeline_clips WHERE track=?1",
-                        [track],
-                        |r| r.get(0),
-                    )?;
-                    save_clip(
-                        db,
-                        &Clip {
-                            id: shell_id,
-                            track_id: track.into(),
-                            repair_run_id: turn.repair_run_id.clone(),
-                            ordinal,
-                            session_id: session.into(),
-                            turn_id: Some(turn_id.into()),
-                            start: at.clone(),
-                            end: None,
-                            generation_end: Some(at.clone()),
-                            category: "shell".into(),
-                            shell_item: Some(item_id.into()),
-                            recovered: frame["_intercatRecovered"] == true,
-                        },
-                    )?;
-                }
+                open_background_shells(db, &current, at)?;
             }
         }
     } else if method.starts_with("item/") {
@@ -471,7 +566,10 @@ pub fn fold(
                 }
             }
         }
-        if !turn.terminal && current.end.is_none() {
+        if !turn.terminal
+            && current.end.is_none()
+            && !crate::step_sources::capturing(db, session, turn_id)?
+        {
             let values = items(db, &id)?;
             let tools: Vec<_> = values.iter().filter(|i| i["kind"] == "toolCall").collect();
             if !tools.is_empty() && tools.iter().all(|i| terminal(i)) {
@@ -482,6 +580,8 @@ pub fn fold(
         }
     }
     db.execute("INSERT INTO timeline_turns VALUES(?1,?2,?3) ON CONFLICT(session,turn) DO UPDATE SET record=excluded.record",params![session,turn_id,serde_json::to_string(&turn)?])?;
+    crate::step_sources::bind_ready(db, session, turn_id)?;
+    crate::plan_assumptions::adopt_turn(db, session, turn_id)?;
     Ok(())
 }
 
@@ -578,6 +678,13 @@ fn summary(db: &Connection, clip: &Clip, now: &Stamp) -> Result<Value> {
         )?
     };
     let mut value = json!({"id":clip.id,"trackId":clip.track_id,"repairRunId":clip.repair_run_id,"ordinal":clip.ordinal,"sessionId":clip.session_id,"turnId":clip.turn_id,"category":clip.category,"label":label,"kind":kind,"start":clip.start.timeline_ms,"end":clip.start.timeline_ms+duration,"running":clip.end.is_none(),"generationEnd":generation,"approximate":approximate,"effectCount":effect_count,"toolTicks":tools.iter().map(|i|json!({"itemId":i["itemId"],"tool":i["tool"],"status":i["status"]})).collect::<Vec<_>>()});
+    if clip.repair_run_id.is_none()
+        && let Some(turn) = &clip.turn_id
+        && let Some((plan, item)) = crate::plan_execution::turn_owner(db, &clip.session_id, turn)?
+    {
+        value["planId"] = plan.to_string().into();
+        value["planItemId"] = item.to_string().into();
+    }
     let assumptions = crate::assumption_store::list(db, Some(&clip.id))?;
     value["assumptionCount"] = json!(assumptions.len());
     value["assumptionIds"] = json!(assumptions.iter().map(|item| &item.id).collect::<Vec<_>>());
@@ -591,6 +698,9 @@ fn summary(db: &Connection, clip: &Clip, now: &Stamp) -> Result<Value> {
     if let Some(generated) = generated {
         value["title"] = generated.title.into();
         value["summary"] = generated.summary.into();
+    }
+    if clip.category == "review" {
+        crate::review_timeline::decorate(db, &clip.id, &mut value)?;
     }
     Ok(value)
 }
@@ -700,8 +810,13 @@ pub fn window(db: &Connection, request: Window) -> Result<Value> {
     while let Some(row) = rows.next()? {
         let id = format!("{}/{}", row.get::<_, String>(0)?, row.get::<_, String>(1)?);
         let position: Option<i64> = row.get(4)?;
+        let internal_fix = match row.get::<_, Option<String>>(5)? {
+            Some(input) => crate::review_fix_store::for_input(db, &input)?.is_some(),
+            None => false,
+        };
         if row.get::<_, bool>(2)?
             || row.get::<_, bool>(8)?
+            || internal_fix
             || position.is_none_or(|at| at < request.start || at > request.end)
         {
             if !reset {
@@ -720,7 +835,11 @@ pub fn window(db: &Connection, request: Window) -> Result<Value> {
     )
 }
 pub fn detail(db: &Connection, id: &str) -> Result<Value> {
-    let clip = clip(db, id)?;
+    let saved = clip(db, id)?;
+    if saved.category == "review" {
+        return crate::review_timeline::detail(db, summary(db, &saved, &Stamp::now())?);
+    }
+    let clip = saved;
     let mut stmt = db.prepare("SELECT record FROM timeline_items WHERE clip=?1 ORDER BY rowid")?;
     let rows = stmt
         .query_map([&clip.id], |r| r.get::<_, String>(0))?
@@ -785,6 +904,6 @@ pub fn detail(db: &Connection, id: &str) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(
-        json!({"model":crate::session_parameters::read(db,&clip.session_id,clip.turn_id.as_deref())?,"clip":summary(db,&clip,&Stamp::now())?,"items":all,"deletionSnapshots":snapshots,"effects":effects,"assumptions":crate::assumption_store::list(db,Some(&clip.id))?}),
+        json!({"model":crate::session_parameters::read(db,&clip.session_id,clip.turn_id.as_deref())?,"clip":summary(db,&clip,&Stamp::now())?,"items":all,"deletionSnapshots":snapshots,"effects":effects,"assumptions":crate::assumption_store::list(db,Some(&clip.id))?,"reviewNotes":crate::review_store::notes(db,&clip.id)?,"reviews":crate::review_store::for_clip(db,&clip.id)?}),
     )
 }

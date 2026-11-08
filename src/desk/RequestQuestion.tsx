@@ -1,3 +1,4 @@
+import { waitSourceLabel } from '../waitSource';
 import { GeneratedRequestTitle } from './RequestTitle';
 import { PrivacyText, usePrivacyLabels } from './PrivacyText';
 import type { useDrafts } from './drafts';
@@ -30,7 +31,7 @@ export function RequestQuestion({ question, tracks, resolve, edit, cut, drafts, 
     <span className="card-mark">◇</span>
     <div><GeneratedRequestTitle word={question} /><strong><PrivacyText text={question.reason ?? ''} interactive={false} /></strong><small className="request-state">{chooseTrack ? 'Not started · pick a track' : 'Not started'}</small><details className="request-context"><summary aria-label="Read the full request" ><PrivacyText text={question.text} interactive={false} /></summary><p tabIndex={0} aria-label="Full request"><PrivacyText text={question.text} /></p></details>
       {chooseTrack && <small>Picking a track re-reads what to do.</small>}
-      {stage === 'start-turn' && <small>{question.startCondition?.candidates.length ? 'Choose the turn that was running when you sent this request.' : 'No running turn was recorded with this request. Choose when to start or edit the request.'}</small>}
+      {stage === 'start-turn' && <small>{question.startCondition?.candidates.length ? 'Choose the work recorded when you sent this request.' : 'No work was recorded with this request. Choose when to start or edit the request.'}</small>}
       <div className="request-options" data-card-actions>
         {chooseTrack && <>{candidates.map(track => <button className="request-destination" key={track.id} title={label(track.title)} onClick={() => resolve({ action: 'retry', target: { mode: 'lock', trackId: track.id } })}>Worker {track.label}{recommendation?.trackId === track.id && <small className="request-recommended">recommended</small>}</button>)}
           <button className="request-destination" onClick={() => resolve({ action: 'retry', target: { mode: 'new' } })}>New track{recommendation && recommendation.trackId === null && <small className="request-recommended">recommended</small>}</button></>}
@@ -39,7 +40,7 @@ export function RequestQuestion({ question, tracks, resolve, edit, cut, drafts, 
         {stage === 'trim' && <><button onClick={() => confirm({ kind: 'stop-and-send' })}>Stop and send</button><button onClick={() => confirm({ kind: 'after-turn' })}>Send after this turn</button></>}
         {stage === 'boundary' && <><button onClick={() => confirm({ kind: 'now' })}>{question.review?.turn ? `Stop ${track?.label ?? ''} and send` : 'Now'}</button><button onClick={() => confirm({ kind: 'after-turn' })}>After this turn</button><button onClick={() => confirm({ kind: 'when-told' })}>When I say</button></>}
         {stage === 'start-turn' && <>
-          {question.startCondition?.candidates.map(source => <button key={`${source.sessionId}/${source.turnId}`} onClick={() => confirm({ kind: 'after-worker-turn', source })}>After {source.label}’s turn</button>)}
+          {question.startCondition?.candidates.map(source => <button key={JSON.stringify(source)} onClick={() => confirm({ kind: 'after', source })}>After <PrivacyText text={waitSourceLabel(source)} interactive={false} /></button>)}
           <button onClick={() => confirm({ kind: 'now' })}>Now</button>
           <button onClick={() => confirm({ kind: 'when-told' })}>When I say</button>
         </>}

@@ -46,7 +46,14 @@ async fn prepared_workspace_uses_the_selected_starting_commit_after_the_user_mov
     let temporary = tempfile::tempdir()?;
     let repo = temporary.path().join("source");
     source(&repo);
-    let project = intercat_daemon::project::inspect(repo.clone()).await?;
+    let project = intercat_daemon::project::inspect(
+        uuid::Uuid::now_v7(),
+        "Dummy project".into(),
+        vec![repo.clone()],
+    )
+    .await?
+    .only_folder()?
+    .clone();
     fs::write(repo.join("file.txt"), "new user commit\n")?;
     git(&repo, &["add", "."]);
     git(

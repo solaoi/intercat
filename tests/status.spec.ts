@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test';
 import { mergeStatus } from '../src/status';
 import type { DaemonStatus } from '../src/bridge';
+import type { Plan } from '../src/plans/types';
 
 function status(): DaemonStatus {
   return { connected: true, daemonPid: 17, sequence: 100, tracks: [{ id: 'a', label: 'A', title: 'Work', status: 'working' }], timeline: { clock: { epochMs: 100, monoMs: 100, bootId: 'boot', timelineMs: 100 }, summaries: [] } };
@@ -22,4 +23,12 @@ test('a stale response is ignored but a restarted daemon can have a lower sequen
   expect(mergeStatus(before, after)).toBe(before);
   after.daemonPid = 18;
   expect(mergeStatus(before, after).daemonPid).toBe(18);
+});
+test('a plan revision from a command survives an older status response', () => {
+  const held = { id: 'dummy-plan', rev: 3, state: 'held' } as Plan;
+  const before = { ...status(), plans: [held] };
+  const incoming = { ...status(), plans: [{ ...held, rev: 2, state: 'draft' as const }] };
+  expect(mergeStatus(before, incoming).plans?.[0]).toBe(held);
+  expect(mergeStatus(before, { ...incoming, daemonPid: 18 }).plans?.[0].rev).toBe(2);
+  expect(mergeStatus(before, { ...incoming, plans: [] }).plans).toEqual([]);
 });

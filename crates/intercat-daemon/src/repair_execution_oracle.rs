@@ -38,6 +38,124 @@ struct Prepared {
     source_index: Vec<u8>,
 }
 
+#[tokio::test]
+async fn repair_start_outcomes_release_only_confirmed_slots() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    for mode in [
+        "rejected",
+        "event-first",
+        "reply-first",
+        "running",
+        "steered",
+    ] {
+        let mut prepared = prepare(Some("repair-start")).await?;
+        let capacity = Arc::new(crate::scheduler::Capacity::new(1));
+        let (client, server) = tokio::io::duplex(65536);
+        let (read, write) = tokio::io::split(client);
+        let mut connection = crate::msp::Connection::new(read, write);
+        let (_, mut runner) = channel_on(&prepared.run, connection.client.clone())?;
+        let (finished, finish) = oneshot::channel();
+        let observed = capacity.clone();
+        let peer = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let mut lines = BufReader::new(read).lines();
+            let start: Value =
+                serde_json::from_str(&lines.next_line().await?.ok_or("Missing start")?)?;
+            assert_eq!(start["method"], "turn/start");
+            assert_eq!(observed.snapshot().active, 1);
+            let command = start["params"]["commandId"].clone();
+            let turn = Uuid::now_v7();
+            let first = if mode == "rejected" {
+                json!({"jsonrpc":"2.0","id":start["id"],"error":{"code":-32602,"message":"Dummy rejection","data":{"kind":"invalidParams","commandId":command}}})
+            } else {
+                json!({"jsonrpc":"2.0","id":start["id"],"result":{"commandId":command,"turnId":turn,"disposition":if mode=="steered" {"steered"} else {"queued"}}})
+            };
+            write.write_all(format!("{first}\n").as_bytes()).await?;
+            if !matches!(mode, "rejected" | "steered") {
+                let cancel: Value =
+                    serde_json::from_str(&lines.next_line().await?.ok_or("Missing reclaim")?)?;
+                assert_eq!(cancel["method"], "turn/unqueue");
+                assert_eq!(cancel["params"]["turnId"], turn.to_string());
+                let event = json!({"jsonrpc":"2.0","method":if mode=="running" {"turn/started"} else {"turn/unqueued"},"params":{"sessionId":"repair-start","commandId":command,"turnId":turn}});
+                let reply = if mode == "running" {
+                    json!({"jsonrpc":"2.0","id":cancel["id"],"error":{"code":-32030,"message":"Already active","data":{"kind":"commandRejected","commandId":cancel["params"]["commandId"],"reason":"run_active"}}})
+                } else {
+                    json!({"jsonrpc":"2.0","id":cancel["id"],"result":{"commandId":cancel["params"]["commandId"],"turnId":turn,"status":"accepted"}})
+                };
+                if mode == "reply-first" {
+                    write.write_all(format!("{reply}\n").as_bytes()).await?;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    assert_eq!(
+                        observed.snapshot().active,
+                        1,
+                        "acknowledgement is not a terminal event"
+                    );
+                    write.write_all(format!("{event}\n").as_bytes()).await?;
+                } else {
+                    write
+                        .write_all(format!("{event}\n{reply}\n").as_bytes())
+                        .await?;
+                }
+            }
+            if matches!(mode, "running" | "steered") {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                assert_eq!(observed.snapshot().active, 1);
+                write.write_all(format!("{}\n",json!({"jsonrpc":"2.0","method":"turn/completed","params":{"sessionId":"repair-start","turnId":turn,"terminal":"interrupted"}})).as_bytes()).await?;
+            }
+            let _ = finish.await;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(command)
+        });
+        let scanner = prepared
+            .journal
+            .repair_input(prepared.run.id)
+            .await?
+            .2
+            .scanner
+            .start(&[])?;
+        let (_shutdown, shutdown) = watch::channel(false);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            runner.execute_inner(
+                SessionIo {
+                    connection: &mut connection,
+                    tracker: Arc::new(Mutex::new(crate::process::Tracker::new(
+                        "repair-start".into(),
+                        prepared.identity,
+                    )?)),
+                },
+                &prepared.journal,
+                &prepared.workspace,
+                &mut prepared.run,
+                &scanner,
+                Task {
+                    instruction: "Dummy repair start verification".into(),
+                    capacity: capacity.clone(),
+                    shutdown,
+                    project_secrets: prepared.secrets.clone(),
+                },
+            ),
+        )
+        .await;
+        let _ = finished.send(());
+        let command = peer.await??;
+        assert!(matches!(outcome??, Outcome::Stopped), "{mode}");
+        assert_eq!(capacity.snapshot().active, 0, "{mode}");
+        if mode == "rejected" {
+            assert_eq!(
+                prepared
+                    .journal
+                    .operation(command.as_str().unwrap().parse()?)
+                    .await?
+                    .unwrap()["state"],
+                "superseded"
+            );
+        }
+        connection.close();
+    }
+    Ok(())
+}
+
 async fn prepare(session: Option<&str>) -> Result<Prepared> {
     let root = tempfile::tempdir()?;
     let source = root.path().join("source");
@@ -61,7 +179,10 @@ async fn prepare(session: Option<&str>) -> Result<Prepared> {
     let source_index = fs::read(source.join(".git/index"))?;
     let journal = Journal::open(root.path().join("db"), crate::secrets::Key::new([7; 32])).await?;
     journal
-        .configure_project(Uuid::now_v7(), project::inspect(source).await?)
+        .configure_project(
+            Uuid::now_v7(),
+            project::inspect(uuid::Uuid::now_v7(), "Dummy project".into(), vec![source]).await?,
+        )
         .await?;
     let project_id = journal.snapshot().await?["projectSecrets"]["projectId"]
         .as_str()
@@ -404,7 +525,7 @@ async fn reply_through_repair_loop(mode: crate::approval::ReplyMode) -> Result<(
             &scanner,
             Task {
                 instruction: "Offline repair reply verification".into(),
-                capacity: Arc::new(Semaphore::new(1)),
+                capacity: Arc::new(crate::scheduler::Capacity::new(1)),
                 shutdown,
                 project_secrets: prepared.secrets.clone(),
             },
@@ -569,6 +690,7 @@ async fn real_repair_reply_closes_its_host_before_starting_the_followup() -> Res
         &mut run,
         &workspace,
         crate::repair_host::Launch {
+            memory: crate::host_memory::Pool::new(),
             worker: &config,
             directory: &prepared.root.path().join("native-host"),
             rpc: &rpc,
@@ -588,19 +710,21 @@ async fn real_repair_reply_closes_its_host_before_starting_the_followup() -> Res
     )?;
     let data = prepared.root.path().join("data");
     let work = crate::runtime::Runtime::start(
+        crate::host_memory::Pool::new(),
         data.clone(),
         rpc.clone(),
         prepared.journal.clone(),
         editor,
-        Arc::new(Semaphore::new(1)),
+        Arc::new(crate::scheduler::Capacity::new(1)),
         Arc::new(crate::dispatch_control::Gate::new(true)),
     );
     let repairs = crate::repair_service::Runtime::start(
+        crate::host_memory::Pool::new(),
         prepared.journal.clone(),
         prepared.root.path().join("integration"),
         data,
         rpc,
-        Arc::new(Semaphore::new(1)),
+        Arc::new(crate::scheduler::Capacity::new(1)),
         prepared.service.clone(),
         prepared.secrets.clone(),
         Arc::new(crate::dispatch_control::Gate::new(false)),
@@ -612,7 +736,7 @@ async fn real_repair_reply_closes_its_host_before_starting_the_followup() -> Res
         let files = workspace.clone();
         let secrets = prepared.secrets.clone();
         fs::write(output.join("attempt.json"), serde_json::to_vec_pretty(&json!({"maximumPaidTurns":2,"previousPaidTurns":201,"automaticFollowup":true}))?)?;
-        let mut running = tokio::spawn(async move { runner.execute(hosted, writer, &files, Task { instruction, capacity: Arc::new(Semaphore::new(1)), shutdown, project_secrets: secrets }).await });
+        let mut running = tokio::spawn(async move { runner.execute(hosted, writer, &files, Task { instruction, capacity: Arc::new(crate::scheduler::Capacity::new(1)), shutdown, project_secrets: secrets }).await });
         let card = tokio::time::timeout(Duration::from_secs(120), async {
             loop {
                 let current = prepared.journal.repair_input(run.id).await?.0;
@@ -744,7 +868,7 @@ async fn approvals_match_the_pinned_sdk() -> Result<()> {
             &scanner,
             Task {
                 instruction: "Offline protocol verification".into(),
-                capacity: Arc::new(Semaphore::new(1)),
+                capacity: Arc::new(crate::scheduler::Capacity::new(1)),
                 shutdown,
                 project_secrets: prepared.secrets.clone(),
             },

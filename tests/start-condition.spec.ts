@@ -42,7 +42,7 @@ test('a new track keeps its chosen source turn through native UI and daemon rest
     await page.getByRole('textbox', { name: 'Request draft', exact: true }).fill('After this turn, prepare the first source');
     await page.getByRole('button', { name: 'New track', exact: true }).click();
     const emptyCard = page.getByRole('group', { name: 'Request needs attention', exact: true });
-    await expect(emptyCard).toContainText('No running turn was recorded');
+    await expect(emptyCard).toContainText('No work was recorded');
     await expect(emptyCard.getByRole('button', { name: /^After .+’s turn$/ })).toHaveCount(0);
     await emptyCard.getByRole('button', { name: 'When I say', exact: true }).click();
     await expect(emptyCard).toHaveCount(0);
@@ -70,21 +70,21 @@ db.commit()`, path.join(data, 'daemon/events.sqlite'), JSON.stringify(sources)])
     await page.getByRole('textbox', { name: 'Request draft', exact: true }).fill(text);
     await page.getByRole('button', { name: 'New track', exact: true }).click();
     const card = page.getByRole('group', { name: 'Request needs attention', exact: true });
-    await expect(card).toContainText('Which running turn should the new track wait for?');
+    await expect(card).toContainText('Which work should this request wait for?');
     for (const zoom of [1, 2]) {
       await app.evaluate(({ BrowserWindow }, zoom) => { const window = BrowserWindow.getAllWindows()[0]; window.setSize(1040, 760); window.webContents.setZoomFactor(zoom); }, zoom);
-      const choice = card.getByRole('button', { name: 'After B’s turn', exact: true });
+      const choice = card.getByRole('button', { name: 'After B’s recorded turn', exact: true });
       await choice.focus();
       await expect(choice).toBeInViewport();
       await expect(choice).toBeEnabled();
       const pixels = await app.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));
       await writeFile(test.info().outputPath(`source-choice-${zoom * 100}.png`), Buffer.from(pixels, 'base64'));
     }
-    await card.getByRole('button', { name: 'After B’s turn', exact: true }).click();
+    await card.getByRole('button', { name: 'After B’s recorded turn', exact: true }).click();
     await expect(card).toHaveCount(0);
-    await expect(page.locator('.request-chip').filter({ hasText: text })).toContainText('new track · after B’s turn');
+    await expect(page.locator('.request-chip').filter({ hasText: text })).toContainText('new track · after B’s recorded turn');
     let current = (await page.evaluate(() => window.intercat.getStatus())).utterances!.find(word => word.text === text)!;
-    expect(current.startCondition?.source).toEqual(sources[1]);
+    expect(current.startCondition?.source).toEqual({ kind: 'turn', value: sources[1] });
     expect(current.startCondition?.ready).toBe(false);
     expect(current.state).toBe('placed');
     const target = current.decision!.trackId;
@@ -96,7 +96,7 @@ db.commit()`, path.join(data, 'daemon/events.sqlite'), JSON.stringify(sources)])
     await stop();
     page = await start();
     current = (await page.evaluate(() => window.intercat.getStatus())).utterances!.find(word => word.text === text)!;
-    expect(current.startCondition?.source).toEqual(sources[1]);
+    expect(current.startCondition?.source).toEqual({ kind: 'turn', value: sources[1] });
     expect(current.startCondition?.ready).toBe(false);
     expect(current.decision!.trackId).toBe(target);
     await stop();

@@ -158,6 +158,8 @@ pub(crate) fn host_paths(data: &Path) -> crate::Result<Vec<(String, String, Path
         ("hosts", "work", 2),
         ("repair-hosts", "repair", 1),
         ("summary-hosts", "summary", 2),
+        ("planner-hosts", "planner", 1),
+        ("review-hosts", "review", 1),
     ] {
         let directory = data.join(folder);
         if !directory.try_exists()? {

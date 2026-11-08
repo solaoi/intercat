@@ -191,7 +191,7 @@ export function NeedsYou({ cards, active = true, returnedAt = 0, canDropFiles = 
         }}>
         {destination && dropCard === card.id && <div className="card-file-drop"><span>Drop to attach · next words to Worker {destination.label}</span></div>}
         {stale ? <span className="attention-state" role="status">{live.has(card.id) ? 'changed elsewhere' : 'answered elsewhere'}</span>
-          : card.kind === 'assumption' ? <span className="attention-state">assumed, running</span>
+          : card.kind === 'assumption' ? <span className="attention-state">assumed</span>
           : card.kind === 'proposal' ? <span className="attention-state">not started</span>
           : card.kind !== 'question' && <span className="attention-state">needs an answer</span>}
         <AttentionActive value={active && !stale}><fieldset disabled={stale} aria-hidden={stale || undefined}>{card.content}</fieldset></AttentionActive>

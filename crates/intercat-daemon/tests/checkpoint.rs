@@ -78,11 +78,7 @@ async fn snapshots_real_index_without_changing_either_checkout_and_chains_turns(
     let index_path = git(path, &["rev-parse", "--git-path", "index"]);
     let index = fs::read(&index_path)?;
     let source_index = fs::read(source.join(".git/index"))?;
-    let journal = Journal::open(
-        root.join("events.sqlite"),
-        intercat_daemon::secrets::Key::new([7; 32]),
-    )
-    .await?;
+    let journal = registered_journal(root.join("events.sqlite"), &workspace).await?;
     let first = checkpoint::save(
         workspace.clone(),
         uuid::Uuid::now_v7(),
@@ -161,11 +157,7 @@ async fn filter_can_transform_content_but_cannot_read_original_objects() -> Resu
     );
     git(path, &["config", "filter.upper.required", "true"]);
     fs::write(path.join("new.txt"), "lower\n")?;
-    let journal = Journal::open(
-        root.join("events.sqlite"),
-        intercat_daemon::secrets::Key::new([7; 32]),
-    )
-    .await?;
+    let journal = registered_journal(root.join("events.sqlite"), &workspace).await?;
     let saved = checkpoint::save(
         workspace.clone(),
         uuid::Uuid::now_v7(),
@@ -241,11 +233,7 @@ async fn nested_repository_is_not_published_as_a_checkpoint() -> Result<()> {
             "nested",
         ],
     );
-    let journal = Journal::open(
-        root.join("events.sqlite"),
-        intercat_daemon::secrets::Key::new([7; 32]),
-    )
-    .await?;
+    let journal = registered_journal(root.join("events.sqlite"), &workspace).await?;
     assert!(
         checkpoint::save(
             workspace.clone(),
@@ -287,11 +275,7 @@ async fn unresolved_index_paths_are_recorded_with_the_worktree_contents() -> Res
     )?;
     let index_path = git(&workspace.path, &["rev-parse", "--git-path", "index"]);
     let index = fs::read(&index_path)?;
-    let journal = Journal::open(
-        root.join("events.sqlite"),
-        intercat_daemon::secrets::Key::new([7; 32]),
-    )
-    .await?;
+    let journal = registered_journal(root.join("events.sqlite"), &workspace).await?;
     let saved = checkpoint::save(
         workspace.clone(),
         uuid::Uuid::now_v7(),
@@ -321,11 +305,7 @@ async fn interrupted_checkpoint_reuses_its_saved_tree_despite_later_file_changes
         let dir = tempfile::tempdir()?;
         let root = dir.path().canonicalize()?;
         let workspace = fixture(&root).await?;
-        let journal = Journal::open(
-            root.join("events.sqlite"),
-            intercat_daemon::secrets::Key::new([7; 32]),
-        )
-        .await?;
+        let journal = registered_journal(root.join("events.sqlite"), &workspace).await?;
         let turn = Uuid::now_v7();
         fs::write(workspace.path.join("keep"), "frozen snapshot\n")?;
         let captured = checkpoint::capture(&workspace, &workspace.base, "frozen\n").await?;
@@ -387,11 +367,7 @@ async fn symlinked_worktree_path_uses_its_physical_path_for_the_sandbox() -> Res
     std::os::unix::fs::symlink(&workspace.path, &alias)?;
     workspace.path = alias;
     fs::write(workspace.path.join("keep"), "saved through alias\n")?;
-    let journal = Journal::open(
-        root.path().join("db"),
-        intercat_daemon::secrets::Key::new([7; 32]),
-    )
-    .await?;
+    let journal = registered_journal(root.path().join("db"), &workspace).await?;
     let saved = checkpoint::save(
         workspace.clone(),
         uuid::Uuid::now_v7(),
@@ -449,11 +425,7 @@ async fn attachment_copies_stay_out_of_checkpoints_even_when_force_added_and_uni
     assert!(git(path, &["ls-tree", "-r", "--name-only", &raw]).contains("brief.txt"));
     let index_path = git(path, &["rev-parse", "--git-path", "index"]);
     let index = fs::read(&index_path)?;
-    let journal = Journal::open(
-        root.join("events.sqlite"),
-        intercat_daemon::secrets::Key::new([7; 32]),
-    )
-    .await?;
+    let journal = registered_journal(root.join("events.sqlite"), &workspace).await?;
     let saved = checkpoint::save(
         workspace.clone(),
         uuid::Uuid::now_v7(),
@@ -523,11 +495,7 @@ async fn tracked_attachment_name_collisions_are_preserved_and_copies_use_another
         &workspace.path,
         &["add", "-f", ".intercat-attachments-2/brief.txt"],
     );
-    let journal = Journal::open(
-        root.join("events.sqlite"),
-        intercat_daemon::secrets::Key::new([7; 32]),
-    )
-    .await?;
+    let journal = registered_journal(root.join("events.sqlite"), &workspace).await?;
     let saved = checkpoint::save(
         workspace.clone(),
         uuid::Uuid::now_v7(),
@@ -575,11 +543,7 @@ async fn unregistered_attachment_names_remain_user_files() -> Result<()> {
         &workspace.path,
         &["add", "-f", ".intercat-attachments-2/copy.txt"],
     );
-    let journal = Journal::open(
-        root.join("events.sqlite"),
-        intercat_daemon::secrets::Key::new([7; 32]),
-    )
-    .await?;
+    let journal = registered_journal(root.join("events.sqlite"), &workspace).await?;
     let saved = checkpoint::save(
         workspace.clone(),
         uuid::Uuid::now_v7(),
@@ -592,4 +556,14 @@ async fn unregistered_attachment_names_remain_user_files() -> Result<()> {
     assert!(files.contains_key(".intercat/attachments/user.txt"));
     assert!(!files.contains_key(".intercat-attachments-2/copy.txt"));
     Ok(())
+}
+
+async fn registered_journal(path: std::path::PathBuf, workspace: &Workspace) -> Result<Journal> {
+    let journal = Journal::open(&path, intercat_daemon::secrets::Key::new([7; 32])).await?;
+    rusqlite::Connection::open(&path)?.execute(
+        "INSERT INTO tracks VALUES(?1,'A','Dummy checkpoint work','working')",
+        [&workspace.track_id],
+    )?;
+    journal.workspace_result(workspace.clone()).await?;
+    Ok(journal)
 }

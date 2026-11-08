@@ -17,7 +17,7 @@ export function OrphanedRequest({ word, tracks, edit, resolve, takeBack }: {
     <div>
       <small className="request-state">Not started · pick a track</small>
       <strong><PrivacyText text={word.reason || 'This reply’s question is no longer current'} interactive={false} /></strong>
-      <details><summary>Original question</summary><p><PrivacyText text={question?.text ?? 'The original question is unavailable.'} /></p></details>
+      <details><summary>Original question</summary><p><PrivacyText text={word.planReply?.question ?? question?.text ?? 'The original question is unavailable.'} /></p></details>
       <p className="orphaned-reply" tabIndex={0}><PrivacyText text={word.text} /></p>
       <div className="request-options" data-card-actions>
         <button disabled={disabled} onClick={edit}>Edit</button>

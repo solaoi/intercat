@@ -32,6 +32,17 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, WorkerState)> {
         .as_str()
         .unwrap()
         .to_owned();
+    journal
+        .workspace_result(intercat_daemon::preparation::Workspace {
+            track_id: track.clone(),
+            path: root.path().join("worker"),
+            reference: "refs/intercat/test/tracks/A".into(),
+            base: "0".repeat(40),
+            state: "ready".into(),
+            error: None,
+            attachment_roots: vec![],
+        })
+        .await?;
     let worker = WorkerState {
         track_id: track,
         phase: "working".into(),
@@ -320,7 +331,7 @@ async fn execution_interrupts_only_the_captured_turn_without_a_running_editor() 
                 root.path(),
                 &root.path().join("editor.log"),
             )?,
-            capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+            capacity: Arc::new(intercat_daemon::scheduler::Capacity::new(1)),
         };
         let identity = intercat_daemon::process::identity(std::process::id())?;
         let tracker = Arc::new(Mutex::new(intercat_daemon::process::Tracker::new(
@@ -418,7 +429,7 @@ async fn a_queued_start_of_a_held_correction_cannot_override_a_newer_stop() -> R
                 root.path(),
                 &root.path().join("editor.log"),
             )?,
-            capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+            capacity: Arc::new(intercat_daemon::scheduler::Capacity::new(1)),
         };
         let identity = intercat_daemon::process::identity(std::process::id())?;
         let tracker = Arc::new(Mutex::new(intercat_daemon::process::Tracker::new(

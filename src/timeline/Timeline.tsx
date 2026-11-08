@@ -1,8 +1,9 @@
+import { queueLabel } from '../scheduling';
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Application } from 'pixi.js';
 import 'pixi.js/unsafe-eval';
 import type { TimelineMark } from '../bridge';
-import { geometry, initialView, LABEL_WIDTH, TOP_HEIGHT, type Clip, type TimelineView, type Track } from './model';
+import { geometry, initialView, LABEL_WIDTH, TOP_HEIGHT, type Clip, type PlannedTurn, type TimelineView, type Track } from './model';
 import { lanes, revealLane, totalHeight, visibleLanes, type Lane } from './viewport';
 import type { TimelineBounds } from './useWindow';
 import { TimelineScene } from './scene';
@@ -10,12 +11,19 @@ import { TrackMenu } from './TrackMenu';
 import { InputMarks } from './InputMarks';
 import { groupMarks } from './inputMarkLayout';
 import { completionLabel } from './completion';
+import { dependencyLinks } from './futureLayout';
+import { PlannedOverflow } from './PlannedOverflow';
 
 interface Props {
   onViewport: (bounds: TimelineBounds) => void; liveNow: () => number | null; preview: boolean; advancing: boolean; tracks: Track[]; marks?: TimelineMark[]; selected: string; selectedRepair: string | null; view: TimelineView;
   onSelect: (id: string) => void; onClip: (track: Track, clip: Clip, repairId: string | null) => void;
   onOpenTrack: (id: string) => void;
   onInput: (id: string) => void;
+  onReviewStop?: (jobs: NonNullable<Track['reviewJobs']>)=>void;
+  onPlan: (id: string, itemId?: string, point?: { left: number; top: number }) => void;
+  selectedPlanItem: string | null;
+  focusPlanItem: { id: string; nonce: number } | null;
+  onPlanControl: (id: string, itemId: string, mode: 'menu' | 'earlier' | 'later' | 'up' | 'down', point?: { left: number; top: number }) => void;
   onSayTo: (id: string) => void; targetDisabled: boolean;
   canDropFiles: boolean; onDropFiles: (files: File[], trackId: string) => void;
   onRepairSelect: (track: Track, id: string) => void; onRepairStop: (id: string) => void; onCut: (id: string) => void; onInteraction: () => void;
@@ -39,6 +47,7 @@ export function Timeline(props: Props) {
   const [hovered, setHovered] = useState<string | null>(null);
   const pointer = useRef<{ x: number; y: number } | null>(null);
   const pendingReveal = useRef<string | null>(null);
+  const focusedPlanRequest = useRef<number | null>(null);
   const rows = useMemo(() => lanes(props.tracks, overview), [props.tracks, overview]);
   const height = totalHeight(rows), visibleHeight = Math.max(0, size.height - TOP_HEIGHT);
   const visible = useMemo(() => visibleLanes(rows, scroll, visibleHeight), [rows, scroll, visibleHeight]);
@@ -52,6 +61,7 @@ export function Timeline(props: Props) {
   const selected = rows.find(row => row.key === selectedKey);
   const mirror = selected && !visible.includes(selected) ? [...visible, selected] : visible;
   const layout = geometry(size.width);
+  const links = useMemo(() => overview ? [] : dependencyLinks(rows, size.width, props.view, props.selectedPlanItem), [rows, size.width, props.view, props.selectedPlanItem, overview]);
   const scrollId = useId();
   const marks = props.preview ? PREVIEW_MARKS : props.marks ?? NO_MARKS;
   const markGroups = useMemo(() => groupMarks(marks, props.view, size.width), [marks, props.view, size.width]);
@@ -68,7 +78,7 @@ export function Timeline(props: Props) {
   }
   function dropRow(clientY: number) {
     const row = rowAt(clientY);
-    return row?.repairId ? undefined : row;
+    return row?.repairId || row?.track.planId || row?.track.reviewer ? undefined : row;
   }
   function moveTo(value: number) {
     if (scroller.current) { scroller.current.scrollTop = value; setScroll(scroller.current.scrollTop); }
@@ -81,12 +91,32 @@ export function Timeline(props: Props) {
   }
   function open(row: Lane) {
     if (overview) density(false, row);
+    if (row.track.planId) { props.onPlan(row.track.planId); return; }
     choose(row);
+    if(row.track.reviewer) {const last=row.clips.at(-1);if(last)props.onClip(row.track,last,null);return;}
     if (!row.repairId) props.onOpenTrack(row.track.id);
   }
   useLayoutEffect(() => {
     if (selected) moveTo(revealLane(scroller.current?.scrollTop ?? 0, visibleHeight, selected));
   }, [selectedKey, visibleHeight]);
+  useLayoutEffect(() => {
+    const row = rows.find(row => row.track.planned.some(item => item.id === props.selectedPlanItem));
+    if (row) moveTo(revealLane(scroller.current?.scrollTop ?? 0, visibleHeight, row));
+  }, [props.selectedPlanItem]);
+  useLayoutEffect(() => {
+    const request = props.focusPlanItem;
+    if (!request || focusedPlanRequest.current === request.nonce || overview) return;
+    const row = rows.find(row => row.track.planned.some(item => item.id === request.id));
+    if (!row) return;
+    const next = revealLane(scroller.current?.scrollTop ?? 0, visibleHeight, row);
+    if (scroller.current && Math.abs(next - scroller.current.scrollTop) > 1) {
+      moveTo(next);
+      return;
+    }
+    const item = viewport.current?.querySelector<HTMLButtonElement>(`[data-plan-item-id="${CSS.escape(request.id)}"] .planned-item-select`)
+      ?? viewport.current?.querySelector<HTMLButtonElement>(`[data-plan-track-id="${CSS.escape(row.track.id)}"] .planned-more`);
+    if (item) { item.focus({ preventScroll: true }); focusedPlanRequest.current = request.nonce; }
+  }, [props.focusPlanItem, rows, scroll, visibleHeight, overview]);
   useLayoutEffect(() => {
     if (pendingReveal.current) {
       const row = rows.find(row => row.key === pendingReveal.current); pendingReveal.current = null;
@@ -130,14 +160,21 @@ export function Timeline(props: Props) {
     return () => { disposed = true; observer.disconnect(); window.removeEventListener('resize', measure); scene.current?.destroy(); scene.current = null; if (application.current === instance) { application.current = null; instance.destroy(true, { children: true, context: true }); } };
   }, []);
   useLayoutEffect(() => {
-    scene.current?.sync({ rows, visible, width: size.width, height: size.height, scroll, total: height, selected: selectedKey, hovered, overview, view: props.view, marks });
-  }, [ready, rows, visible, size, scroll, height, selectedKey, hovered, overview, props.view.start, props.view.duration, marks]);
+    scene.current?.sync({ rows, visible, width: size.width, height: size.height, scroll, total: height, selected: selectedKey, selectedPlanItem: props.selectedPlanItem, hovered, overview, view: props.view, marks });
+  }, [ready, rows, visible, size, scroll, height, selectedKey, props.selectedPlanItem, hovered, overview, props.view.start, props.view.duration, marks]);
+  function planKey(event: React.KeyboardEvent<HTMLButtonElement>, planned: PlannedTurn) {
+    if (event.nativeEvent.isComposing || !planned.planId) return;
+    if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); event.stopPropagation(); props.onCut(planned.id); return; }
+    const mode = event.ctrlKey && event.key === 'Enter' || event.shiftKey && event.key === 'F10' ? 'menu' : event.altKey ? ({ ArrowLeft: 'earlier', ArrowRight: 'later', ArrowUp: 'up', ArrowDown: 'down' } as const)[event.key as 'ArrowLeft' | 'ArrowRight' | 'ArrowUp' | 'ArrowDown'] : null;
+    if (!mode) return; event.preventDefault(); event.stopPropagation();
+    const box = event.currentTarget.getBoundingClientRect(); props.onPlanControl(planned.planId, planned.id, mode, { left: box.left, top: box.bottom + 4 });
+  }
   function overviewPosition(event: React.PointerEvent<HTMLDivElement>) {
     const box = event.currentTarget.getBoundingClientRect();
     moveTo((event.clientY - box.top) / Math.max(1, box.height) * height - visibleHeight / 2);
     props.onInteraction();
   }
-  return <section ref={viewport} className="timeline" data-ready={ready} data-future-count={layout.futureCount} data-overview={overview} data-hovered-row={hovered ?? undefined} aria-label="Timeline"
+  return <section ref={viewport} className="timeline" data-ready={ready} data-future-count={layout.futureCount} data-overview={overview} data-dependency-count={links.length} data-hovered-row={hovered ?? undefined} aria-label="Timeline"
     onPointerMove={event => {
       props.onInteraction();
       pointer.current = { x: event.clientX, y: event.clientY };
@@ -157,6 +194,7 @@ export function Timeline(props: Props) {
     }}>
     {dropTrack && visible.filter(row => row.track.id === dropTrack && !row.repairId).map(row => <div key={row.key} className="lane-file-drop" style={{ top: TOP_HEIGHT + row.top - scroll, height: row.height }}>Drop to attach · to Worker {row.track.label}</div>)}
     <div className="canvas-host" ref={host} />
+    {!!links.length && <ul className="sr-only" aria-label="Selected plan dependencies">{links.map(link => <li key={link.id}>{link.description}</li>)}</ul>}
     <button className="timeline-density" aria-pressed={overview} onClick={() => density(!overview)}>{overview ? 'Detail' : 'Overview'}</button>
     <div className="you-label">◆ <span>You</span></div>
     <InputMarks groups={markGroups} tracks={props.tracks} open={mark => {
@@ -182,9 +220,9 @@ export function Timeline(props: Props) {
             else return;
             event.preventDefault(); props.onInteraction(); choose(rows[Math.max(0, next)]);
           }}>
-          {mirror.map(row => { const result = row.repairId ? null : completionLabel(row.track); const status = result?.text ?? row.status; const warnings = row.clips.filter(clip => clip.warnings?.length).length; return <div role="row" id={row.key} key={row.key} aria-rowindex={row.index + 1} aria-selected={row.key === selectedKey} className={`${row.repairId ? 'repair-row' : 'track-row'}${overview ? ' strip-row' : ''}`} style={{ top: row.top, height: row.height }} onClick={() => open(row)}>
+          {mirror.map(row => { const result = row.repairId ? null : completionLabel(row.track); const status = !row.repairId && row.track.waitingForMemory ? 'queued · waiting for memory' : !row.repairId && row.track.queuePosition ? queueLabel(row.track.queuePosition) : result?.text ?? row.status; const warnings = row.clips.filter(clip => clip.warnings?.length).length; return <div role="row" id={row.key} key={row.key} aria-rowindex={row.index + 1} aria-selected={row.key === selectedKey} className={`${row.repairId ? 'repair-row' : 'track-row'}${overview ? ' strip-row' : ''}`} style={{ top: row.top, height: row.height }} onClick={() => open(row)}>
             <div role="gridcell" aria-label={`${row.track.label} · ${row.repairId ? 'for the commit' : row.track.title} · ${status}${!row.repairId && row.track.nextWaitsForAnswer ? ' · next waits for your answer' : ''}${warnings ? ` · ${warnings} step warnings` : ''}`}>
-              {overview ? <span className="sr-only">{row.track.label} · {row.track.title} · {status}{row.track.nextWaitsForAnswer ? ' · next waits for your answer' : ''}</span> : row.repairId ? <><span className="repair-branch">└</span><span>for the commit</span><span className={`track-status ${row.status}`}>{row.status === 'stopped' ? '■ stopped' : row.status === 'done' ? '✓' : row.status === 'waiting' ? '◇' : '◌'}</span>{row.canStop && <button aria-label={`Stop ${row.track.label} repair`} onClick={event => { event.stopPropagation(); props.onRepairStop(row.repairId!); }}>■</button>}</> : <><span className="track-letter" style={{ color: `#${row.track.color.toString(16)}` }}>{row.track.label}</span><span className="track-name" title={row.track.title}>{row.track.title}<small>{row.track.folder}</small>{result && <small className={`track-result ${result.tone}`}>{result.text}</small>}{row.track.nextWaitsForAnswer && <small className="track-question-wait">next waits for your answer</small>}</span><span className={`track-status ${result?.tone ?? row.status}`}>{result?.mark ?? (row.status === 'stopped' ? '■ stopped' : row.status === 'waiting' ? '◇' : '◌')}</span><TrackMenu track={row.track} disabled={props.targetDisabled} sayTo={props.onSayTo} /></>}
+              {overview ? <span className="sr-only">{row.track.label} · {row.track.title} · {status}{row.track.nextWaitsForAnswer ? ' · next waits for your answer' : ''}</span> : row.repairId ? <><span className="repair-branch">└</span><span>for the commit</span><span className={`track-status ${row.status}`}>{row.status === 'stopped' ? '■ stopped' : row.status === 'done' ? '✓' : row.status === 'waiting' ? '◇' : '◌'}</span>{row.canStop && <button aria-label={`Stop ${row.track.label} repair`} onClick={event => { event.stopPropagation(); props.onRepairStop(row.repairId!); }}>■</button>}</> : <>{!row.track.reviewer && <span className={`track-letter${row.track.planId ? ' planned-letter' : ''}`} style={{ color: `#${row.track.color.toString(16)}` }}>{row.track.label}</span>}<span className="track-name" title={row.track.title}>{row.track.reviewer ? row.track.label : row.track.title}<small>{row.track.folder}</small>{result && <small className={`track-result ${result.tone}`}>{result.text}</small>}{row.track.waitingForMemory && <small>queued · waiting for memory</small>}{!row.track.waitingForMemory && row.track.queuePosition && <small>{queueLabel(row.track.queuePosition)}</small>}{row.track.nextWaitsForAnswer && <small className="track-question-wait">next waits for your answer</small>}</span><span className={`track-status ${result?.tone ?? row.status}`}>{result?.mark ?? (row.status === 'stopped' ? '■ stopped' : row.status === 'waiting' ? '◇' : '◌')}</span>{row.track.reviewer && !!row.track.reviewJobs?.length && <button aria-label="Stop reviews" onClick={event=>{event.stopPropagation();props.onReviewStop?.(row.track.reviewJobs!);}}>■</button>}{!row.track.reviewer && <TrackMenu track={row.track} disabled={props.targetDisabled || !!row.track.planId} sayTo={props.onSayTo} />}</>}
             </div>
           </div>; })}
         </div>
@@ -200,9 +238,23 @@ export function Timeline(props: Props) {
           const end = Math.min(size.width - layout.futureWidth, LABEL_WIDTH + ((clip.running ? Math.max(clip.end, props.liveNow() ?? props.view.now) : clip.end) - props.view.start) / props.view.duration * layout.timeWidth);
           if (end < LABEL_WIDTH || left >= size.width - layout.futureWidth) return null;
           const warningText = clip.warnings?.map(warning => warning.text).join(' ') ?? '';
-          return <button key={clip.id} data-warning={warningText ? 'true' : undefined} ref={clip.running ? element => { if (element) activeButtons.current.set(clip.id, { element, clip, width: -1 }); else activeButtons.current.delete(clip.id); } : undefined} style={{ left, top: row.top + (row.repairId ? 1 : 20), height: row.repairId ? 24 : 35, width: Math.max(8, end - left) }} aria-label={`Open ${row.repairId ? 'repair ' : ''}step ${row.track.label}:${clip.ordinal ?? clip.id}: ${clip.label}${clip.assumptionCount ? `, ${clip.assumptionCount} assumptions` : ''}${warningText ? ` · Warning: ${warningText}` : ''}`} title={`${row.track.label}:${clip.ordinal ?? clip.id} · ${clip.label}${clip.approximate ? ' · approximate duration' : ''}${clip.effectCount ? ` · ${clip.effectCount} effects outside Git` : ''}${warningText ? ` · ${warningText}` : ''}`} onClick={() => { choose(row); props.onClip(row.track, clip, row.repairId); }}>{clip.ordinal ?? '•'}</button>;
+          return <button key={clip.id} data-warning={warningText ? 'true' : undefined} ref={clip.running ? element => { if (element) activeButtons.current.set(clip.id, { element, clip, width: -1 }); else activeButtons.current.delete(clip.id); } : undefined} style={{ left, top: row.top + (row.repairId ? 1 : 20) + (clip.reviewOffset ?? 0), height: row.repairId ? 24 : 35, width: Math.max(8, end - left) }} aria-label={`Open ${row.repairId ? 'repair ' : ''}step ${row.track.label}:${clip.ordinal ?? clip.id}: ${clip.label}${clip.assumptionCount ? `, ${clip.assumptionCount} assumptions` : ''}${warningText ? ` · Warning: ${warningText}` : ''}`} title={`${row.track.label}:${clip.ordinal ?? clip.id} · ${clip.label}${clip.approximate ? ' · approximate duration' : ''}${clip.effectCount ? ` · ${clip.effectCount} effects outside Git` : ''}${warningText ? ` · ${warningText}` : ''}`} onClick={() => { choose(row); props.onClip(row.track, clip, row.repairId); }}>{clip.ordinal ?? '•'}</button>;
         }))}</div>}
-        {!overview && <div className="future-actions" style={{ left: size.width - layout.futureWidth }}>{visible.filter(row => !row.repairId).map(row => <div className="future-row" key={row.key} style={{ position: 'absolute', top: row.top, height: row.height }}>{row.track.planned.slice(0, layout.futureCount).map((planned, index) => <button className="cut-turn" key={planned.id} style={{ marginLeft: layout.tileWidth - (index ? 24 : 20) }} aria-label={`Cut ${planned.label} from ${row.track.label}`} title={`Cut: ${planned.label} · ${planned.after}`} onClick={() => props.onCut(planned.id)} onKeyDown={event => { if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); props.onCut(planned.id); } }}>×</button>)}</div>)}</div>}
+        {!overview && <div className="future-actions" style={{ left: size.width - layout.futureWidth, width: layout.futureWidth }}>{visible.filter(row => !row.repairId).map(row => <div className="future-row" data-plan-track-id={row.track.id} key={row.key} style={{ position: 'absolute', top: row.top, height: row.height, width: layout.futureWidth }}>
+          {row.track.planned.slice(0, layout.futureCount).map((planned, index) => planned.reviewFix
+            ? <div key={planned.id} data-review-fix={planned.id} className="planned-item-hit" style={{ left: 8 + index * (layout.tileWidth + 8), width: layout.tileWidth }}>
+                <button className="planned-item-select" aria-haspopup="dialog" aria-label={`Open ${planned.label} · ${planned.after}`} onClick={() => props.onInput(planned.id)}><span className="sr-only">Review {planned.label}</span></button>
+                <button className="planned-item-cut" aria-label={`Cut ${planned.label} from ${row.track.label}`} onClick={() => props.onCut(planned.id)}>×</button>
+              </div>
+            : planned.planId
+            ? <div key={planned.id} data-plan-item-id={planned.id} data-auto-plan={planned.planId} className="planned-item-hit" style={{ left: 8 + index * (layout.tileWidth + 8), width: layout.tileWidth }}>
+                <button className="planned-item-select" aria-haspopup={planned.blocked ? 'menu' : 'dialog'} aria-pressed={planned.id === props.selectedPlanItem} title={`${planned.label}\n${planned.after}`} aria-label={`${planned.label} · ${planned.after}`} onClick={event => { const box = event.currentTarget.getBoundingClientRect(); props.onPlan(planned.planId!, planned.id, { left: box.left, top: box.bottom + 4 }); }} onContextMenu={event => { event.preventDefault(); props.onPlanControl(planned.planId!, planned.id, 'menu', { left: event.clientX, top: event.clientY }); }} onKeyDown={event => planKey(event, planned)}><span className="sr-only">Review {planned.label}</span></button>
+                <button className="planned-item-cut" aria-label={`Cut ${planned.label} from ${row.track.label}`} onClick={() => props.onCut(planned.id)}>×</button>
+              </div>
+            : <button className="cut-turn" key={planned.id} style={{ marginLeft: layout.tileWidth - (index ? 24 : 20) }} aria-label={`Cut ${planned.label} from ${row.track.label}`} title={`Cut: ${planned.label} · ${planned.after}`} onClick={() => props.onCut(planned.id)} onKeyDown={event => { if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); props.onCut(planned.id); } }}>×</button>)}
+          {row.track.planned.length > layout.futureCount && layout.futureCount > 0 && <PlannedOverflow items={row.track.planned.slice(layout.futureCount)} track={row.track.label} selected={props.selectedPlanItem} control={planKey}
+            openItem={item => { if (item.planId) props.onPlan(item.planId, item.id); else props.onInput(item.id); }} />}
+        </div>)}</div>}
       </div>
     </div>
     <div className="track-overview" role="scrollbar" tabIndex={0} aria-label="All tracks" aria-controls={scrollId} aria-orientation="vertical" aria-valuemin={0} aria-valuemax={Math.max(0, height - visibleHeight)} aria-valuenow={Math.round(scroll)} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); overviewPosition(event); }} onPointerMove={event => { if (event.currentTarget.hasPointerCapture(event.pointerId)) overviewPosition(event); }} onPointerUp={event => event.currentTarget.releasePointerCapture(event.pointerId)} onKeyDown={event => {

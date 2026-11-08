@@ -7,7 +7,7 @@ use intercat_daemon::{
     journal::{Admission, Journal},
     runtime::WorkerState,
     secrets::Key,
-    start_condition::Turn,
+    start_condition::{Source, Turn},
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -124,7 +124,10 @@ async fn waits_for_the_original_turn_even_if_classification_and_restart_are_late
     frame(&journal, &next, "turn/completed").await?;
     let pending = classify(&journal, "after-turn").await?;
     assert_eq!(pending["state"], "placed");
-    assert_eq!(pending["startCondition"]["source"], json!(source));
+    assert_eq!(
+        pending["startCondition"]["source"],
+        json!(Source::Turn(source.clone()))
+    );
     assert_eq!(pending["startCondition"]["ready"], false);
     assert!(
         reserve(&journal, &pending)
@@ -146,12 +149,18 @@ async fn waits_for_the_original_turn_even_if_classification_and_restart_are_late
         })
         .await?;
     let restored = word(&journal, &id.to_string()).await?;
-    assert_eq!(restored["startCondition"]["source"], json!(source));
+    assert_eq!(
+        restored["startCondition"]["source"],
+        json!(Source::Turn(source.clone()))
+    );
     assert_eq!(restored["startCondition"]["ready"], false);
     drop(journal);
     let journal = Journal::open(&path, Key::new([7; 32])).await?;
     let pending = word(&journal, &id.to_string()).await?;
-    assert_eq!(pending["startCondition"]["source"], json!(source));
+    assert_eq!(
+        pending["startCondition"]["source"],
+        json!(Source::Turn(source.clone()))
+    );
     assert_eq!(pending["startCondition"]["ready"], false);
     frame(&journal, &source, "turn/completed").await?;
     let ready = word(&journal, &id.to_string()).await?;
@@ -186,7 +195,9 @@ async fn multiple_turns_require_a_recorded_choice_and_replays_keep_one_new_track
                 asked["id"].as_str().unwrap().into(),
                 1,
                 Resolution::Confirm {
-                    choice: Choice::AfterWorkerTurn { source: forged }
+                    choice: Choice::After {
+                        source: Source::Turn(forged)
+                    }
                 }
             )
             .await
@@ -198,8 +209,8 @@ async fn multiple_turns_require_a_recorded_choice_and_replays_keep_one_new_track
     );
     let op = Uuid::now_v7();
     let resolution = Resolution::Confirm {
-        choice: Choice::AfterWorkerTurn {
-            source: source.clone(),
+        choice: Choice::After {
+            source: Source::Turn(source.clone()),
         },
     };
     let chosen = journal
@@ -211,7 +222,10 @@ async fn multiple_turns_require_a_recorded_choice_and_replays_keep_one_new_track
         )
         .await?;
     assert_eq!(chosen["state"], "placed");
-    assert_eq!(chosen["startCondition"]["source"], json!(source));
+    assert_eq!(
+        chosen["startCondition"]["source"],
+        json!(Source::Turn(source.clone()))
+    );
     assert_eq!(chosen["startCondition"]["ready"], false);
     let replay = journal
         .resolve_input(op, asked["id"].as_str().unwrap().into(), 1, resolution)
@@ -291,7 +305,10 @@ async fn rewording_captures_current_turns_and_rejects_a_choice_from_the_old_card
         })
         .await?;
     let changed = classify(&journal, "after-turn").await?;
-    assert_eq!(changed["startCondition"]["source"], json!(b));
+    assert_eq!(
+        changed["startCondition"]["source"],
+        json!(Source::Turn(b.clone()))
+    );
     assert!(
         journal
             .resolve_input(
@@ -299,7 +316,9 @@ async fn rewording_captures_current_turns_and_rejects_a_choice_from_the_old_card
                 asked["id"].as_str().unwrap().into(),
                 1,
                 Resolution::Confirm {
-                    choice: Choice::AfterWorkerTurn { source: a }
+                    choice: Choice::After {
+                        source: Source::Turn(a)
+                    }
                 }
             )
             .await
@@ -338,7 +357,10 @@ async fn saving_the_context_is_atomic_with_admission() -> Result<()> {
         .stage_utterance(id, "Wait for this turn".into(), Target::New, None, vec![])
         .await?;
     let pending = classify(&journal, "after-turn").await?;
-    assert_eq!(pending["startCondition"]["source"], json!(source));
+    assert_eq!(
+        pending["startCondition"]["source"],
+        json!(Source::Turn(source.clone()))
+    );
     Ok(())
 }
 
@@ -390,7 +412,9 @@ async fn a_failed_source_choice_rolls_back_its_revision_and_track_creation() -> 
     )?;
     let op = Uuid::now_v7();
     let resolution = Resolution::Confirm {
-        choice: Choice::AfterWorkerTurn { source },
+        choice: Choice::After {
+            source: Source::Turn(source),
+        },
     };
     assert!(
         journal
@@ -452,8 +476,8 @@ async fn selecting_the_source_and_confirming_ok_still_wait_for_the_original_turn
             asked["id"].as_str().unwrap().into(),
             1,
             Resolution::Confirm {
-                choice: Choice::AfterWorkerTurn {
-                    source: source.clone(),
+                choice: Choice::After {
+                    source: Source::Turn(source.clone()),
                 },
             },
         )
@@ -473,7 +497,10 @@ async fn selecting_the_source_and_confirming_ok_still_wait_for_the_original_turn
         })
         .await?;
     assert_eq!(accepted["state"], "placed");
-    assert_eq!(accepted["startCondition"]["source"], json!(source));
+    assert_eq!(
+        accepted["startCondition"]["source"],
+        json!(Source::Turn(source.clone()))
+    );
     assert_eq!(accepted["startCondition"]["ready"], false);
     assert!(
         reserve(&journal, &accepted)

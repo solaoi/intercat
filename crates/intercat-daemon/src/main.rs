@@ -288,6 +288,7 @@ async fn run() -> Result<()> {
         &path,
         credentials.as_deref(),
         intercat_daemon::host::Boundary {
+            steps: None,
             profile: crate::host::Profile::Worker,
             secrets: &[],
             rpc: &data.join("run"),

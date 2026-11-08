@@ -5,7 +5,7 @@ export function lanes(tracks: Track[], overview = false): Lane[] {
   const result: Lane[] = [];
   let top = 0;
   for (const track of tracks) {
-    const height = overview ? 12 : ROW_HEIGHT;
+    const height = overview ? 12 : ROW_HEIGHT + Math.max(0,(track.reviewRows ?? 1)-1)*40;
     result.push({ key: `track-${track.id}`, track, repairId: null, top, height, index: result.length, clips: track.clips, status: track.status, canStop: false });
     top += height;
     for (const repair of track.repairs) {

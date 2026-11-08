@@ -3,10 +3,11 @@ import type { TimelineMark } from '../bridge';
 import { groupMarks, markLabel } from './inputMarkLayout';
 import { formatTime, geometry, LABEL_WIDTH, TOP_HEIGHT, type TimelineView } from './model';
 import type { Lane } from './viewport';
+import { dependencyLinks } from './futureLayout';
 
 interface SceneState {
   rows: Lane[]; visible: Lane[]; width: number; height: number; scroll: number; total: number;
-  selected: string; hovered: string | null; overview: boolean; view: TimelineView; marks: TimelineMark[];
+  selected: string; selectedPlanItem: string | null; hovered: string | null; overview: boolean; view: TimelineView; marks: TimelineMark[];
 }
 interface ActiveBar { sprite: NineSliceSprite; start: number; end: number }
 interface RowScene { container: Container; background: Graphics; content: Container; row: Lane; signature: string; active: ActiveBar[]; texture?: Texture }
@@ -17,6 +18,19 @@ function label(parent: Container, value: string, x: number, y: number, color: nu
 function segment(graphic: Graphics, x: number, y: number, toX: number, toY: number, color: number, alpha = 1) {
   graphic.moveTo(x, y).lineTo(toX, toY).stroke({ color, width: 1, alpha });
 }
+const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+function fittedLabel(parent: Container, value: string, x: number, y: number, color: number, width: number, size = 10) {
+  const text = label(parent, value, x, y, color, size);
+  if (text.width <= width) return;
+  const parts = [...graphemes.segment(value)].map(part => part.segment);
+  let low = 0, high = parts.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    text.text = `${parts.slice(0, middle).join('')}…`;
+    if (text.width <= width) low = middle; else high = middle - 1;
+  }
+  text.text = width > 8 ? `${parts.slice(0, low).join('')}…` : '';
+}
 
 /** Scene objects cover only the viewport. Their geometry survives clock ticks. */
 export class TimelineScene {
@@ -25,6 +39,7 @@ export class TimelineScene {
   private headings = new Container();
   private marks = new Container();
   private layer = new Container();
+  private links = new Graphics();
   private playhead = new Container();
   private shade = new Sprite(Texture.WHITE);
   private head = new Sprite(Texture.WHITE);
@@ -42,7 +57,7 @@ export class TimelineScene {
     app.stage.eventMode = 'none';
     this.shade.alpha = 0.018; this.head.alpha = 0.75;
     this.playhead.addChild(this.shade, this.head);
-    app.stage.addChild(this.grid, this.layer, this.headings, this.marks, this.playhead, this.overview, this.position);
+    app.stage.addChild(this.grid, this.layer, this.links, this.headings, this.marks, this.playhead, this.overview, this.position);
   }
   destroy() {
     this.markTexture?.destroy(true);
@@ -135,7 +150,7 @@ export class TimelineScene {
         scene = { container, background, content, row, signature: '', active: [] }; this.rowScenes.set(row.key, scene);
       }
       scene.container.y = TOP_HEIGHT + row.top - state.scroll;
-      const signature = `${key}/${row.height}/${row.track.color}/${row.status}/${row.track.planned.map(item => item.id + item.label + item.after).join('/')}`;
+      const signature = `${key}/${row.height}/${row.track.color}/${row.status}/${state.selectedPlanItem}/${row.track.planned.map(item => item.id + item.label + item.after).join('/')}`;
       if (scene.row.clips !== row.clips || scene.signature !== signature) {
         scene.row = row; scene.signature = signature; this.drawRow(scene);
       }
@@ -151,6 +166,19 @@ export class TimelineScene {
     let mask = this.layer.mask as Graphics | null;
     if (!mask) { mask = new Graphics(); mask.label = 'rows-mask'; this.app.stage.addChild(mask); this.layer.mask = mask; }
     mask.clear().rect(0, TOP_HEIGHT, state.width - 8, Math.max(0, state.height - TOP_HEIGHT)).fill(0xffffff);
+    this.links.mask = mask;
+    this.links.y = TOP_HEIGHT - state.scroll;
+    this.links.clear();
+    if (!state.overview) for (const link of dependencyLinks(state.rows, state.width, state.view, state.selectedPlanItem)) {
+      const points = link.points;
+      this.links.moveTo(points[0].x, points[0].y);
+      for (const point of points.slice(1)) this.links.lineTo(point.x, point.y);
+      this.links.stroke({ color: 0xb6c3dc, width: 1.2, alpha: 0.8 });
+      this.links.circle(points[0].x, points[0].y, 2).fill(0xb6c3dc);
+      const end = points.at(-1)!, before = points.at(-2)!;
+      const direction = Math.sign(end.y - before.y);
+      this.links.moveTo(end.x - 3, end.y - direction * 4).lineTo(end.x, end.y).lineTo(end.x + 3, end.y - direction * 4).stroke({ color: 0xb6c3dc, width: 1.2 });
+    }
     const overviewKey = `${state.width}/${state.height}/${state.total}/${state.rows.map(row => `${row.track.color}:${row.status}:${row.height}`).join('/')}`;
     if (overviewKey !== this.overviewKey) {
       this.overviewKey = overviewKey; this.overview.clear();
@@ -176,17 +204,18 @@ export class TimelineScene {
     const statics = new Container(), graphics = new Graphics();
     statics.addChild(graphics);
     const compact = row.repairId !== null;
-    const top = state.overview ? 2 : compact ? 4 : 22;
+    const baseTop = state.overview ? 2 : compact ? 4 : 22;
     const height = state.overview ? 8 : compact ? 18 : 31;
     if (!state.overview) for (const clip of row.clips) {
       for (const at of clip.assumptionTimes ?? []) {
-        const x = toX(at), y = top - 9;
+        const x = toX(at), y = baseTop - 9;
         if (x >= LABEL_WIDTH + 5 && x <= right - 5) {
           graphics.poly([x, y - 5, x + 5, y, x, y + 5, x - 5, y]).fill(0xd9a24a);
         }
       }
     }
     for (const clip of row.clips) {
+      const top=baseTop+(state.overview?0:clip.reviewOffset??0);
       const left = Math.max(LABEL_WIDTH, toX(clip.start)), end = Math.min(right, toX(clip.running ? Math.max(clip.end, state.view.now) : clip.end));
       if (end < LABEL_WIDTH || left >= right) continue;
       const width = Math.max(3, end - left - 2);
@@ -211,10 +240,11 @@ export class TimelineScene {
       if (width > 25) label(statics, clip.label.slice(0, Math.max(0, Math.floor((width - 20) / 5.5))) + (clip.label.length * 5.5 > width - 12 ? '…' : ''), left + 6, top + 3, row.track.color);
     }
     if (!row.repairId && !state.overview) row.track.planned.slice(0, futureCount).forEach((planned, col) => {
-      const x = right + 8 + col * (tileWidth + 8);
-      for (let p = 0; p < tileWidth; p += 8) { segment(graphics, x + p, 15, x + Math.min(p + 4, tileWidth), 15, row.track.color, 0.6); segment(graphics, x + p, 60, x + Math.min(p + 4, tileWidth), 60, row.track.color, 0.6); }
-      label(statics, planned.label.slice(0, 23), x + 9, 23, row.track.color);
-      label(statics, planned.after.slice(0, 23), x + 9, 40, 0x747984, 9);
+      const x = right + 8 + col * (tileWidth + 8), color = planned.reviewFix ? 0xb497cf : row.track.color;
+      for (let p = 0; p < tileWidth; p += 8) { segment(graphics, x + p, 15, x + Math.min(p + 4, tileWidth), 15, color, 0.6); segment(graphics, x + p, 60, x + Math.min(p + 4, tileWidth), 60, color, 0.6); }
+      if (planned.id === state.selectedPlanItem) graphics.roundRect(x, 15, tileWidth, 45, 4).stroke({ color: 0xededef, width: 1.5 });
+      fittedLabel(statics, planned.label, x + 9, 23, color, tileWidth - 18);
+      fittedLabel(statics, planned.after, x + 9, 40, 0x8f96a4, tileWidth - 18, 9);
     });
     const bounds = statics.getLocalBounds();
     if (bounds.width > 0 && bounds.height > 0) {

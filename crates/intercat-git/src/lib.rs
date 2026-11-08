@@ -58,6 +58,25 @@ pub fn added_lines(before: &[u8], after: &[u8]) -> Vec<std::ops::Range<u32>> {
         .collect()
 }
 
+/// Whether a diff changes an existing, one-based inclusive line range.
+/// Insertions before or after the range only move it; insertions inside touch it.
+pub fn touches_lines(before: &[u8], after: &[u8], start: u32, end: u32) -> bool {
+    if start == 0 || end < start {
+        return true;
+    }
+    use gix::diff::blob::{Algorithm, Diff, InternedInput};
+    let input = InternedInput::new(before, after);
+    Diff::compute(Algorithm::Histogram, &input)
+        .hunks()
+        .any(|hunk| {
+            if hunk.before.is_empty() {
+                hunk.before.start > start - 1 && hunk.before.start < end
+            } else {
+                hunk.before.start < end && hunk.before.end > start - 1
+            }
+        })
+}
+
 pub const ENV_EXAMPLES: [&str; 4] = [".env.example", ".env.sample", ".env.template", ".env.dist"];
 
 pub fn secret_path(path: &str) -> bool {

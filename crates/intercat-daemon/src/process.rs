@@ -40,7 +40,10 @@ impl Scan {
 }
 
 fn information(pid: u32) -> io::Result<BSDInfo> {
-    pidinfo::<BSDInfo>(pid as i32, 0).map_err(io::Error::other)
+    // The nonzero argument includes exited children awaiting a reap. Without
+    // it, Darwin returns ESRCH for those PIDs even though kill(pid, 0) succeeds.
+    // Keep their start time available for the same identity checks as live PIDs.
+    pidinfo::<BSDInfo>(pid as i32, 1).map_err(io::Error::other)
 }
 
 fn from_info(info: &BSDInfo) -> Identity {
@@ -58,7 +61,7 @@ pub fn identity(pid: u32) -> io::Result<Identity> {
 /// Whether the exact process is still alive, ignoring zombies awaiting a reap.
 pub fn is_alive(expected: Identity) -> bool {
     match information(expected.pid) {
-        Ok(info) => from_info(&info) == expected && info.pbi_status != 5,
+        Ok(info) => from_info(&info) == expected && info.pbi_status != libc::SZOMB,
         Err(_) => {
             // An inaccessible PID is not evidence of death.
             (unsafe { libc::kill(expected.pid as i32, 0) }) != -1
@@ -454,7 +457,7 @@ impl Tracker {
         let mut unreadable = Vec::new();
         for pid in pids_by_type(ProcFilter::ByUID { uid })? {
             if let Ok(info) = information(pid)
-                && info.pbi_status != 5
+                && info.pbi_status != libc::SZOMB
             {
                 infos.insert(pid, info);
             }
@@ -481,9 +484,7 @@ impl Tracker {
                 .collect();
             // A fork can race the PID enumeration. An empty sample alone is
             // not proof that the process group ceased to exist.
-            let gone = members.is_empty()
-                && unsafe { libc::kill(-(root.pid as i32), 0) } == -1
-                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            let gone = members.is_empty() && group_inactive(root.pid)?;
             if reused || gone {
                 self.owned_groups.remove(&root.pid);
             } else {
@@ -601,7 +602,7 @@ impl Tracker {
         if from_info(&info) != expected {
             return Ok(SignalResult::IdentityChanged);
         }
-        if info.pbi_status == 5 {
+        if info.pbi_status == libc::SZOMB {
             return Ok(SignalResult::Gone);
         }
         let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
@@ -615,6 +616,31 @@ impl Tracker {
         }
         Ok(SignalResult::Sent)
     }
+}
+
+fn group_inactive(group: u32) -> io::Result<bool> {
+    // A group can still exist while every member awaits reaping. Query the
+    // group itself (including zombies), not just the earlier UID sample.
+    let absent = || unsafe { libc::kill(-(group as i32), 0) } == -1
+        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    let members = match pids_by_type(ProcFilter::ByProgramGroup { pgrpid: group }) {
+        Ok(members) => members,
+        Err(_) if absent() => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if members.is_empty() {
+        return Ok(absent());
+    }
+    for pid in members {
+        match information(pid) {
+            Ok(info) if info.pbi_status == libc::SZOMB => {}
+            Err(_)
+                if unsafe { libc::kill(pid as i32, 0) } == -1
+                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -637,5 +663,53 @@ mod tests {
         assert!(!environment_contains(&bytes, b"INTERCAT_HOST=wrong"));
         assert!(environment_contains(&bytes, b"INTERCAT_HOST=right"));
         assert!(!environment_contains(&bytes, b"HOST=right"));
+    }
+
+    #[test]
+    fn exited_child_is_stopped_before_its_parent_reaps_it() -> std::io::Result<()> {
+        use super::*;
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()?;
+        let result = (|| {
+            let id = identity(child.id())?;
+            let mut tracker = Tracker::new_process_group(uuid::Uuid::now_v7().to_string(), id)?;
+            child.kill()?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let info = information(id.pid)?;
+                if info.pbi_status == libc::SZOMB {
+                    assert_eq!(from_info(&info), id);
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "Child did not exit");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!is_alive(id));
+            assert_eq!(tracker.terminate(id, false)?, SignalResult::Gone);
+            assert!(tracker.refresh()?.is_empty());
+            Ok(())
+        })();
+        let _ = child.kill();
+        child.wait()?;
+        result
+    }
+
+    #[test]
+    fn a_reaped_group_is_removed_from_tracking() -> std::io::Result<()> {
+        use super::*;
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()?;
+        let id = identity(child.id())?;
+        let mut tracker = Tracker::new_process_group(uuid::Uuid::now_v7().to_string(), id)?;
+        child.kill()?;
+        child.wait()?;
+        assert!(tracker.refresh()?.is_empty());
+        Ok(())
     }
 }

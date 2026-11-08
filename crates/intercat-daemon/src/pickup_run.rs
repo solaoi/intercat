@@ -57,13 +57,15 @@ fn check(stopping: &tokio::sync::watch::Receiver<bool>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare(
+    host_memory: std::sync::Arc<crate::host_memory::Pool>,
     journal: &Journal,
     config: Config,
     data: &Path,
     rpc: &Path,
     mut recovery: Recovery,
-    capacity: std::sync::Arc<tokio::sync::Semaphore>,
+    capacity: std::sync::Arc<crate::scheduler::Capacity>,
     mut stopping: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Value> {
     check(&stopping)?;
@@ -157,6 +159,7 @@ pub async fn prepare(
         }).await??;
         source.context["snapshotChanges"] = changes;
         let mut summary = crate::handoff_run::run(
+            host_memory.clone(),
             journal,
             &config,
             data,
@@ -187,6 +190,10 @@ pub async fn prepare(
         })
         .await??;
         check(&stopping)?;
+        let memory = host_memory
+            .request(recovery.request.op_id.to_string())
+            .acquire(crate::msp::StartGuard::Shutdown(stopping.clone()))
+            .await?;
         let mut host = host::Host::spawn(
             &config.binary,
             &data
@@ -197,6 +204,7 @@ pub async fn prepare(
             config.path.as_ref(),
             Some(&config.credentials),
             host::Boundary {
+                steps: None,
                 profile: crate::host::Profile::Worker,
                 secrets: &[],
                 rpc,
@@ -204,6 +212,7 @@ pub async fn prepare(
             },
         )
         .await?;
+        memory.attach(host.identity);
         let result=async {
             check(&stopping)?;
             tokio::select! { biased;

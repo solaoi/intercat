@@ -10,6 +10,88 @@ fn request(session: &str, current: &Value, book: Value, op: Uuid) -> drafts::Sav
 }
 
 #[tokio::test]
+async fn item_instruction_draft_keeps_scope_and_pending_identity_after_restart() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("db");
+    let store = journal(&path).await?;
+    let current = store.read_drafts("session".into()).await?;
+    let mut book = current["book"].clone();
+    let plan = Uuid::now_v7();
+    let item = Uuid::now_v7();
+    let track = Uuid::now_v7();
+    let operation = Uuid::now_v7();
+    book["entries"]["work"]["text"] = json!("Keep the ordinary dummy draft.");
+    book["active"] = json!("item-instruction");
+    book["stack"] = json!(["work"]);
+    book["entries"]["item-instruction"] = json!({"text":"Add a dummy check.","target":{"mode":"lock","trackId":track},"attachments":[],
+        "context":{"kind":"continuation","planId":plan,"itemId":item,"trackId":track,"revision":4,"title":"Dummy item"},
+        "pending":{"kind":"work","request":{"opId":operation,"text":"Add a dummy check.","target":{"mode":"lock","trackId":track},"planItem":{"planId":plan,"itemId":item,"revision":4}}}});
+    for field in ["planId", "itemId", "revision"] {
+        let mut wrong = book.clone();
+        wrong["entries"]["item-instruction"]["pending"]["request"]["planItem"][field] = Value::Null;
+        assert!(
+            store
+                .save_drafts(request("session", &current, wrong, Uuid::now_v7()))
+                .await
+                .is_err()
+        );
+    }
+    let mut wrong = book.clone();
+    wrong["entries"]["item-instruction"]["target"]["trackId"] = json!(Uuid::now_v7());
+    assert!(
+        store
+            .save_drafts(request("session", &current, wrong, Uuid::now_v7()))
+            .await
+            .is_err()
+    );
+    store
+        .save_drafts(request("session", &current, book.clone(), Uuid::now_v7()))
+        .await?;
+    drop(store);
+    let reopened = journal(&path).await?;
+    assert_eq!(reopened.read_drafts("session".into()).await?["book"], book);
+    Ok(())
+}
+
+#[tokio::test]
+async fn plan_revision_draft_preserves_its_exact_operation_after_restart() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("db");
+    let store = journal(&path).await?;
+    let current = store.read_drafts("session".into()).await?;
+    let mut book = current["book"].clone();
+    let plan = Uuid::now_v7();
+    let item = Uuid::now_v7();
+    let token = Uuid::now_v7();
+    let operation = Uuid::now_v7();
+    book["entries"]["work"]["text"] = json!("Keep this ordinary dummy draft.");
+    book["active"] = json!("revision");
+    book["stack"] = json!(["work"]);
+    book["entries"]["revision"] = json!({
+        "text":"Use a blue dummy badge.", "target":{"mode":"none"}, "attachments":[],
+        "context":{"kind":"plan-item","planId":plan,"itemId":item,"token":token,"revision":4,"title":"Dummy badge"},
+        "pending":{"kind":"plan-item","request":{"kind":"submit","planId":plan,"token":token,"revision":4,"opId":operation,"text":"Use a blue dummy badge."}}
+    });
+    for field in ["planId", "token", "revision", "text"] {
+        let mut invalid = book.clone();
+        invalid["entries"]["revision"]["pending"]["request"][field] = Value::Null;
+        assert!(
+            store
+                .save_drafts(request("session", &current, invalid, Uuid::now_v7()))
+                .await
+                .is_err()
+        );
+    }
+    store
+        .save_drafts(request("session", &current, book.clone(), Uuid::now_v7()))
+        .await?;
+    drop(store);
+    let store = journal(&path).await?;
+    assert_eq!(store.read_drafts("session".into()).await?["book"], book);
+    Ok(())
+}
+
+#[tokio::test]
 async fn approval_replies_keep_their_owner_and_pending_response_through_restart() -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("db");
@@ -249,5 +331,43 @@ async fn an_edit_draft_keeps_its_lease_and_exact_pending_finish_across_restart()
     drop(store);
     let store = journal(&path).await?;
     assert_eq!(store.read_drafts("s".into()).await?["book"], book);
+    Ok(())
+}
+
+#[tokio::test]
+async fn plan_reply_draft_keeps_the_normal_target_and_exact_reply_receipt_after_restart()
+-> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("db");
+    let store = journal(&path).await?;
+    let current = store.read_drafts("session".into()).await?;
+    let mut book = current["book"].clone();
+    let plan = Uuid::now_v7();
+    let proposal = Uuid::now_v7();
+    let operation = Uuid::now_v7();
+    let target = Uuid::now_v7();
+    book["entries"]["work"]["text"] = json!("Keep the ordinary dummy draft.");
+    book["entries"]["work"]["target"] = json!({"mode":"lock","trackId":target});
+    book["active"] = json!("plan-reply");
+    book["stack"] = json!(["work"]);
+    book["entries"]["plan-reply"] = json!({"text":"Use separate dummy files.","target":{"mode":"none"},"attachments":[],
+        "context":{"kind":"plan-reply","planId":plan,"questionId":proposal,"revision":4,"question":"Dummy overlap","label":"A + B"},
+        "pending":{"kind":"plan-reply","request":{"opId":operation,"planId":plan,"questionId":proposal,"revision":4,"question":"Dummy overlap","text":"Use separate dummy files."}}});
+    for field in ["planId", "questionId", "revision", "question", "text"] {
+        let mut invalid = book.clone();
+        invalid["entries"]["plan-reply"]["pending"]["request"][field] = Value::Null;
+        assert!(
+            store
+                .save_drafts(request("session", &current, invalid, Uuid::now_v7()))
+                .await
+                .is_err()
+        );
+    }
+    store
+        .save_drafts(request("session", &current, book.clone(), Uuid::now_v7()))
+        .await?;
+    drop(store);
+    let store = journal(&path).await?;
+    assert_eq!(store.read_drafts("session".into()).await?["book"], book);
     Ok(())
 }

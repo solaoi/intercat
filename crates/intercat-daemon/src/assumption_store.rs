@@ -142,7 +142,7 @@ pub fn finish(db: &mut Connection, ticket: &Ticket, result: Finish) -> Result<bo
                         clip_id: source.clip.clone(),
                         question_id: None,
                         question: item.question.clone(),
-                        options: item.options.clone(),
+                        options: item.options.to_vec(),
                         text: item.assumed.clone(),
                         evidence: item.evidence.clone(),
                         revision: existing.as_ref().map_or(1, |value| value.revision + 1),
@@ -295,7 +295,15 @@ pub fn respond(db: &mut Connection, command: &Command) -> Result<Value> {
                 None,
                 &[],
                 None,
+                true,
+                None,
             )?;
+            let (session, turn): (String, Option<String>) = tx.query_row(
+                "SELECT json_extract(record,'$.sessionId'),json_extract(record,'$.turnId') FROM timeline_clips WHERE id=?1",
+                [&assumption.clip_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            if let Some(turn) = turn {
+                crate::plan_continuation::attach_to_turn(&tx, &input, &session, &turn)?;
+            }
             assumption.state = "changed".into();
             assumption.changed_at = Some(now);
             assumption.change_input_id = Some(input);

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 use uuid::Uuid;
 
-async fn verify_workspace(branch: &Branch, project: &crate::project::Project) -> Result<()> {
+async fn verify_workspace(branch: &Branch, project: &crate::project::Folder) -> Result<()> {
     let path = branch.workspace.path.clone();
     let expected = ObjectId::from_hex(branch.checkpoint.sha.as_bytes())?;
     let common = project.common_dir.clone();
@@ -36,6 +36,7 @@ async fn finish(journal: &Journal, operation: Uuid) -> Result<()> {
     Ok(())
 }
 pub async fn prepare(
+    host_memory: std::sync::Arc<crate::host_memory::Pool>,
     journal: &Journal,
     config: Config,
     data: &Path,
@@ -46,7 +47,7 @@ pub async fn prepare(
     let mut branch = journal.branch(Change::Prepare(request)).await?;
     if branch.phase == Phase::Preparing {
         let snapshot = journal.snapshot().await?;
-        let project: crate::project::Project = serde_json::from_value(snapshot["project"].clone())?;
+        let project = crate::folders::from_snapshot(&snapshot, &branch.track_id)?;
         let mut source = project.source().await?;
         source.head = ObjectId::from_hex(branch.checkpoint.sha.as_bytes())?;
         let repository = source.root.clone();
@@ -119,6 +120,10 @@ pub async fn prepare(
             return Err("Shutdown has started.".into());
         }
         let denied = vec![project.root, project.common_dir];
+        let memory = host_memory
+            .request(branch.request.op_id.to_string())
+            .acquire(crate::msp::StartGuard::Shutdown(stopping.clone()))
+            .await?;
         let mut host = host::Host::spawn(
             &config.binary,
             &host_dir,
@@ -126,6 +131,7 @@ pub async fn prepare(
             config.path.as_ref(),
             Some(&config.credentials),
             host::Boundary {
+                steps: None,
                 profile: crate::host::Profile::Worker,
                 secrets: &[],
                 rpc,
@@ -133,6 +139,7 @@ pub async fn prepare(
             },
         )
         .await?;
+        memory.attach(host.identity);
         let operation = async {
             host.connection.client.set_redaction(
                 journal
@@ -238,7 +245,7 @@ pub async fn activate(journal: &Journal, operation: Uuid) -> Result<Branch> {
     if branch.phase == Phase::Ready {
         return Ok(branch);
     }
-    let project = serde_json::from_value(snapshot["project"].clone())?;
+    let project = crate::folders::from_snapshot(&snapshot, &branch.track_id)?;
     verify_workspace(&branch, &project).await?;
     journal.branch(Change::Activate(operation)).await
 }

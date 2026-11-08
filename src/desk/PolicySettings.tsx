@@ -4,6 +4,8 @@ import { ConfirmationSetting } from './Confirmation';
 import { ProjectSecrets } from './ProjectSecrets';
 import { PrivacySettings } from './PrivacySettings';
 import { CheckEnvironment } from './CheckEnvironment';
+import { ExecutionLimits } from './ExecutionLimits';
+import { PlansStartSetting } from '../plans/PlansStartSetting';
 import type { EditorPresentation } from '../bridge';
 
 export function PolicySettings({ open, stops, close, saved, project, tracks, confirmation, confirmationSaved, privacy, privacyEnabled, localReady, privacySaved, presentation, characterChanged }: { presentation: EditorPresentation | null; characterChanged: (value: 'speak' | 'mute') => Promise<void>; privacy: PrivacyState; privacyEnabled: boolean; localReady: boolean; privacySaved: (value: PrivacyState) => void; confirmation?: ConfirmationStatus; confirmationSaved: (value: ConfirmationStatus) => void; open: boolean; stops: Stops; project?: ProjectSecretState | null; tracks: LiveTrack[]; close: () => void; saved: (stops: Stops) => void }) {
@@ -53,6 +55,8 @@ export function PolicySettings({ open, stops, close, saved, project, tracks, con
       <option value="ask">Ask every time</option><option value="background">Keep working in the background</option><option value="stop">Stop everything</option>
     </select>
     {open && project && <ProjectSecrets project={project} tracks={tracks} />}
+    {open && <ExecutionLimits />}
+    {open && <PlansStartSetting />}
     {open && <CheckEnvironment />}
     {error && <p role="alert">{error}</p>}
     <footer><button disabled={saving} onClick={close}>Cancel</button><button disabled={saving} onClick={() => { void save(); }}>{saving ? 'Saving…' : 'Save'}</button></footer>

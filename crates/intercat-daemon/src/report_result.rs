@@ -86,7 +86,7 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn final_report(db: &Connection, session: &str, turn: &str) -> Result<Option<Value>> {
+pub(crate) fn final_report(db: &Connection, session: &str, turn: &str) -> Result<Option<Value>> {
     let row: Option<(String, i64, String)> = db.query_row(
         "SELECT item,revision,record FROM timeline_items WHERE session=?1 AND json_extract(record,'$.turnId')=?2
          AND json_extract(record,'$.kind')='agentMessage' AND json_extract(record,'$.messagePhase')='finalAnswer'
@@ -105,6 +105,25 @@ fn final_report(db: &Connection, session: &str, turn: &str) -> Result<Option<Val
     Ok(record["text"].as_str().and_then(parse).map(|footer| json!({
         "itemId":item,"revision":revision,"kind":footer.kind,"reason":crate::privacy::truncate(&footer.reason,240),
     })))
+}
+
+pub(crate) fn terminal_status(
+    db: &Connection,
+    session: &str,
+    turn: &str,
+) -> Result<Option<String>> {
+    Ok(db
+        .query_row(
+            "SELECT json_extract(payload,'$.params.terminal') FROM events
+         WHERE session_id=?1 AND kind='msp.applied'
+         AND json_extract(payload,'$.method')='turn/completed'
+         AND json_extract(payload,'$.params.turnId')=?2
+         ORDER BY seq DESC LIMIT 1",
+            params![session, turn],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 pub(crate) fn project(db: &Connection, tracks: &mut [Value], workers: &[Value]) -> Result<()> {

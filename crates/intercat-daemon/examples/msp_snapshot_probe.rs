@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
         &std::env::var_os("PATH").ok_or("PATH")?,
         Some(&auth),
         Boundary {
+            steps: None,
             profile: Profile::Worker,
             secrets: &[],
             rpc: &rpc,
@@ -174,6 +175,7 @@ async fn main() -> Result<()> {
         &std::env::var_os("PATH").ok_or("PATH")?,
         Some(&auth),
         Boundary {
+            steps: None,
             profile: Profile::Worker,
             secrets: &[],
             rpc: &rpc,

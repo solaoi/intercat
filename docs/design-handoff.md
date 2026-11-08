@@ -20,9 +20,9 @@ Meta Hackathon 向けの設計、実機検証、macOSアプリの実装をこの
 | --- | --- |
 | `docs/design.md` | 設計書の全文（正本）。0〜23 節と付録。製品の考え・画面構造・Editor ハーネスの仕様・データフロー・失敗の分類・AI 側の制約（MSP / Muse Code / Model API）・検証項目 ①〜㉞・調査を踏まえた決定 |
 | [docs/milestones.md](milestones.md) | 実装のマイルストーン。マイルストーン 1（一本のトラックを最後まで通す）の範囲（本物にするもの・一本目だけの扱い・後に回すもの）・試験の場・完了の条件・作る順と、提出までの順と、1〜13 の製品のマイルストーンの順 |
-| `design/boards/*.html` | 画面イメージ 54 枚。どれもインライン CSS の単一 HTML（書体だけ Google Fonts から読む）で、ブラウザで開く（幅 1440。板 13 は最小の窓の 1040×760）。`index.json` が番号・配置・説明を持つ |
+| `design/boards/*.html` | 画面イメージ 64 枚。HTMLとCSSをブラウザで開く。`index.json` が番号・配置・大きさ・説明を持つ。追加した板の書体と描画方法は、板のREADMEを参照 |
 | [design/boards/README.md](../design/boards/README.md) | 板の一覧、まだ板に描いていないもの、PNG の作り直し方 |
-| `design/boards-png/*.png` | 同じ 54 枚の 2x PNG（Chromium で描画済み） |
+| `design/boards-png/*.png` | 同じ 64 枚の 2x PNG（Chromium で描画済み） |
 | `design/character/` | キャラクター（箱が猫）。`states.png` に 8 状態、`state-*.svg` が各状態、`badge-16.svg` が 16px。`intercat_character.py` が生成スクリプトで、`hako(state, size)` / `badge(size)` が SVG を返す |
 | research/intercat-consolidated-research.md（ローカル記録 `research/intercat-consolidated-research.md`） | 音声・タイムライン・ハーネスと実行管理・プライバシー・macOS・レビュー・アクセシビリティ・行動フレームワークの採用方針。各テーマの理由と具体的な提案、実装順序、確認事項、出典を掲載 |
 | research/verify/（ローカル記録 `research/verify/README.md`） | Muse Code / MSP の実機検証（CLI 1.4.14 / SDK 1.4.14、2026-10-31 〜 11-01）。項目ごとの判定・設計への影響・生ログ・再現スクリプト。結果は第七回まで、設計書 20 節の「実機検証の結果」と各検証項目に反映済み |
@@ -33,7 +33,7 @@ Meta Hackathon 向けの設計、実機検証、macOSアプリの実装をこの
 - どの記述も正しい状態に保つ。食い違いを見つけたら、どちらかに決めて両方の箇所を直す。
 - 板とズレたら、板が正。
 - 例外は、板を描き直すときに直すと本文に書いた箇所だ。そこでは本文が正で、`design/boards/index.json` のその板に `stale` として記録する。
-- 板は 54 枚、設定は 7 ページ（10a〜10g）。設定のシートの上で、適用先（App か Project）を選ぶ。
+- 板は 64 枚、設定は 7 ページ（10a〜10g）。設定のシートの上で、適用先（App か Project）を選ぶ。
 
 ## 公開の方針
 
@@ -378,13 +378,13 @@ Meta Hackathon 向けの設計、実機検証、macOSアプリの実装をこの
 | ㊾ | 大きな出力で、Muse の一つのフレームがどこまで大きくなるか | 未着手 | M1 の前に行う |
 | ㊿ | Local の Glimmer を読み込んだ後の常駐のメモリ | 128 GiB 機で測定済み。active 14.60 GiB、処理後 RSS 15.05 GiB。24/32 GiB は未確認 | [実装の進捗](implementation.md) |
 | V51 | fork の後に書き換えた指示ファイルが、A′ で使われるか | 未着手 | M4 の前に行う |
-| V52 | 承認要求と質問の期限。engaged で期限が確実に外れるか、承認の timedOut の後にどう終わるか（待つ間に枠を返してよいかの前提） | 未着手 | M3 の前に行う |
+| V52 | 承認要求と質問の期限。engagedで期限が外れるか、承認のtimedOutの後にどう終わるか | M3で確認。未回答・engaged・承認・一部回答は180秒の観測で自動終了せず、期限の値も提供されなかった。無期限とは断定せず、待機中は実行枠を保持する方式を採用 | [M3受入の照合](m3-acceptance.md) |
 | V53 | gix と git の CLI が、オブジェクト・パック・ref の書き込みで F_FULLFSYNC を呼ぶか | 未着手 | M1 の作る順の 1 の前に行う |
 | V54 | 隔離した場所で作ったチェックポイントの木が、元で作る木と同じになるか。統合の clone の LFS の置き場所で clean が通るか | 未着手 | M1 の作る順の 6 の前に行う |
 | V55 | ワーカーのシェルから、デーモンのソケットと token に届かないか（Muse のサンドボックスと sandbox-exec の中） | 未着手 | M1 の作る順の 3 の前に行う |
 | V56 | view/page と item/readOutput で、記録した viewCursor の続き・古い cursor・大きな出力を読めるか | 未着手 | M5 の前に行う |
 | V57 | web_fetch のリダイレクトで、別のホストへの通信先の要求が接続ごとに来るか | 未着手 | M5 の前に行う |
-| V58 | 読み取り専用の一時 worktree を workspaceRoots に足したとき、ワーカーから書けないか | 未着手 | M3 の前に行う |
+| V58 | 読み取り専用の一時 worktree を workspaceRoots に足したとき、ワーカーから書けないか | 実機確認済み。通常の追加ルートは書込可。読取専用ボリュームは書込不可 | [M3の検証記録](m3-acceptance.md#v58追加ルートの読み取り専用境界2026-11-08) |
 | V59 | 読むだけの共有のキャッシュから、`--offline` の導入が通るか（npm・pnpm・pip・cargo）。取得の段でコードが動く形も | 未着手 | M1 で依存の導入を作る前に行う |
 | V60 | Push のプロファイルで、SSH agent・HTTPS の認証・先に走らせる pre-push が通るか | 未着手 | M4 の前に行う |
 | V61 | blob を持たない clone で `git describe --tags` が通り、Check から古い blob が取れないか | 未着手 | M4 の前に行う |

@@ -3,10 +3,12 @@ use crate::Result;
 use intercat_git::{ObjectId, Repository, WorktreeSource};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Project {
+pub struct Folder {
+    pub id: String,
     pub name: String,
     pub path: PathBuf,
     pub root: PathBuf,
@@ -15,7 +17,7 @@ pub struct Project {
     pub base_branch: Option<String>,
 }
 
-impl Project {
+impl Folder {
     pub async fn pin(&self) -> Result<()> {
         if self.base_branch.is_none() {
             let project = self.clone();
@@ -58,11 +60,16 @@ impl Project {
     }
 }
 
-pub async fn inspect(path: PathBuf) -> Result<Project> {
+async fn inspect_folder(path: PathBuf) -> Result<Folder> {
     tokio::task::spawn_blocking(move || {
         let source = Repository::clean_project(&path)?;
         let base_branch = Repository::open(&source.root)?.base_branch()?;
-        Ok(Project {
+        Ok(Folder {
+            id: Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                source.common_dir.as_os_str().as_encoded_bytes(),
+            )
+            .to_string(),
             path,
             name: source
                 .root
@@ -77,4 +84,81 @@ pub async fn inspect(path: PathBuf) -> Result<Project> {
         })
     })
     .await?
+}
+
+impl Folder {
+    pub fn id(&self) -> String {
+        self.id.clone()
+    }
+}
+
+/// A named collection of repositories. Repository state belongs to each folder.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Project {
+    pub id: Uuid,
+    pub name: String,
+    pub folders: Vec<Folder>,
+}
+impl Project {
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() || self.folders.is_empty() || self.folders.len() > 8 {
+            return Err("A project needs a name and one to eight folders.".into());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for folder in &self.folders {
+            let expected = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                folder.common_dir.as_os_str().as_encoded_bytes(),
+            )
+            .to_string();
+            if folder.id != expected
+                || !folder.path.is_absolute()
+                || !folder.root.is_absolute()
+                || !folder.common_dir.is_absolute()
+            {
+                return Err("The folder identity does not match its repository.".into());
+            }
+            if !ids.insert(folder.common_dir.clone()) {
+                return Err("Same repository already added · Use the root / Cancel".into());
+            }
+        }
+        Ok(())
+    }
+    pub fn folder(&self, id: &str) -> Result<&Folder> {
+        self.folders
+            .iter()
+            .find(|folder| folder.id() == id)
+            .ok_or_else(|| "The folder is no longer part of this project.".into())
+    }
+    pub fn only_folder(&self) -> Result<&Folder> {
+        match self.folders.as_slice() {
+            [folder] => Ok(folder),
+            [] => Err("Choose a project folder.".into()),
+            _ => Err("Choose which project folder to use.".into()),
+        }
+    }
+    pub async fn pin(&self) -> Result<()> {
+        self.validate()?;
+        for folder in &self.folders {
+            folder.pin().await?;
+        }
+        Ok(())
+    }
+}
+
+pub async fn inspect(id: Uuid, name: String, paths: Vec<PathBuf>) -> Result<Project> {
+    if paths.len() > 8 {
+        return Err("A project can contain at most eight folders.".into());
+    }
+    let mut project = Project {
+        id,
+        name,
+        folders: Vec::new(),
+    };
+    for path in paths {
+        project.folders.push(inspect_folder(path).await?);
+    }
+    project.validate()?;
+    Ok(project)
 }

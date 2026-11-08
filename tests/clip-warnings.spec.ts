@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { closeWindow } from './support/close';
 import { mockDrafts } from './support/drafts';
 
-for (const kind of ['duplicate-title', 'same-file']) for (const zoom of [1, 2]) {
+for (const kind of ['duplicate-title', 'same-file', 'file-comparison-unavailable']) for (const zoom of [1, 2]) {
   test(`${kind} warnings refresh both clips and stay accessible at ${zoom * 100}%`, async () => {
     const directory = await mkdtemp('/private/tmp/ic-clip-warnings-');
     const app = await electron.launch({ args: ['.', '--preview', '--user-data-dir=' + directory] });
@@ -35,7 +35,9 @@ for (const kind of ['duplicate-title', 'same-file']) for (const zoom of [1, 2]) 
         const fixture = (globalThis as typeof globalThis & { clipWarningsFixture: {
           state: { sequence: number }; clips: { trackId: string; warnings: { kind: string; text: string }[] }[];
         } }).clipWarningsFixture;
-        for (const clip of fixture.clips) clip.warnings = kind === 'duplicate-title'
+        for (const clip of fixture.clips) clip.warnings = kind === 'file-comparison-unavailable'
+          ? [{kind, text: 'Couldn’t compare this step’s file changes.'}]
+          : kind === 'duplicate-title'
           ? [{ kind, text: `Same title as ${clip.trackId === 'A' ? 'B' : 'A'}:1 within 10 minutes; possible duplicate work.` }]
           : [{ kind, text: `Also changed in ${clip.trackId === 'A' ? 'B' : 'A'}:1 · src/キャッシュの再試行と保存する値の検証.ts. Both tracks have uncommitted changes.` },
             { kind, text: 'Also changed in C:2 · another/file.ts. Both tracks have uncommitted changes.' }];
@@ -44,7 +46,8 @@ for (const kind of ['duplicate-title', 'same-file']) for (const zoom of [1, 2]) 
       const buttons = page.locator('.step-actions [data-warning]');
       await expect(buttons).toHaveCount(2);
       const first = page.getByRole('button', { name: /^Open step A:1.*Warning:/ });
-      const expected = kind === 'duplicate-title' ? 'Same title as B:1 within 10 minutes' : 'Also changed in B:1';
+      const expected = kind === 'file-comparison-unavailable' ? 'Couldn’t compare this step’s file changes.'
+        : kind === 'duplicate-title' ? 'Same title as B:1 within 10 minutes' : 'Also changed in B:1';
       await expect(first).toHaveAttribute('title', new RegExp(expected));
       await first.hover();
       const pixels = await app.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));
@@ -52,7 +55,7 @@ for (const kind of ['duplicate-title', 'same-file']) for (const zoom of [1, 2]) 
       await first.focus(); await first.press('Enter');
       const warning = page.getByRole('region', { name: 'Step warnings', exact: true });
       await expect(warning).toContainText(expected);
-      await expect(warning.locator('p')).toHaveCount(kind === 'duplicate-title' ? 1 : 2);
+      await expect(warning.locator('p')).toHaveCount(kind === 'same-file' ? 2 : 1);
       await warning.scrollIntoViewIfNeeded();
       await expect(warning).toBeInViewport();
       const bounds = await warning.evaluate(element => ({ content: element.scrollWidth, width: element.clientWidth }));

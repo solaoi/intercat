@@ -275,6 +275,9 @@ async fn fit_request(
         input.target.clone(),
         input.selected.as_deref(),
     )?;
+    if input.single_job {
+        request.run_as_one()?;
+    }
     if check_reasons {
         request.check_previous_reasons();
     }

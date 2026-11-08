@@ -20,6 +20,7 @@ async fn failed_setup_and_spawn_leave_proof_that_no_host_was_started() -> Result
                 std::ffi::OsStr::new("/usr/bin:/bin"),
                 None,
                 Boundary {
+                    steps: None,
                     profile: intercat_daemon::host::Profile::Worker,
                     secrets: &[],
                     rpc: &root.path().join("rpc"),
@@ -65,6 +66,7 @@ wait
             std::ffi::OsStr::new("/usr/bin:/bin"),
             None,
             Boundary {
+                steps: None,
                 profile: intercat_daemon::host::Profile::Worker,
                 secrets: &[],
                 rpc: &rpc,
@@ -118,6 +120,7 @@ wait
             std::ffi::OsStr::new("/usr/bin:/bin"),
             None,
             Boundary {
+                steps: None,
                 profile: intercat_daemon::host::Profile::Worker,
                 secrets: &[],
                 rpc: &rpc,

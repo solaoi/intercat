@@ -199,10 +199,7 @@ pub fn project_id(db: &Connection) -> Result<Option<String>> {
     project
         .map(|project| {
             let project: crate::project::Project = serde_json::from_str(&project)?;
-            use std::os::unix::ffi::OsStrExt;
-            Ok(hex(&Sha256::digest(
-                project.common_dir.as_os_str().as_bytes(),
-            )))
+            Ok(hex(&Sha256::digest(project.id.as_bytes())))
         })
         .transpose()
 }

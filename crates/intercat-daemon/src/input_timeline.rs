@@ -81,7 +81,12 @@ pub fn window(
             || state.as_deref() == Some("placed")
                 && matches!(decision["kind"].as_str(), Some("park" | "plan"));
         let id = format!("input/{input}");
-        if row.get::<_, bool>(2)? || !visible || at < start || at > end {
+        if row.get::<_, bool>(2)?
+            || crate::review_fix_store::for_input(db, &input)?.is_some()
+            || !visible
+            || at < start
+            || at > end
+        {
             if since.is_some() {
                 removed.push(id);
             }

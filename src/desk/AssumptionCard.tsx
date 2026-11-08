@@ -30,7 +30,7 @@ function AssumptionCard({ assumption, label }: { assumption: Assumption; label: 
   }
 
   return <details className="assumption-card">
-    <summary>Worker {label} · {assumption.text}</summary>
+    <summary>{assumption.source === 'planning' ? 'Plan assumed' : 'Worker'} {label} · {assumption.text}</summary>
     <p>{assumption.questionId && 'Worker asked · '}{assumption.question}</p>
     <blockquote>{assumption.evidence}</blockquote>
     <p className="assumption-note">Settled at commit unless you say otherwise.</p>

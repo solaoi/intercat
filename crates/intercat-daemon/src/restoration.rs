@@ -16,6 +16,9 @@ fn sync(file: &File) -> Result<()> {
     }
     Ok(())
 }
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    sync(&File::open(path)?)
+}
 fn parents(root: &Path, path: &str) -> Result<()> {
     crate::deletion::validate_parent(root, path)?;
     let mut current = root.to_path_buf();
@@ -62,34 +65,7 @@ pub fn apply(root: &Path, snapshot: &Snapshot) -> Result<()> {
         parents(root, &format!("{directory}/placeholder"))?;
     }
     for (name, mode, bytes) in writes {
-        parents(root, &name)?;
-        let target = root.join(&name);
-        let parent = target.parent().ok_or("Invalid restore path")?;
-        let temporary = parent.join(format!(".intercat-restore-{}", uuid::Uuid::now_v7()));
-        let result = (|| -> Result<()> {
-            if mode == 0o120000 {
-                std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&bytes), &temporary)?;
-            } else {
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&temporary)?;
-                file.write_all(&bytes)?;
-                file.set_permissions(fs::Permissions::from_mode(if mode == 0o100755 {
-                    0o755
-                } else {
-                    0o644
-                }))?;
-                sync(&file)?;
-            }
-            fs::rename(&temporary, &target)?;
-            sync(&File::open(parent)?)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result?;
+        write_file(root, &name, mode, &bytes)?;
     }
     for name in &snapshot.absent {
         crate::deletion::validate_parent(root, name)?;
@@ -101,4 +77,35 @@ pub fn apply(root: &Path, snapshot: &Snapshot) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn write_file(root: &Path, name: &str, mode: u16, bytes: &[u8]) -> Result<()> {
+    parents(root, name)?;
+    let target = root.join(name);
+    let parent = target.parent().ok_or("Invalid restore path")?;
+    let temporary = parent.join(format!(".intercat-restore-{}", uuid::Uuid::now_v7()));
+    let result = (|| -> Result<()> {
+        if mode == 0o120000 {
+            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(bytes), &temporary)?;
+        } else {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(bytes)?;
+            file.set_permissions(fs::Permissions::from_mode(if mode == 0o100755 {
+                0o755
+            } else {
+                0o644
+            }))?;
+            sync(&file)?;
+        }
+        fs::rename(&temporary, &target)?;
+        sync_directory(parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }

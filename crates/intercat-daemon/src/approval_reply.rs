@@ -68,6 +68,8 @@ pub(crate) fn queue(db: &mut Connection, request: Request) -> Result<()> {
             None,
             &[],
             None,
+            true,
+            None,
         )?;
         let decision = json!({"kind":"trim","trackId":request.track_id,"boundary":"now","command":null,"confidence":1.0,"inferenceMs":0.0,"timedOut":false,"scores":{"approvalReply":request.op_id}});
         tx.execute(

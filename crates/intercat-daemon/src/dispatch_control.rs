@@ -93,6 +93,8 @@ pub(crate) fn set(
     }
     tx.execute("INSERT INTO settings VALUES('dispatchPaused',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[pause.to_string()])?;
     if pause {
+        crate::plan_store::hold_all(&tx)?;
+        crate::review_store::hold_all(&tx)?;
         tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='Turns stopped' WHERE state IN ('staged','reading','placed','held') AND coalesce(json_extract(decision,'$.kind'),'') NOT IN ('park','command')",[])?;
     }
     tx.execute(
@@ -123,6 +125,7 @@ pub(crate) fn local_resumes(connection: &Connection) -> Result<serde_json::Value
              AND later.rowid>h.rowid AND json_extract(later.payload,'$.trackId')=json_extract(h.payload,'$.trackId'))
          AND EXISTS(SELECT 1 FROM utterances u JOIN operations request ON request.id=u.id
              WHERE request.kind='utterance.create' AND request.rowid>h.rowid
+             AND NOT EXISTS(SELECT 1 FROM review_fix_inputs fi WHERE fi.input=u.id)
              AND u.state='placed' AND json_extract(u.decision,'$.trackId')=json_extract(h.payload,'$.trackId'))",
     )?;
     let rows = statement.query_map([], |row| {

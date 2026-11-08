@@ -32,7 +32,7 @@ test('choosing a project rejects local changes and persists the clean starting c
     expect(await readFile(path.join(repo, 'test.txt'), 'utf8')).toBe('uncommitted\n');
     await writeFile(path.join(repo, 'test.txt'), 'committed\n');
     await page.getByRole('button', { name: 'Choose project folder', exact: true }).click();
-    await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).project?.base).toBe(head);
+    await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).project?.folders[0].base).toBe(head);
     await page.getByRole('textbox', { name: 'Request draft' }).fill('Keep the selected starting point.');
     await page.getByRole('button', { name: 'Put', exact: true }).click();
     await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).session?.bound).toBe(true);

@@ -1,6 +1,6 @@
 # 板
 
-画面イメージ（板）54 枚の一覧と、まだ描いていないもの、PNG の作り直し方をまとめる。正本は各 `*.html` と `index.json` で、PNG は `../boards-png/` にある。
+画面イメージ（板）64 枚の一覧と、まだ描いていないもの、PNG の作り直し方をまとめる。正本は各 `*.html` と `index.json` で、PNG は `../boards-png/` にある。
 
 ## 一覧
 
@@ -20,6 +20,11 @@
 | `Dropping.html` | 1h · ファイルをドロップしている：落とせる場所（レーン・カード・入力欄）だけが薄く光る。レーン A の上では「Drop to attach · to Worker A」で、A だけに添付する |
 | `PlanHeld.html` | 1i · 計画の Hold（設定で自動の開始にしたとき）：計画の点線の札が「held」になる（依存のある C は「after A · held」）。Start は帯のチップ「held · nothing has run」の白い「Start plan · 3 tracks」にだけあり、押すまで走らない。その左に「Review plan」 |
 | `DependencyHeld.html` | 1j · 依存先が succeeded で終わらない：A の changelog を切ったので、それに依存する C の docs page は「held · A’s changelog was cut」。依存先が無いので、未来の列の先頭に並ぶ。帯の計画のチップには「Review plan」と「Start plan · 3 tracks」。札を押すとポップオーバーが開き、Restore A’s changelog（⌘Z と同じ）・Change dependency…・Start anyway を出す |
+| `PlanItem.html` | M3 · 項目詳細。元の依頼・実行本文・制約・完了条件を表示する。別の版が届いた状態では「The plan changed · review again」を出し、変更操作を止める |
+| `PlanItemEditing.html` | M3 · 項目の修正。入力欄の「about · Docs page」とRevise itemで修正を送る。対象はeditingとなり、計画のStartは出さない |
+| `DeletedPlans.html` | M3 · Deleted plans · 2から個別にRestoreする。通常のUndoが別項目の実行で止まっても、元のcutを復元できる |
+| `DependencyFailed.html` | M3 · 依存元がfailedの札。Open A・Retry A’s item・Start anywayと依存変更を示す |
+| `DependencyUnclear.html` | M3 · 依存元の結果が不明な札。保存したクリップを開くか、その仕事を明示的に再試行する |
 | `AgentSelected.html` | 2 · Worker A を選んだ：台本は A だけ。選ぶのは閲覧なので、入力欄の文脈チップは「Editor decides」（A は判定の手がかり） |
 | `WorkerDone.html` | 2b · Worker A が完了：レーンの末尾に ✓、見出しが done、台本に done の行、Editor が commit を提案するカード。Can’t place もカードで出し、A の仮定は「+1 more」に畳む。B は続行中 |
 | `ModelPick.html` | 2c · 「Worker A · Spark 1.3 · high ▾」を押した：このトラックだけのモデル（Meta の版）と effort（6 段）の上書き。Editor の選択を既定として示し、「Reset to the Editor’s pick」で戻す |
@@ -62,8 +67,14 @@
 | `Home.html` | 11 · Home：全セッションを最後に動いた順に一行ずつ（プロジェクトのタグ・状態・一行要約・時刻）。机には全セッションのカードがセッション名のタグ付きで集まる。走っているセッションがあるので、状態の行の左に「■ Stop all turns · 2 sessions」 |
 | `SmallWindow.html` | 13 · 最小の窓（1040×760）：承認の対象が長く、カードの中で 4 行を超えてスクロールし、末尾を見るまで Allow once は灰。台本は一行（「▸ Worker A」）に畳み、余った高さは舞台に回す。カードは 1 枚、帯は 1 行で入らないチップは「+2」。状態の行の左の端に「■ Stop all turns · 2 sessions」、その右に「■ Stop A」。未来の列は 1 枚分で、入らないタイルは「+1」。見出しは仕事の名前（「[A] login retry」など）で、再生ヘッドは時間の領域の 80% にある |
 | `SheetSmallWindow.html` | 14 · 最小の窓（1040×760）で Commit シートを開いたまま、A の承認に答える：シートはモーダルではない領域で、舞台と台本だけを覆う。本文はフォルダを切り替える一列で（「lycoris-next · A」と「hitoiro-api · B · 1 assumption」）、差分は Expand で広げる。Check は「Merged checks passed · log」。確定のボタンの列（Discard と Commit）は下に固定し、右上の閉じるボタンはこの窓のシートを閉じるだけ。フォーカスは ⌃Tab で机の承認のカードに移っている（輪郭）。状態の行の左の端に「■ Stop all turns · 2 sessions」、その右に「■ Stop A」。見出しは仕事の名前（「[A] login retry」など）で、再生ヘッドは時間の領域の 80% にある |
+| `PlanUnlockMove.html` | M3 · 錠付き項目の移動。Yesで計画の錠を外してBへ移す。Keep on Aは移動せず現在の計画を保つ |
+| `PlanUnlock.html` | M3 · 錠に合わない生成案。Yesで保存済みの案を採用し、Keep on Aで元の依頼をAの一つの仕事にする |
+| `RequestWait.html` | M3 · 言葉の待ち先。実行中のクリップを含むターンと未開始の計画項目から選び、失敗時はheldを示す |
+| `PlanReply.html` | M3 · 計画の衝突へのReply。元の下書きと宛先を保ち、計画の版に結び付いた訂正文を書く |
+| `PlanAssumptions.html` | M3 · Plannerの仮定をKeep / Changeで扱う。Changeは元の下書きを残して計画訂正を開く。未回答の仮定は実行した項目に結び付け、Commitで確認する |
 
 5d は、secret の入力欄の高さの分、畳みの行（「+1 more」）を外し、台本の欄を 18px 短くしている（130px → 112px）。answered elsewhere のカードも一行にまとめている。ほかの板と違う所は、ここだけだ。
+
 
 ## まだ板に描いていないもの
 
@@ -103,7 +114,6 @@ Main・Planned・SmallWindow・SheetSmallWindow の四枚は、2026-11-03 に今
   - 依存元の差分を当てる前のカード「C’s dev server is still running · Stop it / Keep (A’s changes wait)」（マイルストーン 3 の前に描く）
   - Editor の行の「Placed in Login hardening · Open」（マイルストーン 6 の前に描く）
   - 文書のトラックの点線「use cover v3」、台本の見出しの「manuscript uses v2 · v3 available」、Export のシートの「cover: v2 · v3 available」の行（マイルストーン 8 の前に描く）
-  - 点線のタイルを選んだときの、机の項目の中身（元の依頼の一行・実行本文・制約・完了の条件）と、文脈チップ「about: docs page」、「The plan changed · review again」（マイルストーン 3 の前に描く）
   - Move to project の断り「Q3 report doesn’t have lycoris-next · can’t move this session」と、移動中の帯の一行、カード「Moved, but B’s host couldn’t start · Retry」（マイルストーン 6 の前に描く）
   - Muse Code の写しのカード「Muse Code 1.4.15 is not verified · Download 1.4.14 (424 MB)」（マイルストーン 1 の前に描く）
   - Planner の時間切れのチップ「planning · timed out · Retry / Run as one job」（マイルストーン 3 の前に描く）
@@ -112,7 +122,7 @@ Main・Planned・SmallWindow・SheetSmallWindow の四枚は、2026-11-03 に今
   - 貸し出しのカード「A’s dev server is still running · Stop it / Keep (B waits)」と、チップの「waiting for A’s dev server」。Export のシートの同じカード（マイルストーン 8 の前に描く）
   - レーンの頭の「next waits for your answer」と、質問のカードの副文「asked before your last message」（マイルストーン 2 の前に描く）
   - hook のカード「Hooks need files outside the repo · Commit without hooks / Discard」と、Check の行の「hooks skipped」、行「Hook rejected A’s commit · pre-commit → Worker A / open log」（マイルストーン 1 の前に描く）
-  - 計画の札の「held · A didn’t finish」と「held · A’s result unclear」、言葉のチップの「queued · 2nd」（マイルストーン 3 の前に描く）
+  - 言葉のチップの「queued · 2nd」（マイルストーン 3 の前に描く）。計画の失敗・結果不明の札はDependencyFailedとDependencyUnclearに描いた。
   - Stop all turns and processes… の確認の窓（マイルストーン 1 の前に描く）
   - 10b の Secret files の行の「allowed: .env.test (tracked)」（マイルストーン 5 の前に描く）
   - UI の倍率 200% の画面（既定の窓。マイルストーン 11 の前に描く）
@@ -121,7 +131,7 @@ Main・Planned・SmallWindow・SheetSmallWindow の四枚は、2026-11-03 に今
   - Project hooks を On にする画面（hooks.json の中身と「runs outside the sandbox, without approval」。マイルストーン 5 の前に描く）
   - Read as の「after the turn containing A:14」（マイルストーン 2 の前に描く）
   - Commit シートの「Committing… · wait」と、行「left out: config/.env.staging (secret file)」（マイルストーン 1 の前に描く）
-  - 計画のチップの「planning · invalid plan · Retry / Run as one job」（マイルストーン 3 の前に描く）
+  - 計画のチップの「planning · invalid plan · Retry / Run as one job」（マイルストーン 3 の前に描く）。錠に合わない場合の確認はPlanUnlockに描いた。
   - 点線のタイルの ⌃↩ のメニュー「Move earlier / Move later / Move to track…」（マイルストーン 3 の前に描く）
   - 10f の行：⌃Tab / ⌃⇧Tab、⌃⌘= / ⌃⌘− / ⌃⌘0、⌃↩、⌥← / ⌥→、⌥↑ / ⌥↓、⇧⌘Z（それぞれの機能のマイルストーンの前に描く）
   - 状態の行の「can’t undo: run tests has started」（マイルストーン 2 の前に描く）
@@ -145,7 +155,6 @@ Main・Planned・SmallWindow・SheetSmallWindow の四枚は、2026-11-03 に今
   - Try it two ways の「The checks can’t be compared · Compare the diffs」（マイルストーン 4 の前に描く）
   - テストの変更の行「A′ changes tests · 1 deleted, 1 skip added」と、走れなかった行（マイルストーン 4 の前に描く）
   - 走らせ方の変更の行「A′ changes how tests run · package.json scripts」（マイルストーン 4 の前に描く）
-  - held の札のポップオーバーの「Retry A’s item」（failed と result unclear のとき。マイルストーン 3 の前に描く）
   - 質問のカードの「reply waiting · sends after this turn」と Take back（マイルストーン 1 の前に描く）
   - Include のカードの行「left out: video.mp4 (new, 1.2 GB)」（マイルストーン 6 の前に描く）
   - 同じカードの行「kept as committed: assets.bin (changed, too large)」（マイルストーン 6 の前に描く）
@@ -179,7 +188,6 @@ Main・Planned・SmallWindow・SheetSmallWindow の四枚は、2026-11-03 に今
   - 拒否の枠待ちの「declined · waiting for a slot」（マイルストーン 3 の前に描く）
   - シートの「A was realigned · Refresh」（マイルストーン 4 の前に描く）
   - サブモジュールのカード「Repositories with submodules aren’t supported yet · Cancel」（マイルストーン 4 の前に描く）
-  - 計画のチップのポップオーバーの「Deleted plans · 2」と Restore（マイルストーン 3 の前に描く）
   - You の行のフォーカスと、密集した言葉の一覧（「4 messages」の組を押したときも同じ一覧。マイルストーン 11 の前に描く）
   - 遅れた trim のカード「the turn it was for has ended · Send as instruction / Take back」（マイルストーン 2 の前に描く）
   - 長すぎる入力のカード「Too long for the Editor · give it a one-line request」（マイルストーン 2 の前に描く）
@@ -216,7 +224,7 @@ Main・Planned・SmallWindow・SheetSmallWindow の四枚は、2026-11-03 に今
   - 見出しの ⋯ のメニューの「Say to A」と、文脈チップ「Editor decides」（マイルストーン 2 の前に描く）
   - 時間切れのカードの一文「Picking one re-reads what to do」（マイルストーン 2 の前に描く）
   - 確認モードのチップの補足「back to automatic?」と、Change ▾ の「Back to automatic」（マイルストーン 2 の前に描く）
-  - 計画のカード「Unlock and split? · Yes / Keep on A」と、直している項目の札「editing」（マイルストーン 3 の前に描く）
+  - 計画のカード「Unlock and split? · Yes / Keep on A」（マイルストーン 3 の前に描く）。直している項目の札はPlanItemEditingに描いた。
   - Needs you のカードの先頭の印（needs an answer / not started / assumed, running）と、一行に畳んだ仮定（マイルストーン 5 の前に描く）
   - 分岐のモードの点の印と、確定の「Branch from 14:02 · end of A’s turn 3」、灰の「no checkpoint yet」（マイルストーン 4 の前に描く）
   - 非対応のリポジトリのカード「This repository uses Git LFS · not supported yet · Cancel」（マイルストーン 1 の前に描く）
@@ -255,6 +263,9 @@ Main・Planned・SmallWindow・SheetSmallWindow の四枚は、2026-11-03 に今
 ## 板の再生成
 
 `*.html` は手描きの HTML（インライン CSS）。PNG を作り直すときは、Chromium の headless で撮る。
+
+2026-11-08に追加したPlanItem・PlanItemEditing・DeletedPlans・DependencyFailed・DependencyUnclear・PlanUnlock・PlanUnlockMove・RequestWait・PlanReply・PlanAssumptionsの10枚は、`plan-editing.css`を共有する。
+書体は`npm ci`で入るInterをローカルで読む。前の8枚は1040×760、PlanReplyとPlanAssumptionsは1040×900を基準に、200%表示も確認した。
 
 - 大きさは `index.json` の w × h で、2x で撮る。
 - 書体（Inter / JetBrains Mono）は Google Fonts から読むので、ネットワークのある所で描く。無いと system-ui で描かれ、見た目が変わる。

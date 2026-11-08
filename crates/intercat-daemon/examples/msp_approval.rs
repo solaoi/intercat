@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
             root.path(),
             &root.path().join("editor.log"),
         )?,
-        capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+        capacity: Arc::new(intercat_daemon::scheduler::Capacity::new(1)),
     };
     let mut state = WorkerState {
         secret_revision: None,

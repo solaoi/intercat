@@ -153,6 +153,11 @@ test('all command and timing choices remain reachable beside an assumption at 20
     await leave();
     await update({ utterances: [{ ...request(stage), revision: stage === 'lane' ? 2 : stage === 'command' ? 3 : 4 }] });
     const card = page.locator('[data-attention-card="request-layout-request"]');
+    const ready = stage === 'lane' ? 'Worker A' : stage === 'command' ? 'Commit' : 'After this turn';
+    await expect.poll(async () => {
+      await page.clock.runFor(64);
+      return card.getByRole('button', { name: ready, exact: true }).count();
+    }).toBe(1);
     for (const button of await card.locator('[data-card-actions] button').all()) await reachable(button);
     const boxes = await card.evaluate(element => {
       const box = element.getBoundingClientRect();

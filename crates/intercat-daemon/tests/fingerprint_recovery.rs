@@ -59,7 +59,12 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, String)> {
     journal
         .configure_project(
             Uuid::now_v7(),
-            intercat_daemon::project::inspect(path).await?,
+            intercat_daemon::project::inspect(
+                uuid::Uuid::now_v7(),
+                "Dummy project".into(),
+                vec![path],
+            )
+            .await?,
         )
         .await?;
     journal

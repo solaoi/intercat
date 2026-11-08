@@ -1,5 +1,5 @@
-//! Rule-based work-completion proposals. Source facts stay in the timeline;
-//! only answers need their own durable record.
+//! One proposal slot for saved work results and Planner findings.
+//! Answers retain their source identity for replay and retirement.
 use crate::{
     Result,
     decision::{Decision, Kind, Target},
@@ -15,6 +15,8 @@ pub enum Action {
     Commit,
     Continue,
     Later,
+    KeepPlan,
+    ParallelPlan,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -131,6 +133,7 @@ fn candidates(db: &Connection) -> Result<Vec<Value>> {
     }
     let quiet = crate::quiet_proposals::candidates(db, &proposals)?;
     proposals.extend(quiet);
+    proposals.extend(crate::plan_conflicts::candidates(db)?);
     proposals.sort_by_key(|value| {
         (
             value["kind"] != "work-overlap",
@@ -173,70 +176,92 @@ pub(crate) fn respond(db: &mut Connection, command: &Command) -> Result<Value> {
         .into_iter()
         .find(|p| p["id"] == command.proposal_id.to_string())
         .ok_or("The proposal changed or was already answered.")?;
-    if !proposal["options"]
+    let selected = proposal["options"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|option| option["action"] == serde_json::to_value(&command.action).unwrap())
-    {
-        return Err("This action is not offered by the proposal.".into());
+        .find(|option| option["action"] == serde_json::to_value(&command.action).unwrap())
+        .ok_or("This action is not offered by the proposal.")?;
+    if let Some(reason) = selected["disabledReason"].as_str() {
+        return Err(reason.into());
     }
-    let track = proposal["trackId"].as_str().unwrap();
-    let mut result = json!({"proposalId":command.proposal_id,"action":command.action,"trackId":track,"source":proposal["source"]});
-    match command.action {
-        Action::Continue => {
-            let input = Uuid::now_v7().to_string();
-            let text = format!(
-                "Continue the unfinished work from turn {}. Use its original request and constraints. Keep the language of the original user request in your report; do not switch languages to match these internal continuation instructions. The previous result, quoted as JSON, was: {}",
-                proposal["source"]["turnId"].as_str().unwrap(),
-                proposal["source"]["result"]
-            );
-            crate::journal::insert_utterance(
-                &tx,
-                &input,
-                &text,
-                &Target::Lock(track.into()),
-                None,
-                &[],
-                None,
-            )?;
-            result["inputId"] = input.into();
-        }
-        Action::Commit => {
-            let input = Uuid::now_v7().to_string();
-            crate::journal::insert_utterance(
-                &tx,
-                &input,
-                &format!(
-                    "Review Worker {} for commit.",
-                    proposal["label"].as_str().unwrap()
-                ),
-                &Target::Lock(track.into()),
-                None,
-                &[],
-                None,
-            )?;
-            let mut decision = Decision {
-                kind: Kind::Command,
-                track_id: Some(track.into()),
-                boundary: None,
-                command: Some("commit".into()),
-                confidence: 1.,
-                inference_ms: 0.,
-                timed_out: false,
-                scores: json!({}),
-            };
-            crate::app_commands::prepare_presentation(&mut decision)?;
-            if proposal["kind"] == "work-overlap" {
-                decision.scores["presentation"]["commitTracks"] =
-                    proposal["source"]["trackIds"].clone();
+    let result = if proposal["kind"] == "plan-conflict" {
+        crate::plan_conflicts::respond(&tx, &proposal, &command.action)?
+    } else {
+        let track = proposal["trackId"].as_str().unwrap();
+        let mut result = json!({"proposalId":command.proposal_id,"action":command.action,"trackId":track,"source":proposal["source"]});
+        match command.action {
+            Action::Continue => {
+                let input = Uuid::now_v7().to_string();
+                let text = format!(
+                    "Continue the unfinished work from turn {}. Use its original request and constraints. Keep the language of the original user request in your report; do not switch languages to match these internal continuation instructions. The previous result, quoted as JSON, was: {}",
+                    proposal["source"]["turnId"].as_str().unwrap(),
+                    proposal["source"]["result"]
+                );
+                let session = proposal["source"]["sessionId"].as_str().unwrap();
+                let turn = proposal["source"]["turnId"].as_str().unwrap();
+                let owner = crate::plan_execution::turn_owner(&tx, session, turn)?;
+                crate::journal::insert_utterance(
+                    &tx,
+                    &input,
+                    &text,
+                    &Target::Lock(track.into()),
+                    None,
+                    &[],
+                    None,
+                    true,
+                    None,
+                )?;
+                if let Some((plan_id, item_id)) = owner {
+                    crate::plan_continuation::attach(&tx, &input, plan_id, item_id)?;
+                    let decision = json!({"kind":"extend","trackId":track,"boundary":"after-turn","command":null,"confidence":1.0,"inferenceMs":0.0,"timedOut":false,"scores":{}});
+                    tx.execute("UPDATE utterances SET state=CASE WHEN state='held' THEN state ELSE 'placed' END,decision=?2 WHERE id=?1",
+                    params![input,decision.to_string()])?;
+                }
+                result["inputId"] = input.into();
             }
-            tx.execute("UPDATE utterances SET decision=?2,state=CASE WHEN state='held' THEN 'held' ELSE 'placed' END WHERE id=?1",
+            Action::Commit => {
+                let input = Uuid::now_v7().to_string();
+                crate::journal::insert_utterance(
+                    &tx,
+                    &input,
+                    &format!(
+                        "Review Worker {} for commit.",
+                        proposal["label"].as_str().unwrap()
+                    ),
+                    &Target::Lock(track.into()),
+                    None,
+                    &[],
+                    None,
+                    true,
+                    None,
+                )?;
+                let mut decision = Decision {
+                    kind: Kind::Command,
+                    track_id: Some(track.into()),
+                    boundary: None,
+                    command: Some("commit".into()),
+                    confidence: 1.,
+                    inference_ms: 0.,
+                    timed_out: false,
+                    scores: json!({}),
+                };
+                crate::app_commands::prepare_presentation(&mut decision)?;
+                if proposal["kind"] == "work-overlap" {
+                    decision.scores["presentation"]["commitTracks"] =
+                        proposal["source"]["trackIds"].clone();
+                }
+                tx.execute("UPDATE utterances SET decision=?2,state=CASE WHEN state='held' THEN 'held' ELSE 'placed' END WHERE id=?1",
                 params![input,serde_json::to_string(&decision)?])?;
-            result["inputId"] = input.into();
+                result["inputId"] = input.into();
+            }
+            Action::Later => {}
+            Action::KeepPlan | Action::ParallelPlan => {
+                return Err("This is not a plan conflict.".into());
+            }
         }
-        Action::Later => {}
-    }
+        result
+    };
     tx.execute(
         "INSERT INTO operations VALUES(?1,'proposal.respond',?2,'complete')",
         params![command.op_id.to_string(), payload],

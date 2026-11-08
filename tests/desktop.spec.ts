@@ -285,7 +285,7 @@ test('stage renders, selects tracks and cuts only a planned turn', async () => {
   const cut = page.getByRole('button', { name: 'Cut changelog from A' });
   await cut.focus(); await cut.press('Backspace');
   await expect(cut).toHaveCount(0);
-  await expect(page.getByRole('status')).toContainText('current turn is unchanged');
+  await expect(page.getByRole('status').filter({ hasText: 'current turn is unchanged' })).toBeVisible();
   await expect(page.locator('#track-A')).toContainText('login retry');
   await page.screenshot({ path: 'research/verify/renderer-20261104/stage.png' });
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1040, 760));
@@ -339,7 +339,7 @@ test('starting a held input retries its operation and leaves other held inputs a
   });
   const first=page.getByRole('button',{name:'Start request: First held request',exact:true});
   await first.click();
-  await expect(page.getByRole('status')).toContainText('This request could not start');
+  await expect(page.getByRole('status').filter({ hasText: 'This request could not start' })).toBeVisible();
   await first.click();
   await expect(first).toHaveCount(0);
   await expect(page.getByRole('button',{name:'Start request: Second held request',exact:true})).toBeVisible();
@@ -470,7 +470,7 @@ test('approval and long worker reports leave the composer usable in a small wind
   const page = await app.firstWindow();
   const fixture = {
     connected: true, workerConfigured: true,
-    project: { name: 'Fixture', path: '/fixture', root: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'refs/heads/main' },
+    project: { id: 'dummy-project', name: 'Fixture', folders: [{ id: 'folder', name: 'Fixture', path: '/fixture', root: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'refs/heads/main' }] }, trackFolders: { A: 'folder', B: 'folder', C: 'folder' },
     tracks: ['A', 'B', 'C'].map(id => ({ id, label: id, title: `Dummy work ${id}`, status: 'waiting' })),
     workers: ['A', 'B', 'C'].map(id => ({ trackId: id, phase: id === 'C' ? 'approval' : 'ready', sessionId: id, identity: null, detail: null, activeTurn: null, checkpointPending: false, checkpoint: null, prompts: [], output: 'Completed dummy work.\n'.repeat(20), approvals: id === 'C' ? [{ id: 'approval', requirement: { approvalId: 'approval', sourceIndex: 0 }, subject: 'git push origin HEAD:probe\n'.repeat(12), reason: { kind: 'push', message: 'Review this push' }, canAllow: true, canDeny: true }] : [] })),
     utterances: [], editor: { phase: 'ready' },

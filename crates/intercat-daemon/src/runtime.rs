@@ -98,8 +98,10 @@ pub struct WorkerState {
     pub prompts: Vec<crate::questions::Prompt>,
 }
 impl WorkerState {
-    fn cleanly_stopped(&self) -> bool {
-        self.phase == "stopped" && self.active_turn.is_none() && !self.checkpoint_pending
+    fn released(&self) -> bool {
+        matches!(self.phase.as_str(), "stopped" | "sleeping")
+            && self.active_turn.is_none()
+            && !self.checkpoint_pending
     }
     fn starting(track_id: String, previous: Option<&Self>) -> Self {
         Self {
@@ -128,7 +130,9 @@ pub struct Runtime {
 }
 #[derive(Clone)]
 pub struct Service {
-    capacity: Arc<tokio::sync::Semaphore>,
+    capacity: Arc<crate::scheduler::Capacity>,
+    assistant_capacity: Arc<crate::scheduler::Capacity>,
+    host_memory: Arc<crate::host_memory::Pool>,
     data: PathBuf,
     rpc: PathBuf,
     branches: Arc<tokio::sync::Mutex<()>>,
@@ -141,6 +145,25 @@ pub struct Service {
     paused_ports: Arc<Mutex<HashMap<String, u64>>>,
 }
 impl Service {
+    pub fn host_memory(&self) -> Arc<crate::host_memory::Pool> {
+        self.host_memory.clone()
+    }
+    pub fn set_capacity(&self, setting: &crate::execution_limits::Setting) {
+        self.capacity
+            .set_limit(setting.revision, setting.parallel_workers.into());
+        self.assistant_capacity
+            .set_limit(setting.revision, setting.planner_reviewer_turns.into());
+    }
+    pub fn assistant_capacity(&self) -> crate::scheduler::Snapshot {
+        self.assistant_capacity.snapshot()
+    }
+    pub(crate) fn assistant_pool(&self) -> Arc<crate::scheduler::Capacity> {
+        self.assistant_capacity.clone()
+    }
+    pub fn capacity(&self) -> crate::scheduler::Snapshot {
+        self.capacity.snapshot()
+    }
+
     pub async fn process_audit(&self) -> Result<crate::process_audit::Audit> {
         let data = self.data.clone();
         tokio::task::spawn_blocking(move || crate::process_audit::inspect(&data)).await?
@@ -233,12 +256,13 @@ impl Service {
                 return Err("Shutdown interrupted file recovery.".into());
             }
             crate::pickup_run::prepare(
+                service.host_memory.clone(),
                 &service.journal,
                 config,
                 &service.data,
                 &service.rpc,
                 recovery,
-                service.capacity.clone(),
+                service.assistant_capacity.clone(),
                 active.stopping.clone(),
             )
             .await
@@ -360,6 +384,7 @@ impl Service {
                 .await?
                 .ok_or("Connect workers before branching.")?;
             crate::branch_run::prepare(
+                service.host_memory.clone(),
                 &service.journal,
                 config,
                 &service.data,
@@ -516,6 +541,16 @@ impl Service {
     ) -> Result<crate::deletion::Restored> {
         self.port(track)?.restore(id, snapshot).await
     }
+    pub async fn finish_inheritance(&self, id: Uuid, track: &str, application: Uuid) -> Result<()> {
+        self.port(track)?.finish_inheritance(id, application).await
+    }
+    pub async fn stop_inheritance(
+        &self,
+        track: &str,
+        command: crate::inheritance_issue::Command,
+    ) -> Result<()> {
+        self.port(track)?.stop_inheritance(command).await
+    }
     fn port(&self, track: &str) -> Result<crate::execution::Port> {
         self.ports
             .lock()
@@ -534,7 +569,11 @@ impl Service {
         // worker actor exists for a dirty startup, so use its durable records.
         let _guard = self.branches.lock().await;
         if let Some(operation) = self.journal.operation(id).await? {
-            if operation["kind"] == "worker.stopLost" && operation["payload"]["trackId"] == track {
+            if matches!(
+                operation["kind"].as_str(),
+                Some("worker.stopLost" | "worker.hold")
+            ) && operation["payload"]["trackId"] == track
+            {
                 return Ok(());
             }
             return Err("Operation ID reused.".into());
@@ -547,6 +586,12 @@ impl Service {
                 .cloned()
                 .ok_or("Worker is unavailable.")?,
         )?;
+        if state.phase == "sleeping" {
+            self.journal.hold_inputs(id, track.to_owned()).await?;
+            state.phase = "stopped".into();
+            self.journal.worker_state(state).await?;
+            return Ok(());
+        }
         if !["needs-recovery", "lost", "failed", "after-connection-loss"]
             .contains(&state.phase.as_str())
         {
@@ -584,7 +629,52 @@ impl Service {
         self.journal.stop_lost_worker(id, state, turn).await
     }
     pub async fn start_turn(&self, id: Uuid, track: &str) -> Result<()> {
-        self.port(track)?.start(id).await
+        if let Ok(port) = self.port(track)
+            && !port.is_closed()
+        {
+            return port.start(id).await;
+        }
+        let snapshot = self.journal.snapshot().await?;
+        if let Some(operation) = self.journal.operation(id).await? {
+            if operation["kind"] == "utterance.start"
+                && snapshot["utterances"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|word| {
+                        word["id"] == operation["payload"]["utteranceId"]
+                            && word["decision"]["trackId"] == track
+                    })
+            {
+                return Ok(());
+            }
+            return Err("Operation ID reused.".into());
+        }
+        let word = snapshot["utterances"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|word| {
+                word["decision"]["trackId"] == track
+                    && (word["state"] == "held"
+                        || word["state"] == "placed" && word["decision"]["boundary"] == "when-told")
+            })
+            .min_by_key(|word| {
+                (
+                    word["createdAt"].as_i64().unwrap_or_default(),
+                    word["id"].as_str().unwrap_or_default(),
+                )
+            })
+            .ok_or("No request is waiting on this worker.")?;
+        self.start_held_input(
+            id,
+            word["id"].as_str().ok_or("Missing request ID.")?.to_owned(),
+            word["revision"]
+                .as_i64()
+                .ok_or("Missing request revision.")?,
+        )
+        .await?;
+        Ok(())
     }
     pub async fn stop_captured(&self, id: Uuid, track: &str, turn: Option<Uuid>) -> Result<()> {
         if let Ok(port) = self.port(track)
@@ -607,7 +697,7 @@ impl Service {
             .filter(|state| state["trackId"] == track)
             .any(|state| {
                 serde_json::from_value::<WorkerState>(state.clone())
-                    .is_ok_and(|state| state.cleanly_stopped())
+                    .is_ok_and(|state| state.released())
             })
         {
             return self
@@ -679,7 +769,7 @@ impl Service {
                 .filter(|state| state["trackId"] == track)
                 .any(|state| {
                     serde_json::from_value::<WorkerState>(state.clone())
-                        .is_ok_and(|state| state.cleanly_stopped())
+                        .is_ok_and(|state| state.released())
                 })
         {
             return Err("Recover the worker before starting this request.".into());
@@ -827,11 +917,12 @@ impl Service {
 }
 impl Runtime {
     pub fn start(
+        host_memory: Arc<crate::host_memory::Pool>,
         data: PathBuf,
         rpc: PathBuf,
         journal: Journal,
         editor: crate::editor::Manager,
-        capacity: Arc<tokio::sync::Semaphore>,
+        capacity: Arc<crate::scheduler::Capacity>,
         paused: Arc<crate::dispatch_control::Gate>,
     ) -> Self {
         let (stop, mut stopping) = watch::channel(false);
@@ -842,6 +933,8 @@ impl Runtime {
         let recoveries = crate::pickup_run::Runs::default();
         let service = Service {
             capacity: capacity.clone(),
+            assistant_capacity: Arc::new(crate::scheduler::Capacity::new(2)),
+            host_memory,
             data: data.clone(),
             rpc: rpc.clone(),
             branches: branches.clone(),
@@ -853,6 +946,7 @@ impl Runtime {
             project_secrets: project_secrets.clone(),
             paused_ports: Arc::default(),
         };
+        let host_memory = service.host_memory.clone();
         let shutdown = stop.clone();
         let task = tokio::spawn(async move {
             let mut changes = journal.subscribe();
@@ -891,11 +985,14 @@ impl Runtime {
                         let previous = previous
                             .cloned()
                             .and_then(|value| serde_json::from_value::<WorkerState>(value).ok());
-                        if previous.as_ref().is_some_and(WorkerState::cleanly_stopped)
+                        if previous.as_ref().is_some_and(WorkerState::released)
                             && !snapshot["utterances"].as_array().into_iter().flatten().any(
                                 |word| {
                                     word["state"] == "placed"
                                         && word["decision"]["trackId"] == track
+                                        && word["decision"]["boundary"] != "when-told"
+                                        && (word["startCondition"].is_null()
+                                            || word["startCondition"]["ready"] == true)
                                 },
                             )
                         {
@@ -910,12 +1007,10 @@ impl Runtime {
                             started.insert(track.to_string());
                             continue;
                         }
-                        if previous.as_ref().is_some_and(|state| {
-                            state.phase != "retry"
-                                && (state.phase != "stopped"
-                                    || state.active_turn.is_some()
-                                    || state.checkpoint_pending)
-                        }) {
+                        if previous
+                            .as_ref()
+                            .is_some_and(|state| state.phase != "retry" && !state.released())
+                        {
                             let mut state = previous.unwrap();
                             state.phase = "needs-recovery".into();
                             state.detail=Some("The previous worker did not close cleanly. Recovery is required before sending more work.".into());
@@ -942,8 +1037,11 @@ impl Runtime {
                             editor: editor.clone(),
                             capacity: capacity.clone(),
                         };
+                        let host_memory = host_memory.clone();
+                        let completed_track = track.to_owned();
                         tasks.spawn(async move {
                             run_host(Launch {
+                                host_memory,
                                 config,
                                 data,
                                 rpc,
@@ -954,6 +1052,7 @@ impl Runtime {
                                 execution,
                             })
                             .await;
+                            completed_track
                         });
                     }
                 }
@@ -962,7 +1061,7 @@ impl Runtime {
                     _=stopping.changed()=>{},
                     changed=changes.changed()=>{if changed.is_err(){break;}},
                     changed=secret_changes.changed()=>{if changed.is_err(){break;}},
-                    _=tasks.join_next(),if !tasks.is_empty()=>{},
+                    completed=tasks.join_next(),if !tasks.is_empty()=>{if let Some(Ok(track))=completed{started.remove(&track);}},
                 }
             }
             let _ = shutdown.send(true);
@@ -1220,6 +1319,7 @@ pub(crate) async fn release_session(
 }
 
 struct Launch {
+    host_memory: Arc<crate::host_memory::Pool>,
     config: Config,
     data: PathBuf,
     rpc: PathBuf,
@@ -1231,6 +1331,7 @@ struct Launch {
 }
 async fn run_host(launch: Launch) {
     let Launch {
+        host_memory,
         config,
         data,
         rpc,
@@ -1279,6 +1380,7 @@ async fn run_host(launch: Launch) {
     };
     execution.port.track_processes(tracker.clone());
     let mut runner = WorkerRunner {
+        host_memory,
         config,
         data,
         rpc,
@@ -1322,8 +1424,13 @@ async fn run_host(launch: Launch) {
     if let Some((target, _)) = runner.secret.take() {
         let _ = runner.journal.secret_failed(target.op_id).await;
     }
+    let sleeping = result
+        .as_ref()
+        .is_err_and(|error| error.is::<crate::host_memory::Reclaimed>());
     runner.state.phase = if cleanup.is_err() {
         "needs-recovery"
+    } else if sleeping {
+        "sleeping"
     } else if result.is_ok() && runner.state.phase == "after-connection-loss" {
         "after-connection-loss"
     } else if result.is_ok() {
@@ -1332,8 +1439,13 @@ async fn run_host(launch: Launch) {
         "failed"
     }
     .into();
+    if sleeping && cleanup.is_ok() {
+        runner.state.identity = None;
+        runner.state.detail = None;
+    }
     runner.state.detail = result
         .err()
+        .filter(|_| !sleeping)
         .or_else(|| cleanup.err())
         .map(|error| error.to_string())
         .or(runner.state.detail);
@@ -1341,6 +1453,7 @@ async fn run_host(launch: Launch) {
 }
 
 struct WorkerRunner {
+    host_memory: Arc<crate::host_memory::Pool>,
     config: Config,
     data: PathBuf,
     rpc: PathBuf,
@@ -1531,6 +1644,8 @@ impl WorkerRunner {
         let error = "The worker is reconnecting. Wait for its current state.";
         match command {
             Command::Start { reply, .. }
+            | Command::StopInheritance { reply, .. }
+            | Command::FinishInheritance { reply, .. }
             | Command::Retry { reply, .. }
             | Command::Answer { reply, .. }
             | Command::Respond { reply, .. }
@@ -1634,6 +1749,11 @@ impl WorkerRunner {
             std::ffi::OsStr::new(&self.config.path),
             Some(&self.config.credentials),
             host::Boundary {
+                steps: Some(crate::step_capture::Service::start(
+                    self.journal.clone(),
+                    self.state.track_id.clone(),
+                    &self.path,
+                )?),
                 profile: crate::host::Profile::Worker,
                 secrets: &environment,
                 rpc: &self.rpc,
@@ -1686,7 +1806,12 @@ impl WorkerRunner {
         }) {
             return Ok(true);
         }
-        let capacity = self.execution.capacity.clone();
+        let ticket = self.execution.capacity.request(
+            format!("recovery:{}", self.state.track_id),
+            crate::scheduler::Priority::Continuation,
+        );
+        let reservation = ticket.acquire();
+        tokio::pin!(reservation);
         loop {
             tokio::select! { biased;
                 _ = self.stopping.changed() => if *self.stopping.borrow() { return Ok(false); },
@@ -1695,8 +1820,8 @@ impl WorkerRunner {
                     Some(command) => Self::reject(command),
                     None => return Ok(false),
                 },
-                permit = capacity.clone().acquire_owned() => {
-                    self.continuity.retain_slot(permit?);
+                permit = &mut reservation => {
+                    self.continuity.retain_slot(permit);
                     return Ok(true);
                 },
             }
@@ -1707,6 +1832,52 @@ impl WorkerRunner {
         if !self.reserve_recovery_slot().await? {
             return Ok(());
         }
+        let guard = self.execution.port.start_guard();
+        let Some(guard) = guard else {
+            return Ok(());
+        };
+        let mut ticket = self.host_memory.request(self.state.track_id.clone());
+        let memory = if let Some(memory) = ticket.try_acquire() {
+            memory
+        } else {
+            self.state.phase = "waiting-memory".into();
+            self.state.detail = Some("queued · waiting for memory".into());
+            self.journal.worker_state(self.state.clone()).await?;
+            let admission = ticket.acquire(guard);
+            tokio::pin!(admission);
+            let admitted = loop {
+                tokio::select! { biased;
+                    _=self.stopping.changed()=>return Ok(()),
+                    command=self.execution.commands.recv()=>match command {
+                        Some(crate::execution::Command::Stop{id,..} | crate::execution::Command::Hold{id}) => {
+                            if self.state.active_turn.is_some() || self.state.checkpoint_pending {
+                                self.stop_here(id).await?;
+                            } else {
+                                self.journal.hold_inputs(id,self.state.track_id.clone()).await?;
+                                self.state.phase="stopped".into();
+                                self.state.detail=None;
+                                self.journal.worker_state(self.state.clone()).await?;
+                            }
+                            return Ok(());
+                        },
+                        Some(command)=>Self::reject(command),
+                        None=>return Ok(()),
+                    },
+                    result=&mut admission=>break result,
+                }
+            };
+            match admitted {
+                Ok(memory) => memory,
+                Err(error) if error.is::<crate::msp::StartCancelled>() => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        self.continuity.host_memory = Some(memory);
+        self.journal
+            .mount_dependency_references(&self.state.track_id)
+            .await?;
         let mut host = match self.open_host().await {
             Ok(host) => host,
             Err(error) if self.state.session_id.is_some() => {
@@ -1714,6 +1885,11 @@ impl WorkerRunner {
             }
             Err(error) => return Err(error),
         };
+        self.continuity
+            .host_memory
+            .as_ref()
+            .unwrap()
+            .attach(host.identity);
         self.tracker = Some(host.tracker.clone());
         self.execution.port.track_processes(self.tracker.clone());
         self.state.identity = Some(host.identity);
@@ -1804,6 +1980,7 @@ impl WorkerRunner {
         }
         self.record_final(frames).await?;
         self.continuity.settle().await?;
+        self.continuity.host_memory = None;
         if recoverable {
             return Err(crate::msp::ConnectionLost(result.unwrap_err().to_string()).into());
         }
@@ -1830,7 +2007,11 @@ impl WorkerRunner {
             }
         }
         self.execution.port.track_processes(None);
+        self.journal
+            .unmount_dependency_references(&self.state.track_id)
+            .await?;
         self.continuity.release_slot();
+        self.continuity.host_memory = None;
         if let Some(session) = &self.state.session_id {
             self.journal.interrupt_effects(session.clone()).await?;
         }
@@ -1840,4 +2021,4 @@ impl WorkerRunner {
 
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
-mod tests;
+pub(crate) mod tests;

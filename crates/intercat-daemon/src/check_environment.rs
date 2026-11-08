@@ -1,5 +1,5 @@
 //! Explicit Check inputs. Persist paths and bindings while values stay in memory.
-use crate::{Result, project::Project};
+use crate::{Result, project::Folder};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -108,7 +108,7 @@ impl Frozen {
     }
 }
 
-pub fn validate_file(path: &Path, project: &Project) -> Result<PathBuf> {
+pub fn validate_file(path: &Path, project: &Folder) -> Result<PathBuf> {
     let path = path
         .canonicalize()
         .map_err(|_| "The selected Check environment file is unavailable.")?;
@@ -123,6 +123,14 @@ pub fn validate_file(path: &Path, project: &Project) -> Result<PathBuf> {
     }
     read_values(&path)?;
     Ok(path)
+}
+
+pub fn validate_project_file(path: &Path, project: &crate::project::Project) -> Result<PathBuf> {
+    let mut checked = path.to_path_buf();
+    for folder in &project.folders {
+        checked = validate_file(&checked, folder)?;
+    }
+    Ok(checked)
 }
 
 pub(crate) fn selection(db: &Connection) -> Result<Selection> {
@@ -142,7 +150,7 @@ pub(crate) fn selection(db: &Connection) -> Result<Selection> {
 pub(crate) fn change(
     db: &mut Connection,
     request: &Change,
-    project_root: &Path,
+    project_id: Uuid,
     file: Option<PathBuf>,
 ) -> Result<Selection> {
     if request.op_id.get_version_num() != 7 {
@@ -168,7 +176,7 @@ pub(crate) fn change(
         [],
         |row| row.get(0),
     )?;
-    if serde_json::from_str::<Project>(&project)?.root != project_root {
+    if serde_json::from_str::<crate::project::Project>(&project)?.id != project_id {
         return Err("The project changed before saving Check environment.".into());
     }
     let current = selection(&tx)?;
@@ -202,8 +210,9 @@ pub(crate) fn change(
 mod tests {
     use super::*;
 
-    fn save(db: &mut Connection, request: &Change, root: &Path) -> Result<Selection> {
-        change(db, request, root, request.file.clone())
+    fn save(db: &mut Connection, request: &Change, _root: &Path) -> Result<Selection> {
+        let project = crate::folders::project(db)?.unwrap();
+        change(db, request, project.id, request.file.clone())
     }
 
     #[test]
@@ -261,13 +270,19 @@ mod tests {
         let database = root.path().join("settings.sqlite");
         let mut db = Connection::open(&database)?;
         db.execute_batch("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE operations(id TEXT PRIMARY KEY,kind TEXT,payload TEXT,state TEXT); CREATE TABLE events(ts INTEGER,kind TEXT,payload TEXT);")?;
-        let project = Project {
+        let folder = Folder {
+            id: "fixture-folder".into(),
             name: "fixture".into(),
             path: root.path().into(),
             root: root.path().into(),
             common_dir: root.path().join(".git"),
             base: "base".into(),
             base_branch: None,
+        };
+        let project = crate::project::Project {
+            id: Uuid::now_v7(),
+            name: "fixture".into(),
+            folders: vec![folder],
         };
         db.execute(
             "INSERT INTO settings VALUES('project',?1)",

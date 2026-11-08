@@ -220,6 +220,8 @@ async fn processor_generates_a_draft_from_all_source_chunks_and_waits_for_submis
     let id = Uuid::now_v7();
     journal
         .stage_document(Document {
+            execute_allowed: true,
+            plan_item: None,
             op_id: id,
             text: String::new(),
             target: Target::New,
@@ -396,6 +398,8 @@ async fn a_reference_only_request_waits_for_the_users_instruction_without_genera
     let id = Uuid::now_v7();
     journal
         .stage_document(Document {
+            execute_allowed: true,
+            plan_item: None,
             op_id: id,
             text: String::new(),
             target: Target::New,

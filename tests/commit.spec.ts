@@ -30,7 +30,7 @@ test.afterEach(async () => {
 
 function fixture(): IntegrationJob {
   const changes = [{ path: 'index.js', before: { object: 'b'.repeat(40), mode: 33188 }, after: { object: 'c'.repeat(40), mode: 33188 } }];
-  return { assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0, id: '01a1a200-0000-7000-8000-000000000001', revision: 1, status: 'checked', sessionName: 'Commit fixture', slug: 'commit-fixture', project: { name: 'Fixture', root: '/fixture', path: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'refs/heads/main' }, error: null,
+  return { exclusions: [], assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0, id: '01a1a200-0000-7000-8000-000000000001', revision: 1, status: 'checked', sessionName: 'Commit fixture', slug: 'commit-fixture', project: { id: 'dummy-folder', name: 'Fixture', root: '/fixture', path: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'refs/heads/main' }, error: null,
     tracks: [{ id: '01a1a200-0000-7000-8000-000000000002', label: 'A', title: 'Update the exported value', included: true, checkpointCount: 1, lastClip: null, checkpoint: { sha: 'c'.repeat(40) } }],
     plan: { targetRef: 'refs/heads/intercat/commit-fixture', tree: 'd'.repeat(40), rows: [{ track: '01a1a200-0000-7000-8000-000000000002', state: 'included', changes, conflicts: [] }] }, messages: {}, keptSecrets: [], contributions: {},
     candidate: { revision: 1, state: 'checked', generation: 1, head: 'e'.repeat(40), tree: 'd'.repeat(40), settingsHash: 'f'.repeat(64), commits: [{ track: '01a1a200-0000-7000-8000-000000000002', sha: 'e'.repeat(40), parent: 'a'.repeat(40), tree: 'd'.repeat(40), author: 'Worker A', message: 'Update the exported value\n\nIntercat: fixture/A@1\n', changes }], blockedCommit: null, secretScans: [], check: { command: 'npm test', code: 0, stdout: 'Check passed\n', stderr: '', truncated: false }, reason: null, failedTrack: null, hooksSkipped: false, dependencyRuns: [] } };
@@ -38,7 +38,7 @@ function fixture(): IntegrationJob {
 
 async function mock(job: IntegrationJob, loseKeep = false) {
   await app.evaluate(({ ipcMain, BrowserWindow }, input) => {
-    const state = { connected: true, sequence: 1, workerConfigured: true, project: input.job.project, session: { id: 'session', slug: input.job.slug, name: input.job.sessionName, createdAt: 0 }, tracks: input.job.tracks.map(track => ({ ...track, status: 'done' })), workers: [], workspaces: [], utterances: [], editor: { phase: 'ready' }, integration: input.job };
+    const state = { connected: true, sequence: 1, workerConfigured: true, project: { id: 'dummy-project', name: input.job.project.name, folders: [input.job.project] }, trackFolders: Object.fromEntries(input.job.tracks.map(track => [track.id,input.job.project.id])), session: { id: 'session', slug: input.job.slug, name: input.job.sessionName, createdAt: 0 }, tracks: input.job.tracks.map(track => ({ ...track, status: 'done' })), workers: [], workspaces: [], utterances: [], editor: { phase: 'ready' }, integration: input.job };
     const memory = globalThis as typeof globalThis & { commitCalls: unknown[]; commitState: typeof state; commitClips: unknown[] };
     memory.commitCalls = []; memory.commitState = state; memory.commitClips = [];
     ipcMain.removeHandler('intercat:timeline-window');
@@ -700,7 +700,7 @@ async function realFixture(secret = false, failedCheck = false, unborn = false, 
     await chmod(hook, 0o755);
   }
   const token = randomBytes(32).toString('hex');
-  daemon = spawn(path.resolve('target/debug/intercatd'), ['serve', seeded.data, path.resolve('services/editor/src')], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, INTERCAT_GITLEAKS: path.resolve('.tools/gitleaks-8.30.1/gitleaks') } });
+  daemon = spawn(path.join(process.env.CARGO_TARGET_DIR ? path.resolve(process.env.CARGO_TARGET_DIR) : path.resolve('target'), 'debug/intercatd'), ['serve', seeded.data, path.resolve('services/editor/src')], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, INTERCAT_GITLEAKS: path.resolve('.tools/gitleaks-8.30.1/gitleaks') } });
   let startupError = '';
   daemon.stderr!.on('data', (chunk: Buffer) => { startupError = (startupError + chunk.toString()).slice(-4096); });
   const lines=createInterface({input:daemon.stdout!});

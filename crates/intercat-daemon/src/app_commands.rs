@@ -10,10 +10,15 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WaitingRequest {
-    pub input_id: Uuid,
-    pub revision: i64,
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum WaitingRequest {
+    Input { input_id: Uuid, revision: i64 },
+    Plan { plan_id: Uuid, revision: u64 },
 }
 
 pub(crate) fn install(db: &Connection) -> Result<()> {
@@ -31,6 +36,8 @@ pub(crate) fn capture(db: &Connection, input: &str) -> Result<()> {
         "SELECT id,revision FROM utterances WHERE state='placed'
         AND json_extract(decision,'$.boundary')='when-told'
         AND json_extract(decision,'$.kind') IN ('fork','extend','schedule')
+        AND NOT EXISTS(SELECT 1 FROM plan_inputs WHERE plan_inputs.input=utterances.id)
+        AND NOT EXISTS(SELECT 1 FROM plans WHERE plans.source=utterances.id AND json_extract(plans.record,'$.state')<>'single-job')
         ORDER BY created_at,rowid",
     )?;
     let rows = query
@@ -41,17 +48,28 @@ pub(crate) fn capture(db: &Connection, input: &str) -> Result<()> {
     let mut candidates = Vec::new();
     for (id, revision) in rows {
         if input_start::unavailable(db, &id, revision, Permission::GoAhead)?.is_none() {
-            candidates.push(WaitingRequest {
+            candidates.push(WaitingRequest::Input {
                 input_id: id.parse()?,
                 revision,
             });
         }
     }
-    db.execute(
-        "INSERT INTO input_command_candidates VALUES(?1,?2)
-        ON CONFLICT(input) DO UPDATE SET record=excluded.record",
-        params![input, serde_json::to_string(&candidates)?],
-    )?;
+    for plan in crate::plan_store::list(db)? {
+        if plan.state == crate::plans::State::Draft
+            && plan.generation.state == crate::plans::GenerationState::Ready
+            && plan.rewrite.is_none()
+            && plan
+                .items
+                .iter()
+                .any(|item| item.state == crate::plans::ItemState::Planned)
+        {
+            candidates.push(WaitingRequest::Plan {
+                plan_id: plan.id,
+                revision: plan.rev,
+            });
+        }
+    }
+    db.execute("INSERT INTO input_command_candidates VALUES(?1,?2) ON CONFLICT(input) DO UPDATE SET record=excluded.record", params![input, serde_json::to_string(&candidates)?])?;
     Ok(())
 }
 
@@ -68,27 +86,64 @@ fn captured(db: &Connection, input: &str) -> Result<Vec<WaitingRequest>> {
         .transpose()?
         .unwrap_or_default())
 }
-
 fn is_go_ahead(decision: &Decision) -> bool {
     decision.kind == Kind::Command && decision.command.as_deref() == Some("start-waiting")
 }
-
 fn scoped(db: &Connection, input: &str, decision: &Decision) -> Result<Vec<WaitingRequest>> {
     let mut result = Vec::new();
     for candidate in captured(db, input)? {
-        let track: Option<String> = db
-            .query_row(
-                "SELECT json_extract(decision,'$.trackId') FROM utterances WHERE id=?1",
-                [candidate.input_id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        if decision.track_id.is_none() || decision.track_id == track {
+        let matches = if let Some(track) = &decision.track_id {
+            match &candidate {
+                WaitingRequest::Input { input_id, .. } => {
+                    db.query_row(
+                        "SELECT json_extract(decision,'$.trackId') FROM utterances WHERE id=?1",
+                        [input_id.to_string()],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten()
+                    .as_ref()
+                        == Some(track)
+                }
+                WaitingRequest::Plan { plan_id, .. } => crate::plan_store::read(db, *plan_id)
+                    .is_ok_and(|plan| {
+                        plan.items
+                            .iter()
+                            .filter(|item| item.state != crate::plans::ItemState::Cut)
+                            .all(|item| &item.track_ref == track)
+                    }),
+            }
+        } else {
+            true
+        };
+        if matches {
             result.push(candidate);
         }
     }
     Ok(result)
+}
+fn unavailable(db: &Connection, candidate: &WaitingRequest) -> Result<Option<String>> {
+    match candidate {
+        WaitingRequest::Input { input_id, revision } => Ok(input_start::unavailable(
+            db,
+            &input_id.to_string(),
+            *revision,
+            Permission::GoAhead,
+        )?
+        .map(str::to_owned)),
+        WaitingRequest::Plan { plan_id, revision } => {
+            let Ok(plan) = crate::plan_store::read(db, *plan_id) else {
+                return Ok(Some("This plan is unavailable.".into()));
+            };
+            if plan.rev != *revision {
+                return Ok(Some("The plan changed. Read this request again.".into()));
+            }
+            if plan.state != crate::plans::State::Draft {
+                return Ok(Some("This plan is no longer waiting for your go.".into()));
+            }
+            Ok(crate::plan_store::start_unavailable(db, &plan)?.map(str::to_owned))
+        }
+    }
 }
 
 pub(crate) fn projection(
@@ -101,35 +156,30 @@ pub(crate) fn projection(
     }
     let mut candidates = Vec::new();
     for candidate in scoped(db, input, decision)? {
-        let row: Option<(String, Option<String>)> = db
-            .query_row(
-                "SELECT coalesce(nullif(u.text,''),json_extract(s.record,'$.preview'),''),t.label
-            FROM utterances u LEFT JOIN utterance_sources s ON s.input=u.id
-            LEFT JOIN tracks t ON t.id=json_extract(u.decision,'$.trackId') WHERE u.id=?1",
-                [candidate.input_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let (text, label) = row.unwrap_or_else(|| ("Request unavailable".into(), None));
+        let (text, label) = match &candidate {
+            WaitingRequest::Input { input_id, .. } => db.query_row(
+                "SELECT coalesce(nullif(u.text,''),json_extract(s.record,'$.preview'),''),t.label FROM utterances u LEFT JOIN utterance_sources s ON s.input=u.id LEFT JOIN tracks t ON t.id=json_extract(u.decision,'$.trackId') WHERE u.id=?1",
+                [input_id.to_string()], |row| Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?)),
+            ).optional()?.unwrap_or_else(|| ("Request unavailable".into(), None)),
+            WaitingRequest::Plan { plan_id, .. } => (crate::plan_store::read(db, *plan_id).map(|plan| plan.summary).unwrap_or_else(|_| "Plan unavailable".into()), None),
+        };
         let mut characters = text.chars();
         let mut preview: String = characters.by_ref().take(200).collect();
         if characters.next().is_some() {
             preview.push('…');
         }
-        let available = input_start::unavailable(
-            db,
-            &candidate.input_id.to_string(),
-            candidate.revision,
-            Permission::GoAhead,
-        )?
-        .is_none();
-        candidates.push(json!({"inputId":candidate.input_id,"revision":candidate.revision,"text":preview,"label":label,"available":available}));
+        let reason = unavailable(db, &candidate)?;
+        let mut value = serde_json::to_value(&candidate)?;
+        value["text"] = preview.into();
+        value["label"] = json!(label);
+        value["available"] = reason.is_none().into();
+        value["reason"] = json!(reason);
+        candidates.push(value);
     }
     Ok(Some(
         json!({"candidates":candidates,"started":decision.scores.get("commandResult")}),
     ))
 }
-
 pub(crate) fn begin(
     db: &Connection,
     input: &str,
@@ -141,21 +191,15 @@ pub(crate) fn begin(
             if candidates.is_empty() {
                 "Nothing is waiting for your go."
             } else {
-                "Which waiting request should start?"
+                "Which waiting request or plan should start?"
             }
             .into(),
         ));
     }
-    let choice = &candidates[0];
-    if let Some(reason) = input_start::unavailable(
-        db,
-        &choice.input_id.to_string(),
-        choice.revision,
-        Permission::GoAhead,
-    )? {
-        return Ok(Some(reason.into()));
+    if let Some(reason) = unavailable(db, &candidates[0])? {
+        return Ok(Some(reason));
     }
-    select(db, input, decision, choice)?;
+    select(db, input, decision, &candidates[0])?;
     Ok(None)
 }
 
@@ -166,19 +210,44 @@ pub(crate) fn select(
     choice: &WaitingRequest,
 ) -> Result<()> {
     if !is_go_ahead(decision) || !scoped(db, input, decision)?.contains(choice) {
-        return Err("Choose a waiting request shown with this command.".into());
+        return Err("Choose a waiting request or plan shown with this command.".into());
+    }
+    if let Some(reason) = unavailable(db, choice)? {
+        return Err(reason.into());
     }
     let source: Uuid = input.parse()?;
     let operation = Uuid::new_v5(&source, b"start-waiting");
-    input_start::start(
-        db,
-        &operation.to_string(),
-        &choice.input_id.to_string(),
-        choice.revision,
-        Permission::GoAhead,
-    )?;
-    decision.scores["commandResult"] =
-        json!({"inputId":choice.input_id,"revision":choice.revision+1});
+    let started = match choice {
+        WaitingRequest::Input { input_id, revision } => {
+            input_start::start(
+                db,
+                &operation.to_string(),
+                &input_id.to_string(),
+                *revision,
+                Permission::GoAhead,
+            )?;
+            WaitingRequest::Input {
+                input_id: *input_id,
+                revision: revision + 1,
+            }
+        }
+        WaitingRequest::Plan { plan_id, .. } => {
+            let mut plan = crate::plan_store::read(db, *plan_id)?;
+            let before = plan.rev;
+            crate::plan_store::start(db, &mut plan)?;
+            crate::plan_history::advance_revision(db, plan.id, before, plan.rev)?;
+            crate::plan_store::save(db, &plan, "plan.started-by-words")?;
+            db.execute(
+                "INSERT INTO operations VALUES(?1,'plan.go',?2,'complete')",
+                params![operation.to_string(), serde_json::to_string(choice)?],
+            )?;
+            WaitingRequest::Plan {
+                plan_id: *plan_id,
+                revision: plan.rev,
+            }
+        }
+    };
+    decision.scores["commandResult"] = serde_json::to_value(started)?;
     Ok(())
 }
 

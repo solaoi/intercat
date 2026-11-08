@@ -1,6 +1,6 @@
 //! Frozen Commit inputs and object-only integration. No worker checkout is read
 //! and no project code, hooks, or filters are executed while planning a merge.
-use crate::{Result, checkpoint::Checkpoint, journal::Journal, project::Project};
+use crate::{Result, checkpoint::Checkpoint, journal::Journal, project::Folder};
 use intercat_git::{Merge, ObjectId, Repository, SavedFile};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
@@ -131,7 +131,7 @@ pub struct Track {
     pub id: String,
     pub label: String,
     pub title: String,
-    pub initial_base: String,
+    pub basis: crate::lineage::Basis,
     pub checkpoint: Option<Checkpoint>,
     pub checkpoint_count: u64,
     pub last_clip: Option<i64>,
@@ -149,8 +149,10 @@ pub struct Job {
     pub session_id: String,
     pub slug: String,
     pub session_name: String,
-    pub project: Project,
+    pub project: Folder,
     pub tracks: Vec<Track>,
+    pub lineage: crate::lineage::Frozen,
+    pub omitted_conflicts: std::collections::BTreeSet<String>,
     pub plan: Option<Plan>,
     pub error: Option<String>,
     pub candidate: Option<crate::candidate::Candidate>,
@@ -174,6 +176,7 @@ pub struct Job {
 pub(crate) fn project(job: &Job) -> Result<serde_json::Value> {
     let mut value = crate::integration_assumptions::project(job)?;
     value["orderReview"] = serde_json::to_value(&job.order_review)?;
+    value["exclusions"] = serde_json::to_value(crate::integration_exclusions::project(job)?)?;
     Ok(value)
 }
 
@@ -198,6 +201,7 @@ pub struct Row {
     pub base_ref: String,
     pub expected_base: Option<String>,
     pub base: String,
+    pub delta_base: Option<String>,
     pub integrated_ref: String,
     pub expected_integrated: Option<String>,
     pub state: RowState,
@@ -334,7 +338,10 @@ pub fn freeze(job: &Job) -> Result<Plan> {
         let integrated_ref = format!("refs/intercat/{}/integrated/{}", job.slug, track.label);
         let expected_base = repo.reference_target(&base_ref)?;
         let expected_integrated = repo.reference_target(&integrated_ref)?;
-        let base = expected_base.unwrap_or(track.initial_base.parse()?);
+        let base = track.basis.base.parse()?;
+        if expected_base.is_some_and(|expected| expected != base) {
+            return Err("The track base changed. Refresh before preparing the Commit.".into());
+        }
         roots.push(base);
         if let Some(checkpoint) = &track.checkpoint {
             roots.push(checkpoint.sha.parse()?);
@@ -344,6 +351,7 @@ pub fn freeze(job: &Job) -> Result<Plan> {
             base_ref,
             expected_base: expected_base.map(|v| v.to_string()),
             base: base.to_string(),
+            delta_base: None,
             integrated_ref,
             expected_integrated: expected_integrated.map(|v| v.to_string()),
             state: RowState::Waiting,
@@ -352,6 +360,7 @@ pub fn freeze(job: &Job) -> Result<Plan> {
             conflicts: Vec::new(),
         });
     }
+    roots.extend(job.lineage.roots()?);
     repo.sync_objects(&roots)?;
     Ok(Plan {
         target_ref,
@@ -366,6 +375,7 @@ pub fn freeze(job: &Job) -> Result<Plan> {
 }
 
 pub fn plan(job: &Job) -> Result<Plan> {
+    crate::integration_exclusions::validate(job)?;
     let repo = repository(job)?;
     let frozen = job
         .plan
@@ -376,6 +386,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
     let mut blocked = false;
     let mut rows = Vec::new();
     let mut roots = vec![tree];
+    let mut integrated = job.lineage.integrated.clone();
     for track in &job.tracks {
         let mut row = frozen
             .rows
@@ -383,11 +394,11 @@ pub fn plan(job: &Job) -> Result<Plan> {
             .find(|row| row.track == track.id)
             .ok_or("Missing frozen track base.")?
             .clone();
-        let base = row.base.parse()?;
         row.state = RowState::Excluded;
         row.tree = None;
         row.changes.clear();
         row.conflicts.clear();
+        row.delta_base = None;
         if let Some(checkpoint) = &track.checkpoint {
             let checkpoint_id = checkpoint.sha.parse()?;
             if repo.reference_target(&checkpoint.reference)? != Some(checkpoint_id) {
@@ -411,7 +422,28 @@ pub fn plan(job: &Job) -> Result<Plan> {
             } else if track.included && blocked {
                 row.state = RowState::Waiting;
             } else if track.included {
-                let base_tree = repo.tree_id(base)?;
+                let point = job.lineage.by_sha(&track.id, &checkpoint.sha)?;
+                let base_tree =
+                    match job
+                        .lineage
+                        .track_baseline(&repo, point, &track.basis, &integrated)?
+                    {
+                        Merge::Clean(tree) => tree,
+                        Merge::Conflicts(paths) => {
+                            row.state = RowState::Conflict;
+                            row.conflicts = paths
+                                .into_iter()
+                                .map(|path| Conflict {
+                                    path: path.to_string(),
+                                    with_tracks: vec![],
+                                })
+                                .collect();
+                            blocked = true;
+                            rows.push(row);
+                            continue;
+                        }
+                    };
+                row.delta_base = Some(base_tree.to_string());
                 let checkpoint_tree = repo.tree_id(checkpoint_id)?;
                 match repo.merge_trees(base_tree, tree, checkpoint_tree)? {
                     Merge::Clean(merged) => {
@@ -430,6 +462,10 @@ pub fn plan(job: &Job) -> Result<Plan> {
                         tree = merged;
                         roots.push(tree);
                         row.tree = Some(tree.to_string());
+                        job.lineage.incorporate(
+                            &mut integrated,
+                            job.lineage.by_sha(&track.id, &checkpoint.sha)?,
+                        )?;
                     }
                     Merge::Conflicts(paths) => {
                         blocked = true;

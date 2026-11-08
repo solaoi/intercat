@@ -1,5 +1,6 @@
+import { queueLabel } from '../scheduling';
 import { useState } from 'react';
-import type { UnloggedControl, Approval, ApprovalResponse, LiveTrack, WorkerState, Prompt, PromptResponse, SecretEntry, SecretInputState } from '../bridge';
+import type { UnloggedControl, Approval, ApprovalResponse, LiveTrack, WorkerState, Prompt, PromptResponse, SecretEntry, SecretInputState, PendingInheritance } from '../bridge';
 import { QuestionCard } from './QuestionCard';
 import { ApprovalCard } from './ApprovalCard';
 import { approvalContext } from './ApprovalDrafts';
@@ -12,15 +13,37 @@ import type { AttentionCard } from './NeedsYou';
 import { WorkerModel } from './WorkerModel';
 
 
-type Props = { unloggedControls?: UnloggedControl[]; secretInputs?: SecretInputState[]; workers: WorkerState[]; tracks: LiveTrack[]; flows?: OutputFlow[]; effects?: Effect[]; start: (id: string) => void; stop: (id: string) => void; canDropFiles: boolean; dropFiles: (files: File[], trackId: string) => void };
+type Props = { pendingInheritance?: PendingInheritance[]; queued?: ReadonlyMap<string, number>; unloggedControls?: UnloggedControl[]; secretInputs?: SecretInputState[]; workers: WorkerState[]; tracks: LiveTrack[]; flows?: OutputFlow[]; effects?: Effect[]; start: (id: string) => void; stop: (id: string) => void; canDropFiles: boolean; dropFiles: (files: File[], trackId: string) => void };
 type CardProps = Pick<Props, 'workers' | 'tracks'> & {
+  pendingInheritance: PendingInheritance[];
+  finishInheritance: (pending: PendingInheritance) => Promise<void>;
   provideSecret: (worker: WorkerState, prompt: Prompt, entry: SecretEntry) => Promise<void>;
   answer: (opId: string, worker: WorkerState, card: Approval, response: ApprovalResponse) => Promise<void>;
   respond: (worker: WorkerState, prompt: Prompt, response: PromptResponse) => Promise<void>;
 };
 
-export function workerCards({ workers, tracks, provideSecret, answer, respond }: CardProps): AttentionCard[] {
+function InheritanceRecovery({ pending, worker, label, finish }: { pending: PendingInheritance; worker: WorkerState; label: string; finish: CardProps['finishInheritance'] }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const ready = !worker.activeTurn && !worker.checkpointPending && ['held','ready'].includes(worker.phase);
+  return <div className="inheritance-recovery">
+    <strong>File update for Worker {label}</strong>
+    <p>Finish applying the saved files. No request will be sent.</p>
+    {pending.sourceState === 'cut' && <p>The request stays taken back.</p>}
+    {worker.detail && worker.phase === 'held' && <p>{worker.detail}</p>}
+    {error && <p role="alert">{error}</p>}
+    <div className="inheritance-actions"><button disabled={busy || !ready} onClick={() => { setBusy(true); setError(''); void finish(pending).catch(error => setError((error instanceof Error ? error.message : String(error)).replace(/^(?:Error: )?Error invoking remote method '[^']+': (?:Error: )?/, ''))).finally(() => setBusy(false)); }}>{busy || worker.phase === 'finishing-inheritance' ? 'Finishing…' : 'Finish file update'}</button></div>
+  </div>;
+}
+
+export function workerCards({ workers, tracks, pendingInheritance, finishInheritance, provideSecret, answer, respond }: CardProps): AttentionCard[] {
   return [
+    ...pendingInheritance.flatMap(pending => {
+      const worker = workers.find(worker => worker.trackId === pending.trackId);
+      if (!worker || worker.phase === 'starting') return [];
+      const label = tracks.find(track => track.id === pending.trackId)?.label ?? '';
+      return [{ id: `inheritance-${pending.operationId}`, version: `${pending.state}:${pending.sourceState}`, kind: 'stopped' as const, destination: { trackId: pending.trackId, label }, title: `Saved files for Worker ${label}`, content: <InheritanceRecovery key={pending.operationId} pending={pending} worker={worker} label={label} finish={finishInheritance} /> }];
+    }),
     ...workers.flatMap(worker => worker.prompts.map(prompt => ({
       id: `prompt-${worker.trackId}-${prompt.request.userInputId}`,
       version: prompt.revision,
@@ -40,7 +63,7 @@ export function workerCards({ workers, tracks, provideSecret, answer, respond }:
   ];
 }
 
-export function Workers({ unloggedControls = [], workers, tracks, flows = [], effects = [], secretInputs = [], start, stop, canDropFiles, dropFiles }: Props) {
+export function Workers({ pendingInheritance = [], queued, unloggedControls = [], workers, tracks, flows = [], effects = [], secretInputs = [], start, stop, canDropFiles, dropFiles }: Props) {
   const [dropTrack, setDropTrack] = useState<string | null>(null);
   return <div className="workers">
     {workers.map(worker => { const track = tracks.find(track => track.id === worker.trackId); const label = `Worker ${track?.label ?? ''}`; const acceptsFiles = canDropFiles && !!track; return <section key={worker.trackId} data-worker-card={worker.trackId} className={dropTrack === worker.trackId && acceptsFiles ? 'file-drop-active' : undefined}
@@ -52,7 +75,7 @@ export function Workers({ unloggedControls = [], workers, tracks, flows = [], ef
       onDragLeave={event => { if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setDropTrack(null); }}
       onDrop={event => { if (!event.dataTransfer.types.includes('Files')) return; event.preventDefault(); event.stopPropagation(); setDropTrack(null); if (acceptsFiles) dropFiles(Array.from(event.dataTransfer.files), worker.trackId); }}>
       {dropTrack === worker.trackId && acceptsFiles && <div className="card-file-drop"><span>Drop to attach · next words to {label}</span></div>}
-      <div className="worker-controls"><strong>{label}</strong><span>{['stopped', 'after-connection-loss'].includes(worker.phase) && worker.detail ? worker.detail : worker.phase}</span>{!['working','starting'].includes(worker.phase) && unloggedControls.some(control => control.paused !== false && (!control.trackId || control.trackId === worker.trackId)) && <small className="unlogged-control">unlogged · saved after the log recovered</small>}<WorkerModel model={worker.model} /><div className="worker-actions"><button aria-label={`Start ${label}`} disabled={!['ready', 'held'].includes(worker.phase)} onClick={() => start(worker.trackId)}>Start</button><button aria-label={`Stop ${label}`} disabled={['failed', 'stopped', 'after-connection-loss', 'checkpoint', 'restoring'].includes(worker.phase)} onClick={() => stop(worker.trackId)}>Stop</button></div></div>
+      <div className="worker-controls"><strong>{label}</strong><span>{queued?.has(worker.trackId) && !worker.activeTurn ? queueLabel(queued.get(worker.trackId)!) : ['stopped', 'after-connection-loss'].includes(worker.phase) && worker.detail ? worker.detail : worker.phase === 'waiting-memory' ? 'queued · waiting for memory' : worker.phase === 'sleeping' ? 'ready' : worker.phase === 'reviewing-fix' ? 'reviewing the fix' : worker.phase === 'review-conflict' ? 'waiting for your review decision' : worker.phase === 'finishing-inheritance' ? 'finishing file update' : worker.phase === 'stopping-processes' ? 'stopping processes' : worker.phase}</span>{!['working','starting'].includes(worker.phase) && unloggedControls.some(control => control.paused !== false && (!control.trackId || control.trackId === worker.trackId)) && <small className="unlogged-control">unlogged · saved after the log recovered</small>}<WorkerModel model={worker.model} /><div className="worker-actions"><button aria-label={`Start ${label}`} disabled={pendingInheritance.some(pending => pending.trackId === worker.trackId) || !['ready', 'held', 'sleeping'].includes(worker.phase)} onClick={() => start(worker.trackId)}>Start</button><button aria-label={`Stop ${label}`} disabled={['failed', 'stopped', 'after-connection-loss', 'checkpoint', 'restoring'].includes(worker.phase)} onClick={() => stop(worker.trackId)}>Stop</button></div></div>
       {secretInputs.find(input => input.owner.kind === 'work' && input.trackId === worker.trackId) && (() => { const input = secretInputs.find(input => input.owner.kind === 'work' && input.trackId === worker.trackId)!; return <p role="status">{input.state === 'ready' ? `${input.name} was supplied to this host.` : input.state === 'prepared' || input.state === 'stopping' || input.state === 'settled' || input.state === 'restarting' ? `Preparing ${input.name} for this worker…` : input.detail}</p>; })()}
       {worker.phase === 'held' && worker.detail && <p role="status">{worker.detail}</p>}
       <ReferenceScreening track={worker.trackId} label={label} />

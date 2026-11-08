@@ -60,7 +60,7 @@ test('real worker results reach proposals, continuation and the retained Editor 
     }, { timeout: 150_000, intervals: [250, 500, 1000] }).toBe(kind);
     await expect.poll(async () => {
       const proposal = (await status()).proposal;
-      return proposal?.trackId === track ? proposal.options[0].action : null;
+      return proposal && proposal.kind !== 'plan-conflict' && proposal.trackId === track ? proposal.options[0].action : null;
     }, { timeout: 30_000 }).toBe(kind === 'partial' ? 'continue' : 'commit');
   };
   const add = async (text: string) => {

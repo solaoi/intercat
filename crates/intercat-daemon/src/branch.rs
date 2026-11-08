@@ -223,10 +223,18 @@ fn prepare(tx: &Transaction<'_>, request: Request) -> Result<Branch> {
         "INSERT INTO tracks VALUES(?1,?2,?3,'waiting')",
         params![track_id, label, format!("Branch · {title}")],
     )?;
+    if crate::folders::project(tx)?.is_some() {
+        let folder = crate::folders::track(tx, &request.parent_track_id)?;
+        crate::folders::bind(tx, &track_id, &folder.id())?;
+    }
     tx.execute(
         "INSERT INTO workspaces VALUES(?1,?2)",
         params![track_id, serde_json::to_string(&workspace)?],
     )?;
+    let point = crate::lineage_store::point(tx, &request.parent_track_id, &checkpoint.sha)?;
+    let mut basis = point.basis();
+    crate::lineage::include(&mut basis.inherits, &point.track, &point.inherited())?;
+    crate::lineage_store::initialize(tx, &track_id, &basis)?;
     crate::attachment_history::freeze(
         tx,
         request.op_id,

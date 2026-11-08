@@ -133,7 +133,15 @@ print('SECRET_BOUNDARY_PROBE_COMPLETE')
     )
     .await?;
     journal
-        .configure_project(Uuid::now_v7(), project::inspect(source.clone()).await?)
+        .configure_project(
+            Uuid::now_v7(),
+            project::inspect(
+                uuid::Uuid::now_v7(),
+                "Dummy project".into(),
+                vec![source.clone()],
+            )
+            .await?,
+        )
         .await?;
     let binary = PathBuf::from(&args[1]).canonicalize()?;
     journal

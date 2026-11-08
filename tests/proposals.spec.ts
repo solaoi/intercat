@@ -17,7 +17,7 @@ test.beforeEach(async () => {
 });
 test.afterEach(async () => { await closeWindow(app); await rm(directory, { recursive: true, force: true }); });
 
-async function mount(kind: 'done' | 'partial' | 'quiet' | 'overlap', zoom = 1, age = 0, lose = false) {
+async function mount(kind: 'done' | 'partial' | 'quiet' | 'overlap', zoom = 1, age = 0, lose = false, bound = false) {
   await app.evaluate(({ ipcMain, BrowserWindow }, input) => {
     const proposal: Proposal = { id: 'dummy-proposal', kind: input.kind === 'quiet' ? 'quiet-changes' : 'work-completed', trackId: 'A', label: 'A',
       createdAt: input.now - input.age,
@@ -36,6 +36,9 @@ async function mount(kind: 'done' | 'partial' | 'quiet' | 'overlap', zoom = 1, a
       tracks: [{ id: 'A', label: 'A', title: 'ダミーのログイン作業', status: 'done' }], workers: [], utterances: [], proposal,
     };
     if (input.kind === 'overlap') state.tracks!.push({ id: 'B', label: 'B', title: '別のダミー作業', status: 'done' });
+    if (input.bound) state.plans = [{ id:'dummy-plan',rev:1,state:'running',sourceId:'source',sourceRevision:1,startMode:'manual',executeAllowed:true,lockedTrack:null,
+      generation:{id:'generation',state:'ready',attempt:0,detail:null},basedOn:[],attachments:[],summary:'Dummy remainder',assumptions: [], notices:[],seenRevision:null,rewrite:null,
+      items:[{planItemId:'dummy-item',trackRef:'A',folderId:'dummy',order:0,title:'Dummy remainder',instruction:'Finish the dummy work.',constraints:[],doneWhen:'Done.',after:[],state:'failed',skipOrder:[],startRequested:false,utteranceId:'initial',detail:'One step remains.'}]}];
     const memory = { state, requests: [] as ProposalCommand[], integrations: [] as unknown[], replies: new Map<string, ProposalResponse>(), lose: input.lose };
     Object.assign(globalThis, { proposalFixture: memory });
     ipcMain.removeHandler('intercat:status'); ipcMain.handle('intercat:status', () => state);
@@ -52,7 +55,12 @@ async function mount(kind: 'done' | 'partial' | 'quiet' | 'overlap', zoom = 1, a
         if (input.kind === 'overlap') word.presentation!.commitTracks = ['A', 'B'];
         state.utterances!.push(word);
       }
-      if (command.action === 'continue') response.inputId = 'dummy-continuation';
+      if (command.action === 'continue') {
+        response.inputId = 'dummy-continuation';
+        if (input.bound) state.utterances!.push({id:response.inputId,text:'Internal dummy continuation instructions.',attachments:[],createdAt:input.now,
+          state:'held',revision:1,reason:'Turns stopped',target:{mode:'lock',trackId:'A'},planId:'dummy-plan',planItemId:'dummy-item',planContinuation:{title:'Dummy remainder'},
+          decision:{kind:'extend',trackId:'A',boundary:'after-turn',command:null,confidence:1,inferenceMs:0,timedOut:false}});
+      }
       memory.replies.set(command.opId, response); state.proposal = null; state.sequence!++;
       if (memory.lose) { memory.lose = false; throw new Error('Dummy lost acknowledgement'); }
       return response;
@@ -65,14 +73,14 @@ async function mount(kind: 'done' | 'partial' | 'quiet' | 'overlap', zoom = 1, a
     ipcMain.removeHandler('intercat:integration-command'); ipcMain.handle('intercat:integration-command', (_event, request) => {
       memory.integrations.push(request);
       const job: IntegrationJob = { id: 'dummy-job', revision: 1, status: 'open', sessionName: 'Dummy review', slug: 'dummy',
-        project: { name: 'Dummy', root: '/dummy', path: '/dummy', commonDir: '/dummy/.git', base: 'a'.repeat(40), baseBranch: 'refs/heads/main' },
-        assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0,
+        project: { id: 'dummy-folder', name: 'Dummy', root: '/dummy', path: '/dummy', commonDir: '/dummy/.git', base: 'a'.repeat(40), baseBranch: 'refs/heads/main' },
+        exclusions: [], assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0,
         tracks: [], plan: null, candidate: null, messages: {}, keptSecrets: [], contributions: {}, error: null };
       state.integration = job; return job;
     });
     BrowserWindow.getAllWindows()[0].setSize(1040, 900);
     BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(input.zoom);
-  }, { kind, zoom, age, now: await page.evaluate(() => Date.now()), lose });
+  }, { kind, zoom, age, now: await page.evaluate(() => Date.now()), lose, bound });
   await page.reload(); await page.clock.runFor(1100);
   await page.mouse.move(5, 5); await page.clock.runFor(1600);
 }
@@ -98,6 +106,22 @@ for (const zoom of [1, 2]) test(`partial proposal has two usable actions and vis
   await card().getByRole('button', { name: 'Ask A to continue', exact: true }).click();
   await expect.poll(() => app.evaluate(() => (globalThis as any).proposalFixture.requests.map((request: ProposalCommand) => request.action))).toEqual(['continue']);
   expect(await app.evaluate(() => (globalThis as any).proposalFixture.integrations)).toEqual([]);
+});
+
+for (const zoom of [1,2]) test(`a held continuation stays visible with its item name at ${zoom*100}%`,async()=>{
+  await mount('partial',zoom,0,false,true);
+  await card().getByRole('button',{name:'Ask A to continue',exact:true}).click();
+  await page.clock.runFor(1200);
+  const request=page.locator('.request-strip [data-utterance-id="dummy-continuation"]');
+  await expect(request).toBeVisible();
+  await expect(page.locator('.request-strip')).not.toContainText('Internal dummy');
+  await expect(page.locator('.request-strip').getByRole('button',{name:'Start request: About Dummy remainder',exact:true})).toBeEnabled();
+  await app.evaluate(()=>{
+    const state:DaemonStatus=(globalThis as any).proposalFixture.state;
+    state.utterances![0].state='placed';state.utterances![0].reason=null;state.sequence!++;
+  });
+  await page.clock.runFor(1200);
+  await expect(page.getByRole('button',{name:'Cut About Dummy remainder from A',exact:true})).toBeAttached();
 });
 
 for (const lose of [false, true]) test(`commit proposal opens a durable review without publishing${lose ? ' after a lost answer' : ''}`, async () => {
@@ -249,12 +273,16 @@ for (const zoom of [1, 2]) test(`mixed M2 answers preserve a locked draft throug
   const destination = page.getByRole('combobox', { name: 'Request destination' });
   const text = 'Bへの依頼を書きかけたまま、AとCの確認に答えます。';
   await draft.fill(text); await destination.selectOption('B');
-  // At 200% the desk can use all available height. Browse via Stage mode,
-  // then return to the same cards and the independently addressed draft.
+  // Row clicks open the worker details and return to the normal desk layout.
   await draft.focus(); await page.keyboard.press('Meta+Shift+T');
   await expect(page.locator('.app')).toHaveClass(/stage-mode/);
-  await page.locator('#track-B').click(); await page.locator('#track-A').click();
+  await page.locator('#track-B').click();
+  await expect(page.locator('.app')).not.toHaveClass(/stage-mode/);
   await draft.focus(); await page.keyboard.press('Meta+Shift+T');
+  await expect(page.locator('.app')).toHaveClass(/stage-mode/);
+  await page.clock.runFor(200);
+  await page.getByRole('scrollbar', { name: 'All tracks', exact: true }).press('Home');
+  await page.locator('#track-A').click();
   await expect(page.locator('.app')).not.toHaveClass(/stage-mode/);
   await draft.focus(); await page.mouse.move(5, 5); await page.clock.runFor(1600);
   await page.getByRole('button', { name: /\+\d+ more/ }).click();

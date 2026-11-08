@@ -27,6 +27,32 @@ impl std::fmt::Display for ConnectionLost {
     }
 }
 impl std::error::Error for ConnectionLost {}
+
+/// Only errors that reject the start before admission can release its reservation.
+/// Internal failures, interruption and command-ID conflicts need reconciliation.
+pub(crate) fn rejected_start_code(error: &(dyn std::error::Error + 'static)) -> Option<i64> {
+    use muse_code_sdk::errors::ErrorCode;
+    let error = error.downcast_ref::<muse_code_sdk::errors::MspError>()?;
+    [
+        ErrorCode::InvalidRequest,
+        ErrorCode::MethodNotFound,
+        ErrorCode::InvalidParams,
+        ErrorCode::Overloaded,
+        ErrorCode::InputTooLarge,
+        ErrorCode::CapabilityRequired,
+        ErrorCode::SessionNotFound,
+        ErrorCode::SessionNotLoaded,
+        ErrorCode::SessionInUse,
+        ErrorCode::SessionAmbiguous,
+        ErrorCode::SessionStreamMismatch,
+        ErrorCode::Backpressured,
+        ErrorCode::SkillNotFound,
+        ErrorCode::DaemonDraining,
+    ]
+    .iter()
+    .any(|code| error.matches(*code))
+    .then(|| error.code())
+}
 /// A queued start lost its authorization before reaching the transport.
 #[derive(Debug)]
 pub struct StartCancelled;
@@ -58,7 +84,7 @@ impl StartGuard {
             paused,
         }
     }
-    fn current(&self) -> bool {
+    pub(crate) fn current(&self) -> bool {
         match self {
             Self::Worker {
                 generation,
@@ -349,7 +375,15 @@ impl Connection {
                 let history_reply = reply.as_ref().is_some_and(|reply| reply.history);
                 if let Some(sender) = reply.and_then(|reply| reply.sender) {
                     let result = if let Some(error) = frame.get("error") {
-                        Err(std::io::Error::other(format!("MSP error: {error}")).into())
+                        match serde_json::from_value::<muse_code_sdk::msp::ErrorObject>(
+                            error.clone(),
+                        ) {
+                            Ok(error) => match muse_code_sdk::errors::MspError::try_from(error) {
+                                Ok(error) => Err(error.into()),
+                                Err(error) => Err(error.into()),
+                            },
+                            Err(error) => Err(error.into()),
+                        }
                     } else {
                         Ok(frame.get("result").cloned().unwrap_or(Value::Null))
                     };
@@ -882,6 +916,47 @@ mod tests {
         crate::screening::Command {
             params,
             permit: Arc::new(Arc::new(tokio::sync::RwLock::new(())).read_owned().await),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_rejections_keep_the_sdk_error_kind_and_malformed_errors_do_not() {
+        for structured in [true, false] {
+            let (read, mut responses) = tokio::io::duplex(4096);
+            let (write, requests) = tokio::io::duplex(4096);
+            let mut connection = Connection::new(read, write);
+            let client = connection.client.clone();
+            let task = tokio::spawn(async move { client.request("fixture", json!({})).await });
+            let mut requests = BufReader::new(requests);
+            let mut line = String::new();
+            requests.read_line(&mut line).await.unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            let mut error = json!({"code":-32030,"message":"Dummy rejected command"});
+            if structured {
+                error["data"] = json!({"kind":"commandRejected","retryable":false});
+            }
+            responses
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"jsonrpc":"2.0","id":frame["id"],"error":error})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let error = task.await.unwrap().unwrap_err();
+            assert_eq!(rejected_start_code(error.as_ref()), None);
+            if structured {
+                let error = error
+                    .downcast_ref::<muse_code_sdk::errors::MspError>()
+                    .unwrap();
+                assert_eq!(error.code(), -32030);
+                assert_eq!(error.retryable(), Some(false));
+            } else {
+                assert!(error.is::<muse_code_sdk::errors::ProtocolError>());
+            }
+            connection.close();
         }
     }
 

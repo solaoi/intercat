@@ -57,7 +57,14 @@ fn capture(
     if session["bound"] != true {
         return Err("The session is still being prepared.".into());
     }
-    let project: Project = serde_json::from_value(setting(db, "project")?)?;
+    let configured: Project = serde_json::from_value(setting(db, "project")?)?;
+    let project = if let Some(previous) = previous {
+        configured.folder(&previous.project.id())?.clone()
+    } else if let Some(id) = selected.and_then(|tracks| tracks.first()) {
+        crate::folders::track(db, id)?
+    } else {
+        configured.only_folder()?.clone()
+    };
     let session_id = session["id"]
         .as_str()
         .ok_or("Missing session ID.")?
@@ -72,10 +79,11 @@ fn capture(
             "The project or session changed. Open its current review before refreshing.".into(),
         );
     }
-    let slug = session["slug"]
-        .as_str()
-        .ok_or("Missing session slug.")?
-        .to_string();
+    let slug: String = db.query_row(
+        "SELECT slug FROM session_folders WHERE session=?1 AND folder=?2",
+        params![session_id, project.id()],
+        |row| row.get(0),
+    )?;
     let name = session["name"]
         .as_str()
         .ok_or("Missing session name.")?
@@ -93,12 +101,26 @@ fn capture(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut tracks = Vec::new();
     for (track_id, label, title, workspace) in records {
+        if crate::folders::track(db, &track_id)?.id() != project.id() {
+            continue;
+        }
         let workspace: Workspace = serde_json::from_str(&workspace)?;
         if workspace.state != "ready" {
             continue;
         }
-        if label.is_empty() || !label.bytes().all(|b| b.is_ascii_uppercase()) {
+        let family = label.trim_end_matches(|c: char| c.is_ascii_digit());
+        let branch = &label[family.len()..];
+        if family.is_empty()
+            || !family.bytes().all(|b| b.is_ascii_uppercase())
+            || !branch.is_empty() && !branch.parse::<u64>().is_ok_and(|number| number >= 2)
+        {
             return Err("Invalid track label.".into());
+        }
+        let applying:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE kind='workspace.apply-inheritance' AND state<>'complete' AND json_extract(payload,'$.dependencies.track')=?1)",[&track_id],|row|row.get(0))?;
+        if applying {
+            return Err(
+                format!("Finish {label}’s inherited file update before opening Commit.").into(),
+            );
         }
         // A completed operation is authoritative even if the worker-state
         // notification is still queued, or the daemon died just before it.
@@ -132,10 +154,10 @@ fn capture(
                 .unwrap_or(0)
                 .try_into()?,
             checkpoint_count: checkpoint_count(db, &track_id)?,
-            id: track_id,
+            id: track_id.clone(),
             label,
             title,
-            initial_base: workspace.base,
+            basis: crate::lineage_store::basis(db, &track_id)?,
             checkpoint,
             last_clip,
             included,
@@ -175,6 +197,10 @@ fn capture(
         session_name: name,
         project,
         tracks,
+        lineage: crate::lineage_store::freeze(db)?,
+        omitted_conflicts: previous
+            .map(|job| job.omitted_conflicts.clone())
+            .unwrap_or_default(),
         plan: None,
         error: None,
         candidate: None,
@@ -188,6 +214,8 @@ fn capture(
         assumptions_failed: 0,
         order_review: None,
     };
+    crate::integration_exclusions::enforce(&mut job)?;
+    crate::integration_exclusions::order_sources_first(&mut job)?;
     crate::integration_assumptions::capture(db, &mut job)?;
     Ok(job)
 }
@@ -320,15 +348,7 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
         } => {
             let mut job = read(tx, *id)?;
             editable(&job, *revision)?;
-            let row = job
-                .tracks
-                .iter_mut()
-                .find(|row| row.id == *track)
-                .ok_or("Unknown integration track.")?;
-            if *included && row.checkpoint.is_none() {
-                return Err("This track has no saved checkpoint.".into());
-            }
-            row.included = *included;
+            crate::integration_exclusions::select(&mut job, track, *included)?;
             job.revision += 1;
             job.status = if job.contributions.is_empty() {
                 Status::Preparing
@@ -638,6 +658,18 @@ pub(crate) fn published(
         .operation;
     match outcome {
         crate::publication::Outcome::Complete => {
+            let included = job
+                .tracks
+                .iter()
+                .filter(|track| track.included)
+                .filter_map(|track| {
+                    track
+                        .checkpoint
+                        .as_ref()
+                        .map(|checkpoint| (track.id.as_str(), checkpoint.sha.as_str()))
+                })
+                .collect::<Vec<_>>();
+            crate::lineage_store::published(&tx, &job.lineage, &included)?;
             for commit in &job.candidate.as_ref().ok_or("Missing candidate.")?.commits {
                 let track = job
                     .tracks

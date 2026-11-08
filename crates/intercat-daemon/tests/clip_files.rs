@@ -1,10 +1,11 @@
 use intercat_daemon::{
     Result, clip_files,
     clock::Stamp,
-    decision::{Decision, Kind, Outcome, Target},
     journal::Journal,
     preparation::Workspace,
+    runtime::WorkerState,
     secrets::Key,
+    step_sources::{self, Active, Source},
     timeline::Window,
 };
 use serde_json::{Value, json};
@@ -34,12 +35,11 @@ fn git(path: &Path, args: &[&str]) -> String {
 struct Fixture {
     root: tempfile::TempDir,
     journal: Journal,
-    tracks: Vec<String>,
-    workspaces: Vec<PathBuf>,
-    base: String,
+    spaces: Vec<Workspace>,
+    sessions: Vec<String>,
 }
 impl Fixture {
-    async fn new(shared_repo: bool) -> Result<Self> {
+    async fn new(shared: bool) -> Result<Self> {
         let root = tempfile::tempdir()?;
         let repo = root.path().join("repository");
         fs::create_dir(&repo)?;
@@ -60,54 +60,19 @@ impl Fixture {
         );
         let base = git(&repo, &["rev-parse", "HEAD"]);
         let journal = Journal::open(root.path().join("db"), Key::new([7; 32])).await?;
-        let mut tracks = vec![];
-        let mut workspaces = vec![];
-        for index in 0..2 {
-            journal
-                .stage_utterance(
-                    Uuid::now_v7(),
-                    format!("Dummy {index}"),
-                    Target::New,
-                    None,
-                    vec![],
-                )
-                .await?;
-            let input = journal.claim_input().await?.unwrap();
-            journal
-                .apply_input(
-                    input.id,
-                    input.revision,
-                    Outcome::Classified(Decision {
-                        kind: Kind::Fork,
-                        track_id: None,
-                        boundary: Some("now".into()),
-                        command: None,
-                        confidence: 1.,
-                        inference_ms: 0.,
-                        timed_out: false,
-                        scores: json!({}),
-                    }),
-                )
-                .await?;
-            let snapshot = journal.snapshot().await?;
-            let track = snapshot["tracks"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|track| !tracks.contains(&track["id"].as_str().unwrap().to_owned()))
-                .unwrap()["id"]
-                .as_str()
-                .unwrap()
-                .to_owned();
-            let workspace = root.path().join(format!("worker-{index}"));
-            if index == 1 && !shared_repo {
+        let db = rusqlite::Connection::open(root.path().join("db"))?;
+        let mut spaces = Vec::new();
+        let mut sessions = Vec::new();
+        for n in 0..2 {
+            let path = root.path().join(format!("worker-{n}"));
+            if n == 1 && !shared {
                 git(
                     root.path(),
                     &[
                         "clone",
                         "-q",
                         repo.to_str().unwrap(),
-                        workspace.to_str().unwrap(),
+                        path.to_str().unwrap(),
                     ],
                 );
             } else {
@@ -117,87 +82,140 @@ impl Fixture {
                         "worktree",
                         "add",
                         "--detach",
-                        workspace.to_str().unwrap(),
+                        path.to_str().unwrap(),
                         "HEAD",
                     ],
                 );
             }
-            let workspace = workspace.canonicalize()?;
+            let track = Uuid::now_v7().to_string();
+            let session = Uuid::now_v7().to_string();
+            db.execute(
+                "INSERT INTO tracks VALUES(?1,?2,'Dummy','waiting')",
+                rusqlite::params![track, if n == 0 { "A" } else { "B" }],
+            )?;
+            let space = Workspace {
+                track_id: track.clone(),
+                path: path.canonicalize()?,
+                reference: format!("refs/intercat/dummy-{n}"),
+                base: base.clone(),
+                state: "ready".into(),
+                error: None,
+                attachment_roots: vec![],
+            };
+            journal.workspace_result(space.clone()).await?;
             journal
-                .workspace_result(Workspace {
-                    track_id: track.clone(),
-                    path: workspace.clone(),
-                    reference: format!("refs/intercat/dummy-{index}"),
-                    base: base.clone(),
-                    state: "ready".into(),
-                    error: None,
-                    attachment_roots: vec![],
+                .worker_state(WorkerState {
+                    track_id: track,
+                    phase: "ready".into(),
+                    session_id: Some(session.clone()),
+                    secret_revision: None,
+                    identity: None,
+                    detail: None,
+                    active_turn: None,
+                    approvals: vec![],
+                    output: None,
+                    checkpoint_pending: false,
+                    checkpoint: None,
+                    prompts: vec![],
                 })
                 .await?;
-            tracks.push(track);
-            workspaces.push(workspace);
+            spaces.push(space);
+            sessions.push(session);
         }
         Ok(Self {
             root,
             journal,
-            tracks,
-            workspaces,
-            base,
+            spaces,
+            sessions,
         })
     }
-    fn patch(&self, index: usize, path: &str) -> Value {
-        let content=json!({"files":[{"path":self.workspaces[index].join(path),"hunks":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["-base","+changed"]}]}]}).to_string();
-        json!({"content":content,"encoding":"utf8","byteLen":content.len(),"offsetBytes":0,"eof":true,"mediaType":"application/json"})
+    fn db(&self) -> Result<rusqlite::Connection> {
+        Ok(rusqlite::Connection::open(self.root.path().join("db"))?)
     }
-    async fn edit(
+    fn path(&self, n: usize) -> &Path {
+        &self.spaces[n].path
+    }
+    async fn begin(&self, n: usize, turn: &str, calls: &[&str]) -> Result<()> {
+        let before = intercat_daemon::checkpoint::capture(
+            &self.spaces[n],
+            &self.spaces[n].base,
+            "Dummy before\n",
+        )
+        .await?
+        .sha;
+        assert!(
+            self.journal
+                .begin_step_capture(Active {
+                    track: self.spaces[n].track_id.clone(),
+                    session: self.sessions[n].clone(),
+                    turn: turn.into(),
+                    before,
+                    calls: calls.iter().map(|s| s.to_string()).collect(),
+                    workspace: self.spaces[n].clone()
+                })
+                .await?
+        );
+        Ok(())
+    }
+    async fn item(
         &self,
-        index: usize,
-        item: &str,
-        path: &str,
+        n: usize,
+        turn: &str,
+        call: &str,
         revision: u64,
-        cache: bool,
+        status: &str,
+        background: bool,
     ) -> Result<String> {
-        let output = self.patch(index, path);
-        self.journal.try_msp(self.tracks[index].clone(),format!("session-{index}"),Stamp::now(),json!({"method":"item/completed","params":{"sessionId":format!("session-{index}"),"item":{"itemId":item,"turnId":format!("turn-{index}"),"kind":"toolCall","tool":"edit_file","revision":revision,"status":"completed","args":json!({"path":path}).to_string(),"patchRef":{"id":format!("patch-{item}"),"kind":"tool_patch","availability":"available","mediaType":"application/json","byteLen":output["byteLen"]}}}}),None,None)?.await??;
-        if cache {
-            self.cache(index, item, output).await?;
-        }
-        let db = rusqlite::Connection::open(self.root.path().join("db"))?;
-        Ok(db.query_row(
+        self.journal.try_msp(self.spaces[n].track_id.clone(),self.sessions[n].clone(),Stamp::now(),json!({"method":if status=="inProgress" {"item/started"} else {"item/completed"},"params":{"sessionId":self.sessions[n],"item":{"itemId":format!("item-{call}"),"callId":call,"turnId":turn,"kind":"toolCall","tool":"bash","revision":revision,"status":status,"background":background,"args":"{\"command\":\"dummy only\"}"}}}),None,None)?.await??;
+        Ok(self.db()?.query_row(
             "SELECT clip FROM timeline_items WHERE session=?1 AND item=?2",
-            rusqlite::params![format!("session-{index}"), item],
-            |row| row.get(0),
+            rusqlite::params![self.sessions[n], format!("item-{call}")],
+            |r| r.get(0),
         )?)
     }
-    async fn cache(&self, index: usize, item: &str, output: Value) -> Result<()> {
-        self.journal
-            .cache_output(
-                format!("session-{index}"),
-                item.into(),
-                format!("patch-{item}"),
-                output,
-            )
-            .await
+    async fn source(
+        &self,
+        n: usize,
+        turn: &str,
+        calls: &[&str],
+        paths: Option<&[&str]>,
+    ) -> Result<()> {
+        let calls = calls.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            self.journal
+                .save_step_source(Source {
+                    id: step_sources::identity(&self.sessions[n], turn, &calls),
+                    track: self.spaces[n].track_id.clone(),
+                    session: self.sessions[n].clone(),
+                    turn: turn.into(),
+                    calls,
+                    paths: paths.map(|p| p.iter().map(|s| s.to_string()).collect()),
+                    workspace: self.spaces[n].clone(),
+                    at: Stamp::now()
+                })
+                .await?
+        );
+        Ok(())
+    }
+    async fn closed(&self, n: usize, call: &str, paths: Option<&[&str]>) -> Result<String> {
+        let turn = Uuid::now_v7().to_string();
+        self.begin(n, &turn, &[call]).await?;
+        let id = self.item(n, &turn, call, 1, "completed", false).await?;
+        self.source(n, &turn, &[call], paths).await?;
+        Ok(id)
     }
     async fn process(&self) -> Result<()> {
-        for _ in 0..20 {
+        for _ in 0..40 {
             let Some(ticket) = self.journal.next_clip_files().await? else {
                 return Ok(());
             };
-            let comparison = clip_files::inspect(&ticket);
-            assert!(self.journal.finish_clip_files(ticket, comparison).await?);
+            assert!(
+                self.journal
+                    .finish_clip_files(ticket.clone(), clip_files::inspect(&ticket))
+                    .await?
+            );
         }
-        panic!("file scan did not settle");
-    }
-    async fn window(&self, since: Option<i64>) -> Result<Value> {
-        self.journal
-            .timeline_window(Window {
-                tracks: self.tracks.clone(),
-                start: 0,
-                end: i64::MAX,
-                since,
-            })
-            .await
+        panic!("file scans did not settle")
     }
     async fn warnings(&self, id: &str) -> Result<Vec<Value>> {
         Ok(
@@ -207,99 +225,188 @@ impl Fixture {
                 .clone(),
         )
     }
+    fn ended(&self, id: &str) -> Result<bool> {
+        Ok(self.db()?.query_row(
+            "SELECT json_extract(record,'$.end') IS NOT NULL FROM timeline_clips WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+    fn count(&self, sql: &str) -> Result<i64> {
+        Ok(self.db()?.query_row(sql, [], |r| r.get(0))?)
+    }
 }
 
 #[tokio::test]
-async fn exact_patch_files_mark_both_clips_and_leave_content_versions_alone() -> Result<()> {
+async fn saved_sources_mark_both_clips_without_changing_content_versions() -> Result<()> {
     let f = Fixture::new(true).await?;
-    fs::write(f.workspaces[0].join("shared.txt"), "A\n")?;
-    let a = f.edit(0, "edit-a", "shared.txt", 1, true).await?;
+    fs::write(f.path(0).join("shared.txt"), "A\n")?;
+    let a = f.closed(0, "a", Some(&["shared.txt"])).await?;
     f.process().await?;
     assert!(f.warnings(&a).await?.is_empty());
-    let before = f.window(None).await?;
-    let db = rusqlite::Connection::open(f.root.path().join("db"))?;
-    let version: i64 = db.query_row(
+    let version: i64 = f.db()?.query_row(
         "SELECT version FROM timeline_versions WHERE id=?1",
         [&a],
         |r| r.get(0),
     )?;
-    fs::write(f.workspaces[1].join("shared.txt"), "B\n")?;
-    let b = f.edit(1, "edit-b", "shared.txt", 1, true).await?;
+    let before = f
+        .journal
+        .timeline_window(Window {
+            tracks: f.spaces.iter().map(|s| s.track_id.clone()).collect(),
+            start: 0,
+            end: i64::MAX,
+            since: None,
+        })
+        .await?;
+    fs::write(f.path(1).join("shared.txt"), "B\n")?;
+    let b = f.closed(1, "b", Some(&["shared.txt"])).await?;
     f.process().await?;
     for id in [&a, &b] {
-        let warnings = f.warnings(id).await?;
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0]["kind"], "same-file");
-        assert!(warnings[0]["text"].as_str().unwrap().contains("shared.txt"));
+        let w = f.warnings(id).await?;
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0]["kind"], "same-file");
+        assert!(w[0]["text"].as_str().unwrap().contains("shared.txt"));
     }
     assert_eq!(
-        db.query_row(
+        f.db()?.query_row(
             "SELECT version FROM timeline_versions WHERE id=?1",
             [&a],
             |r| r.get::<_, i64>(0)
         )?,
         version
     );
-    assert_eq!(db.query_row("SELECT count(*) FROM events WHERE kind='clip.files.compared' AND json_array_length(payload,'$.overlaps')>0",[],|row|row.get::<_,i64>(0))?,1);
-    let delta = f.window(before["revision"].as_i64()).await?;
+    let delta = f
+        .journal
+        .timeline_window(Window {
+            tracks: f.spaces.iter().map(|s| s.track_id.clone()).collect(),
+            start: 0,
+            end: i64::MAX,
+            since: before["revision"].as_i64(),
+        })
+        .await?;
     assert!(
         delta["clips"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|clip| clip["id"] == a)
+            .any(|c| c["id"] == a)
     );
-    // An in-flight edit to another file never becomes part of this clip.
-    fs::write(f.workspaces[0].join("unrecorded.txt"), "later work\n")?;
-    assert!(!serde_json::to_string(&f.warnings(&a).await?)?.contains("unrecorded"));
+    fs::write(f.path(0).join("later.txt"), "Later\n")?;
+    assert!(!serde_json::to_string(&f.warnings(&a).await?)?.contains("later.txt"));
     Ok(())
 }
 
 #[tokio::test]
-async fn missing_and_partial_outputs_never_guess_files_and_late_complete_output_is_used()
--> Result<()> {
+async fn parallel_batch_waits_for_all_call_ids_in_either_arrival_order() -> Result<()> {
     let f = Fixture::new(true).await?;
-    for index in 0..2 {
-        fs::write(f.workspaces[index].join("shared.txt"), "changed\n")?;
-    }
-    let a = f.edit(0, "a", "shared.txt", 1, true).await?;
+    let turn = Uuid::now_v7().to_string();
+    f.begin(0, &turn, &["a", "b"]).await?;
+    let id = f.item(0, &turn, "a", 1, "completed", false).await?;
+    assert!(!f.ended(&id)?);
+    f.source(0, &turn, &["a", "b"], Some(&["empty.txt"]))
+        .await?;
+    assert!(!f.ended(&id)?);
+    assert_eq!(f.item(0, &turn, "b", 1, "inProgress", false).await?, id);
+    assert!(!f.ended(&id)?);
+    assert_eq!(f.item(0, &turn, "b", 2, "completed", false).await?, id);
+    assert!(f.ended(&id)?);
+    assert_eq!(f.count("SELECT count(*) FROM step_source_clips")?, 1);
+    f.source(0, &turn, &["a", "b"], Some(&["empty.txt"]))
+        .await?;
+    f.begin(0, &turn, &["c"]).await?;
+    let next = f.item(0, &turn, "c", 1, "completed", false).await?;
+    assert_ne!(id, next);
+    assert!(!f.ended(&next)?);
+    f.source(0, &turn, &["c"], Some(&[])).await?;
+    assert!(f.ended(&next)?);
+    assert_eq!(f.count("SELECT count(*) FROM step_source_clips")?, 2);
+    // A background shell is split off at the batch boundary and later completed.
+    f.begin(0, &turn, &["d"]).await?;
+    let bg = f.item(0, &turn, "d", 1, "inProgress", true).await?;
+    f.source(0, &turn, &["d"], Some(&[])).await?;
+    assert!(f.ended(&bg)?);
+    assert_eq!(f.count("SELECT count(*) FROM timeline_clips WHERE json_extract(record,'$.category')='shell' AND json_extract(record,'$.end') IS NULL")?,1);
+    f.item(0, &turn, "d", 2, "completed", false).await?;
+    assert_eq!(f.count("SELECT count(*) FROM timeline_clips WHERE json_extract(record,'$.category')='shell' AND json_extract(record,'$.end') IS NULL")?,0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unavailable_sources_never_guess_from_a_later_tree_or_patch() -> Result<()> {
+    let f = Fixture::new(true).await?;
+    fs::write(f.path(0).join("shared.txt"), "A\n")?;
+    let a = f.closed(0, "a", None).await?;
     f.process().await?;
-    let b = f.edit(1, "b", "shared.txt", 1, false).await?;
+    assert_eq!(
+        f.warnings(&a).await?[0]["kind"],
+        "file-comparison-unavailable"
+    );
+    let before = f.count("SELECT count(*) FROM events WHERE kind='clip.files.compared'")?;
+    f.journal
+        .cache_output(
+            f.sessions[0].clone(),
+            "item-a".into(),
+            "fake-patch".into(),
+            json!({"files":[{"path":"shared.txt","hunks":[{"lines":["+fake"]}]}]}),
+        )
+        .await?;
+    f.process().await?;
+    assert_eq!(
+        before,
+        f.count("SELECT count(*) FROM events WHERE kind='clip.files.compared'")?
+    );
+    let empty = f.closed(1, "empty", Some(&[])).await?;
+    f.process().await?;
+    assert!(f.warnings(&empty).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_and_clean_peers_are_compared_and_later_completion_keeps_the_address() -> Result<()>
+{
+    let f = Fixture::new(true).await?;
+    let turn = Uuid::now_v7().to_string();
+    f.begin(1, &turn, &["active"]).await?;
+    let b = f.item(1, &turn, "active", 1, "inProgress", false).await?;
+    fs::write(f.path(0).join("shared.txt"), "A\n")?;
+    let a = f.closed(0, "a", Some(&["shared.txt"])).await?;
     f.process().await?;
     assert!(f.warnings(&a).await?.is_empty());
-    let mut partial = f.patch(1, "shared.txt");
-    partial["eof"] = false.into();
-    f.cache(1, "b", partial).await?;
+    fs::write(f.path(1).join("shared.txt"), "B\n")?;
+    // A's next closed step checks B while B is still running.
+    let a2 = f.closed(0, "a2", Some(&["shared.txt"])).await?;
     f.process().await?;
-    assert!(f.warnings(&b).await?.is_empty());
-    f.cache(1, "b", f.patch(1, "shared.txt")).await?;
+    assert_eq!(f.warnings(&a2).await?.len(), 1);
+    assert_eq!(f.warnings(&b).await?.len(), 1);
+    assert!(f.warnings(&a).await?.is_empty());
+    f.item(1, &turn, "active", 2, "completed", false).await?;
+    f.source(1, &turn, &["active"], Some(&["shared.txt"]))
+        .await?;
     f.process().await?;
-    assert_eq!(f.warnings(&a).await?.len(), 1);
+    assert_eq!(f.warnings(&a2).await?.len(), 1);
     assert_eq!(f.warnings(&b).await?.len(), 1);
     Ok(())
 }
 
 #[tokio::test]
-async fn foreign_repositories_and_already_integrated_files_are_not_overlaps() -> Result<()> {
-    let f = Fixture::new(false).await?;
-    for index in 0..2 {
-        fs::write(f.workspaces[index].join("shared.txt"), "changed\n")?;
-        f.edit(index, &format!("foreign-{index}"), "shared.txt", 1, true)
-            .await?;
-    }
-    f.process().await?;
-    assert!(
-        f.window(None).await?["clips"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|clip| clip["warnings"].as_array().unwrap().is_empty())
-    );
+async fn new_boundary_and_commit_invalidate_old_comparisons() -> Result<()> {
     let f = Fixture::new(true).await?;
-    fs::write(f.workspaces[0].join("shared.txt"), "A\n")?;
-    git(&f.workspaces[0], &["add", "."]);
+    for n in 0..2 {
+        fs::write(f.path(n).join("shared.txt"), "changed\n")?;
+    }
+    let a = f.closed(0, "a", Some(&["shared.txt"])).await?;
+    let b = f.closed(1, "b", Some(&["shared.txt"])).await?;
+    let old = f.journal.next_clip_files().await?.unwrap();
+    let result = clip_files::inspect(&old);
+    let c = f.closed(1, "c", Some(&["shared.txt"])).await?;
+    assert!(!f.journal.finish_clip_files(old, result).await?);
+    f.process().await?;
+    assert!(f.warnings(&b).await?.is_empty());
+    assert_eq!(f.warnings(&c).await?.len(), 1);
+    assert_eq!(f.warnings(&a).await?.len(), 1);
+    git(f.path(0), &["add", "."]);
     git(
-        &f.workspaces[0],
+        f.path(0),
         &[
             "-c",
             "user.name=Dummy",
@@ -310,58 +417,59 @@ async fn foreign_repositories_and_already_integrated_files_are_not_overlaps() ->
             "Saved dummy",
         ],
     );
-    let integrated = git(&f.workspaces[0], &["rev-parse", "HEAD"]);
-    f.journal.append("integration.published",json!({"status":"done","tracks":[{"id":f.tracks[0],"checkpoint":{"sha":integrated}}],"candidate":{"commits":[{"track":f.tracks[0]}]}})).await?;
-    let a = f.edit(0, "integrated", "shared.txt", 1, true).await?;
+    let integrated = git(f.path(0), &["rev-parse", "HEAD"]);
+    f.journal.append("integration.published",json!({"status":"done","tracks":[{"id":f.spaces[0].track_id,"checkpoint":{"sha":integrated}}],"candidate":{"commits":[{"track":f.spaces[0].track_id}]}})).await?;
     f.process().await?;
-    fs::write(f.workspaces[1].join("shared.txt"), "B\n")?;
-    f.edit(1, "other", "shared.txt", 1, true).await?;
-    f.process().await?;
-    assert!(f.warnings(&a).await?.is_empty());
-    assert_ne!(integrated, f.base);
+    for id in [&a, &c] {
+        assert!(f.warnings(id).await?.is_empty());
+    }
     Ok(())
 }
 
 #[tokio::test]
-async fn changed_patch_invalidates_both_marks_and_rejects_an_old_scan() -> Result<()> {
+async fn a_late_source_uses_clip_order_instead_of_record_arrival_order() -> Result<()> {
     let f = Fixture::new(true).await?;
-    for index in 0..2 {
-        fs::write(f.workspaces[index].join("shared.txt"), "changed\n")?;
-    }
-    let a = f.edit(0, "a", "shared.txt", 1, true).await?;
+    fs::write(f.path(0).join("shared.txt"), "A\n")?;
+    let a = f.closed(0, "a", Some(&["shared.txt"])).await?;
+    let turn = Uuid::now_v7().to_string();
+    f.begin(1, &turn, &["old"]).await?;
+    fs::write(f.path(1).join("shared.txt"), "B first\n")?;
+    let old = f.item(1, &turn, "old", 1, "completed", false).await?;
+    f.journal
+        .try_msp(
+            f.spaces[1].track_id.clone(),
+            f.sessions[1].clone(),
+            Stamp::now(),
+            json!({"method":"turn/completed","params":{"sessionId":f.sessions[1],"turnId":turn}}),
+            None,
+            None,
+        )?
+        .await??;
+    fs::write(f.path(1).join("shared.txt"), "B second\n")?;
+    let current = f.closed(1, "current", Some(&["shared.txt"])).await?;
+    f.source(1, &turn, &["old"], Some(&["shared.txt"])).await?;
     f.process().await?;
-    let b = f.edit(1, "b", "shared.txt", 1, true).await?;
-    let ticket = f.journal.next_clip_files().await?.unwrap();
-    let comparison = clip_files::inspect(&ticket);
-    f.edit(1, "b", "shared.txt", 2, false).await?;
-    assert!(!f.journal.finish_clip_files(ticket, comparison).await?);
-    f.process().await?;
-    assert_eq!(f.warnings(&a).await?.len(), 1);
-    let mut wrong = f.patch(1, "shared.txt");
-    wrong["content"] =
-        json!({"files":[{"path":"../not-the-workspace","hunks":[{"lines":["+bad"]}]}]})
-            .to_string()
-            .into();
-    wrong["byteLen"] = wrong["content"].as_str().unwrap().len().into();
-    f.cache(1, "b", wrong).await?;
-    assert!(f.warnings(&a).await?.is_empty());
-    assert!(f.warnings(&b).await?.is_empty());
-    f.process().await?;
-    assert!(f.warnings(&a).await?.is_empty());
+    assert!(f.warnings(&old).await?.is_empty());
+    assert_eq!(f.warnings(&current).await?.len(), 1);
+    let peer: Option<String> = f.db()?.query_row(
+        "SELECT peer_clip FROM clip_file_warnings WHERE clip=?1",
+        [a],
+        |r| r.get(0),
+    )?;
+    assert_eq!(peer, Some(current));
     Ok(())
 }
 
 #[tokio::test]
-async fn warning_storage_failure_rolls_back_and_restart_keeps_valid_marks() -> Result<()> {
+async fn storage_failure_rolls_back_and_restart_keeps_sources_and_marks() -> Result<()> {
     let f = Fixture::new(true).await?;
-    for index in 0..2 {
-        fs::write(f.workspaces[index].join("shared.txt"), "changed\n")?;
-    }
-    let a = f.edit(0, "a", "shared.txt", 1, true).await?;
+    fs::write(f.path(0).join("shared.txt"), "changed\n")?;
+    let a = f.closed(0, "a", Some(&["shared.txt"])).await?;
     f.process().await?;
-    let b = f.edit(1, "b", "shared.txt", 1, true).await?;
+    fs::write(f.path(1).join("shared.txt"), "changed\n")?;
+    let b = f.closed(1, "b", Some(&["shared.txt"])).await?;
     let ticket = f.journal.next_clip_files().await?.unwrap();
-    let db = rusqlite::Connection::open(f.root.path().join("db"))?;
+    let db = f.db()?;
     db.execute_batch("CREATE TRIGGER fail_file_warning BEFORE INSERT ON clip_file_warnings BEGIN SELECT RAISE(ABORT,'dummy storage full'); END;")?;
     assert!(
         f.journal
@@ -376,100 +484,75 @@ async fn warning_storage_failure_rolls_back_and_restart_keeps_valid_marks() -> R
             .finish_clip_files(ticket.clone(), clip_files::inspect(&ticket))
             .await?
     );
+    f.process().await?;
     let reopened = Journal::open(f.root.path().join("db"), Key::new([7; 32])).await?;
-    assert_eq!(
-        reopened.clip_detail(a).await?["clip"]["warnings"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        reopened.clip_detail(b).await?["clip"]["warnings"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    for id in [&a, &b] {
+        assert_eq!(
+            reopened.clip_detail(id.clone()).await?["clip"]["warnings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert_eq!(f.count("SELECT count(*) FROM step_source_clips")?, 2);
     Ok(())
 }
 
 #[tokio::test]
-async fn symlinked_parent_is_not_followed_and_background_service_stops_cleanly() -> Result<()> {
-    let f = Fixture::new(true).await?;
-    let external = f.root.path().join("outside");
-    fs::create_dir(&external)?;
-    fs::write(external.join("shared.txt"), "outside dummy\n")?;
-    for index in 0..2 {
-        std::os::unix::fs::symlink(&external, f.workspaces[index].join("link"))?;
-        f.edit(index, &format!("link-{index}"), "link/shared.txt", 1, true)
-            .await?;
+async fn foreign_repositories_and_line_endings_do_not_create_false_overlaps() -> Result<()> {
+    let f = Fixture::new(false).await?;
+    for n in 0..2 {
+        fs::write(f.path(n).join("shared.txt"), "changed\n")?;
     }
-    f.process().await?;
-    assert!(
-        f.window(None).await?["clips"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|clip| clip["warnings"].as_array().unwrap().is_empty())
-    );
-    let db = rusqlite::Connection::open(f.root.path().join("db"))?;
-    db.execute("UPDATE clip_file_pending SET retry_at=0", [])?;
-    f.process().await?;
-    let count: i64 = db.query_row(
-        "SELECT count(*) FROM events WHERE kind='clip.files.compared'",
-        [],
-        |row| row.get(0),
-    )?;
-    db.execute("UPDATE clip_file_pending SET retry_at=0", [])?;
-    f.process().await?;
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM events WHERE kind='clip.files.compared'",
-            [],
-            |row| row.get::<_, i64>(0)
-        )?,
-        count
-    );
-    for index in 0..2 {
-        fs::write(f.workspaces[index].join("shared.txt"), "safe change\n")?;
-    }
-    let service = clip_files::Service::start(f.journal.clone());
-    let a = f.edit(0, "safe-a", "shared.txt", 1, true).await?;
-    let b = f.edit(1, "safe-b", "shared.txt", 1, true).await?;
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            if f.warnings(&a).await?.len() == 1 && f.warnings(&b).await?.len() == 1 {
-                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await??;
-    service.stop().await;
-    assert_eq!(
-        fs::read_to_string(external.join("shared.txt"))?,
-        "outside dummy\n"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn line_ending_conversion_is_not_an_uncommitted_change() -> Result<()> {
-    let f = Fixture::new(true).await?;
-    git(&f.workspaces[0], &["config", "core.autocrlf", "true"]);
-    fs::write(f.workspaces[0].join("shared.txt"), "base\r\n")?;
-    fs::write(f.workspaces[1].join("shared.txt"), "changed\r\n")?;
-    let a = f.edit(0, "a", "shared.txt", 1, true).await?;
-    f.process().await?;
-    let b = f.edit(1, "b", "shared.txt", 1, true).await?;
+    let a = f.closed(0, "a", Some(&["shared.txt"])).await?;
+    let b = f.closed(1, "b", Some(&["shared.txt"])).await?;
     f.process().await?;
     assert!(f.warnings(&a).await?.is_empty());
     assert!(f.warnings(&b).await?.is_empty());
-    fs::write(f.workspaces[0].join("shared.txt"), "new\r\n")?;
-    let changed = f.edit(0, "changed", "shared.txt", 1, true).await?;
+    let f = Fixture::new(true).await?;
+    git(f.path(0), &["config", "core.autocrlf", "true"]);
+    fs::write(f.path(0).join("shared.txt"), "base\r\n")?;
+    fs::write(f.path(1).join("shared.txt"), "B\n")?;
+    let a = f.closed(0, "a", Some(&["shared.txt"])).await?;
+    f.closed(1, "b", Some(&["shared.txt"])).await?;
     f.process().await?;
-    assert_eq!(f.warnings(&changed).await?.len(), 1);
+    assert!(f.warnings(&a).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsafe_paths_show_unavailable_and_service_stops_without_reading_outside() -> Result<()> {
+    let f = Fixture::new(true).await?;
+    let outside = f.root.path().join("outside");
+    fs::create_dir(&outside)?;
+    fs::write(outside.join("shared.txt"), "dummy outside\n")?;
+    for n in 0..2 {
+        std::os::unix::fs::symlink(&outside, f.path(n).join("link"))?;
+    }
+    let a = f.closed(0, "a", Some(&["link/shared.txt"])).await?;
+    f.process().await?;
+    assert_eq!(
+        f.warnings(&a).await?[0]["kind"],
+        "file-comparison-unavailable"
+    );
+    f.db()?
+        .execute("UPDATE clip_file_pending SET retry_at=0", [])?;
+    f.process().await?;
+    let count = f.count("SELECT count(*) FROM events WHERE kind='clip.files.compared'")?;
+    f.db()?
+        .execute("UPDATE clip_file_pending SET retry_at=0", [])?;
+    f.process().await?;
+    assert_eq!(
+        count,
+        f.count("SELECT count(*) FROM events WHERE kind='clip.files.compared'")?
+    );
+    let service = clip_files::Service::start(f.journal.clone());
+    service.stop().await;
+    assert_eq!(
+        fs::read_to_string(outside.join("shared.txt"))?,
+        "dummy outside\n"
+    );
     Ok(())
 }
 
@@ -504,4 +587,121 @@ fn a_clean_filter_cannot_execute_during_file_comparison() -> Result<()> {
     );
     assert!(!root.path().join("filter-ran").exists());
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "two paid dummy Muse turns; verifies warnings while the peer is running"]
+async fn native_workers_warn_on_the_exact_file_while_the_peer_is_running() -> Result<()> {
+    use intercat_daemon::{
+        host::{Boundary, Host, Profile},
+        msp::Event,
+        step_capture::Service,
+    };
+    let mut f = Fixture::new(true).await?;
+    let binary = PathBuf::from(std::env::var("INTERCAT_MUSE_BINARY")?);
+    let auth = PathBuf::from(std::env::var("INTERCAT_MUSE_AUTH")?);
+    let output = PathBuf::from(std::env::var("INTERCAT_STEP_OUTPUT")?);
+    fs::create_dir_all(&output)?;
+    let rpc = f.root.path().join("rpc");
+    fs::create_dir(&rpc)?;
+    let mut hosts = Vec::new();
+    for n in 0..2 {
+        let capture = Service::start(f.journal.clone(), f.spaces[n].track_id.clone(), f.path(n))?;
+        let host = Host::spawn(
+            &binary,
+            &f.root.path().join(format!("host-{n}")),
+            f.path(n),
+            std::ffi::OsStr::new(&std::env::var("PATH")?),
+            Some(&auth),
+            Boundary {
+                profile: Profile::Worker,
+                secrets: &[],
+                rpc: &rpc,
+                denied: &[],
+                steps: Some(capture),
+            },
+        )
+        .await?;
+        host.connection.client.initialize().await?;
+        let opened=host.connection.client.request("session/start",json!({"commandId":Uuid::now_v7(),"workspaceRoot":f.path(n),"providerId":"meta","approvalMode":"promptUnmatched"})).await?;
+        f.sessions[n] = opened["session"]["sessionId"].as_str().unwrap().into();
+        f.journal
+            .worker_state(WorkerState {
+                track_id: f.spaces[n].track_id.clone(),
+                phase: "ready".into(),
+                session_id: Some(f.sessions[n].clone()),
+                secret_revision: None,
+                identity: Some(host.identity),
+                detail: None,
+                active_turn: None,
+                approvals: vec![],
+                output: None,
+                checkpoint_pending: false,
+                checkpoint: None,
+                prompts: vec![],
+            })
+            .await?;
+        hosts.push(host);
+    }
+    let commands = [
+        "printf A > shared.txt; : > empty.txt",
+        "printf B > shared.txt; /bin/sleep 30",
+    ];
+    let result=async {
+        let mut started=[false,false];let mut ended=[false,false];let mut decided=std::collections::BTreeSet::new();
+        let start=|n:usize|f.journal.screen_start(json!({"commandId":Uuid::now_v7(),"sessionId":f.sessions[n],"reasoningEffort":"minimal","input":[{"type":"text","text":format!("Disposable test. Run exactly one bash call with exactly this command: {}. Do not use any other tools. After it finishes reply DONE.",commands[n])}]}));
+        let b=start(1).await?;
+        hosts[1].connection.client.start(b,intercat_daemon::msp::StartGuard::Stopped(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))).await?;
+        started[1]=true;
+        let mut interval=tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut active_warning=false;
+        tokio::time::timeout(std::time::Duration::from_secs(110),async {
+            while !ended.iter().all(|done|*done) {
+                let (left,right)=hosts.split_at_mut(1);
+                let observed=tokio::select! {
+                    e=left[0].connection.next_event()=>Some((0,e)),
+                    e=right[0].connection.next_event()=>Some((1,e)),
+                    _=interval.tick()=>None,
+                };
+                if let Some((n,event))=observed {
+                    let frame=match event {Some(Event::Frame(value))=>value.frame,Some(Event::Closed(reason))=>return Err(reason.into()),None=>return Err("Native host closed.".into())};
+                    let p=&frame["params"];
+                    if p["sessionId"]!=f.sessions[n] {continue}
+                    f.journal.try_msp(f.spaces[n].track_id.clone(),f.sessions[n].clone(),Stamp::now(),frame.clone(),None,None)?.await??;
+                    if matches!(frame["method"].as_str(),Some("approval/request"|"approval/requested")) {
+                        let key=(n,p["approvalId"].to_string(),p["currentRequirementId"].to_string());
+                        if decided.insert(key) {
+                            let allowed=p["subject"]["kind"]=="shell" && p["subject"]["workspaceRoot"]==f.path(n).to_string_lossy().as_ref() && p["subject"]["command"]==commands[n];
+                            let choice=p["availableChoices"].as_array().unwrap().iter().find(|c|c["scope"]=="once" && c["decision"]==if allowed {"approved"}else{"abort"}).unwrap();
+                            hosts[n].connection.client.request("approval/decide",json!({"commandId":Uuid::now_v7(),"sessionId":f.sessions[n],"approvalId":p["approvalId"],"requirementId":p["currentRequirementId"],"choiceId":choice["choiceId"]})).await?;
+                        }
+                    }
+                    if frame["method"]=="turn/completed" {ended[n]=true;}
+                }
+                if !started[0] && fs::read_to_string(f.path(1).join("shared.txt"))?=="B" {
+                    let a=start(0).await?;
+                    hosts[0].connection.client.start(a,intercat_daemon::msp::StartGuard::Stopped(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))).await?;started[0]=true;
+                }
+                f.process().await?;
+                if started[0] && !ended[1] {
+                    let count:i64=f.db()?.query_row("SELECT count(*) FROM clip_file_warnings WHERE peer_track=?1",[&f.spaces[1].track_id],|r|r.get(0))?;
+                    active_warning |= count>0;
+                }
+            }
+            Ok::<_,Box<dyn std::error::Error+Send+Sync>>(())
+        }).await??;
+        f.process().await?;
+        assert!(active_warning,"No warning was observed while B was running.");
+        assert_eq!(f.count("SELECT count(*) FROM step_source_clips")?,2);
+        let rows=f.db()?.prepare("SELECT p.path,b.clip FROM step_source_paths p JOIN step_source_clips b ON b.source=p.source ORDER BY p.path")?
+            .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(rows.iter().filter(|(path,_)|path=="shared.txt").count(),2);
+        for (_,clip) in rows.iter().filter(|(path,_)|path=="shared.txt") {let warnings=f.warnings(clip).await?;assert_eq!(warnings.len(),1);assert_eq!(warnings[0]["kind"],"same-file");}
+        fs::write(output.join("result.json"),serde_json::to_vec_pretty(&json!({"schema":intercat_daemon::journal::SCHEMA_VERSION,"paidTurns":2,"sources":2,"activePeerWarning":active_warning,"paths":rows.iter().map(|(p,_)|p).collect::<Vec<_>>()}))?)?;
+        Ok::<_,Box<dyn std::error::Error+Send+Sync>>(())
+    }.await;
+    while let Some(host) = hosts.pop() {
+        host.shutdown().await?;
+    }
+    result
 }

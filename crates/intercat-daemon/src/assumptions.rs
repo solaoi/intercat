@@ -22,7 +22,7 @@ pub struct Assumption {
     pub clip_id: String,
     pub question_id: Option<String>,
     pub question: String,
-    pub options: [String; 2],
+    pub options: Vec<String>,
     pub text: String,
     pub evidence: String,
     pub revision: i64,

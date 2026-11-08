@@ -1,4 +1,4 @@
-import type { Assumption, Project } from '../bridge';
+import type { Assumption, Folder } from '../bridge';
 
 export interface Change { path: string; before: { object: string; mode: number } | null; after: { object: string; mode: number } | null }
 export interface Commit { track: string; sha: string; parent: string; tree: string; message: string; author: string; changes: Change[] }
@@ -13,10 +13,11 @@ export interface Candidate {
 export type CommitAssumption = Assumption & { included: boolean };
 export interface CommitOrderReview { overlaps: { path: string; tracks: string[] }[]; order: string[]; confirmed: boolean }
 export interface IntegrationJob {
+  exclusions: { track: string; dependents: string[]; omitted: boolean }[];
   orderReview?: CommitOrderReview | null;
   assumptions: CommitAssumption[]; assumptionsChanged: boolean; assumptionsPending: number; assumptionsFailed: number;
   id: string; revision: number; status: 'preparing' | 'ordering' | 'open' | 'merge-conflict' | 'failed' | 'discarded' | 'building' | 'staging' | 'checked' | 'committing' | 'commit-blocked' | 'done';
-  sessionName: string; slug: string; project: Project; error: string | null; candidate: Candidate | null;
+  sessionName: string; slug: string; project: Folder; error: string | null; candidate: Candidate | null;
   tracks: { id: string; label: string; title: string; included: boolean; checkpointCount: number; lastClip: number | null; checkpoint: { sha: string } | null }[];
   plan: { targetRef: string; tree: string | null; rows: { track: string; state: string; changes: Change[]; conflicts: { path: string; withTracks: string[] }[] }[] } | null;
   messages: Record<string, string>; keptSecrets: string[]; finishedSinceOpen?: number;

@@ -163,7 +163,14 @@ impl Server {
         let preparation =
             crate::preparation::Preparation::start(&self.workspace_root, self.journal.clone())?;
         let preparation_status = preparation.status.clone();
-        let capacity = Arc::new(Semaphore::new(4));
+        let execution_limits = self.journal.execution_limits().await?;
+        let capacity = Arc::new(crate::scheduler::Capacity::new(
+            execution_limits.parallel_workers.into(),
+        ));
+        capacity.set_limit(
+            execution_limits.revision,
+            execution_limits.parallel_workers.into(),
+        );
         let paused = Arc::new(crate::dispatch_control::Gate::new(
             self.journal.snapshot().await?["dispatchPaused"]
                 .as_bool()
@@ -171,6 +178,7 @@ impl Server {
         ));
         let (shutdown_signal, mut requested_shutdown) = tokio::sync::watch::channel(false);
         let runtime = crate::runtime::Runtime::start(
+            crate::host_memory::Pool::new(),
             self.workspace_root
                 .parent()
                 .ok_or_else(|| io::Error::other("Workspace root needs a parent."))?
@@ -181,11 +189,29 @@ impl Server {
             capacity.clone(),
             paused.clone(),
         );
+        runtime.service.set_capacity(&execution_limits);
+        let planning = crate::planning::Service::start(
+            runtime.service.host_memory(),
+            self.journal.clone(),
+            self.workspace_root.parent().unwrap().to_path_buf(),
+            self.path.parent().unwrap().to_path_buf(),
+            runtime.service.assistant_pool(),
+            paused.clone(),
+        );
+        let reviewing = crate::reviewing::Service::start(
+            runtime.service.host_memory(),
+            self.journal.clone(),
+            self.workspace_root.parent().unwrap().to_path_buf(),
+            self.path.parent().unwrap().to_path_buf(),
+            runtime.service.assistant_pool(),
+            paused.clone(),
+        );
         let integration = crate::integration::Service::new(
             self.journal.clone(),
             self.workspace_root.parent().unwrap().join("integration"),
         );
         let repairs = crate::repair_service::Runtime::start(
+            runtime.service.host_memory(),
             self.journal.clone(),
             self.workspace_root.parent().unwrap().join("integration"),
             self.workspace_root.parent().unwrap().to_path_buf(),
@@ -250,7 +276,9 @@ impl Server {
             runtime.shutdown(),
             repairs.shutdown(),
             quiet_proposals.stop(),
-            clip_files.stop()
+            clip_files.stop(),
+            planning.shutdown(),
+            reviewing.shutdown()
         );
         processor.shutdown().await?;
         report_analysis.shutdown().await;
@@ -458,6 +486,80 @@ async fn dispatch(
         ));
     }
     match request.method.as_str() {
+        "plans-start.get" => journal
+            .plans_start()
+            .await
+            .and_then(|value| Ok(serde_json::to_value(value)?))
+            .map_err(|error| (-32005, error.to_string())),
+        "plans-start.change" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .change_plans_start(params)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "plan.observe" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .observe_plans(params)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "plan.reply" => {
+            let reply = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .reply_to_plan(reply)
+                .await
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "review.stop" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .stop_review(params)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "review.retry" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .retry_review(params)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "review.fix" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .review_fix_command(params)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "plan.command" => {
+            let command = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .plan_command(command)
+                .await
+                .and_then(|plan| Ok(serde_json::to_value(plan)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "execution-limits.get" => journal
+            .execution_limits()
+            .await
+            .and_then(|value| Ok(serde_json::to_value(value)?))
+            .map_err(|error| (-32005, error.to_string())),
+        "execution-limits.change" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            let setting = journal
+                .change_execution_limits(params)
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            runtime.set_capacity(&setting);
+            Ok(serde_json::to_value(setting).unwrap())
+        }
         "check-environment.get" => {
             let selection = journal
                 .check_environment()
@@ -473,14 +575,17 @@ async fn dispatch(
             let candidates = tokio::task::spawn_blocking(move || {
                 project
                     .map(|project| {
-                        [".env.test", ".env.ci"]
-                            .into_iter()
-                            .filter_map(|name| {
-                                crate::check_environment::validate_file(
-                                    &project.root.join(name),
-                                    &project,
-                                )
-                                .ok()
+                        project
+                            .folders
+                            .iter()
+                            .flat_map(|folder| {
+                                [".env.test", ".env.ci"]
+                                    .into_iter()
+                                    .map(move |name| folder.root.join(name))
+                            })
+                            .filter_map(|path| {
+                                crate::check_environment::validate_project_file(&path, &project)
+                                    .ok()
                             })
                             .collect::<Vec<_>>()
                     })
@@ -1069,6 +1174,54 @@ async fn dispatch(
                 .map_err(|error| (-32005, error.to_string()))?;
             Ok(Value::Null)
         }
+        "inheritance.issue" => {
+            let command: crate::inheritance_issue::Command =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if command.op_id.get_version_num() != 7 || command.issue_id.get_version_num() != 7 {
+                return Err(invalid());
+            }
+            if command.action == crate::inheritance_issue::Action::Keep
+                || journal
+                    .operation(command.op_id)
+                    .await
+                    .map_err(|error| (-32005, error.to_string()))?
+                    .is_some()
+            {
+                journal
+                    .inheritance_issue_command(command, false)
+                    .await
+                    .map_err(|error| (-32005, error.to_string()))?;
+            } else {
+                let issue = journal
+                    .inheritance_issue(command.issue_id)
+                    .await
+                    .map_err(|error| (-32005, error.to_string()))?;
+                runtime
+                    .stop_inheritance(&issue.track_id, command)
+                    .await
+                    .map_err(|error| (-32005, error.to_string()))?;
+            }
+            Ok(Value::Null)
+        }
+        "inheritance.finish" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields, rename_all = "camelCase")]
+            struct Params {
+                op_id: uuid::Uuid,
+                track_id: String,
+                application_id: uuid::Uuid,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.op_id.get_version_num() != 7 {
+                return Err(invalid());
+            }
+            runtime
+                .finish_inheritance(params.op_id, &params.track_id, params.application_id)
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            Ok(Value::Null)
+        }
         "worker.start" | "worker.hold" => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -1178,16 +1331,28 @@ async fn dispatch(
                 .map_err(|_| (-32002, "Retry could not be saved.".into()))?;
             Ok(Value::Null)
         }
+        "folder.assign" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .assign_folder(params)
+                .await
+                .map_err(|error| (-32002, error.to_string()))?;
+            Ok(Value::Null)
+        }
         "project.configure" => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields, rename_all = "camelCase")]
             struct Params {
                 op_id: uuid::Uuid,
-                path: PathBuf,
+                name: String,
+                paths: Vec<PathBuf>,
             }
             let params: Params =
                 serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
-            if params.op_id.get_version_num() != 7 || !params.path.is_absolute() {
+            if params.op_id.get_version_num() != 7
+                || params.paths.len() > 8
+                || params.paths.iter().any(|path| !path.is_absolute())
+            {
                 return Err(invalid());
             }
             if let Some(previous) = journal
@@ -1195,19 +1360,26 @@ async fn dispatch(
                 .await
                 .map_err(|_| (-32002, "Operation could not be read.".into()))?
             {
+                let project: crate::project::Project =
+                    serde_json::from_value(previous["payload"].clone()).map_err(|_| invalid())?;
                 if previous["kind"] != "project.configure"
-                    || previous["payload"]["path"] != serde_json::to_value(&params.path).unwrap()
+                    || project.id != params.op_id
+                    || project.name != params.name
+                    || project
+                        .folders
+                        .iter()
+                        .map(|folder| &folder.path)
+                        .collect::<Vec<_>>()
+                        != params.paths.iter().collect::<Vec<_>>()
                 {
                     return Err(invalid());
                 }
-                let project =
-                    serde_json::from_value(previous["payload"].clone()).map_err(|_| invalid())?;
                 return journal
                     .configure_project(params.op_id, project)
                     .await
                     .map_err(|error| (-32002, error.to_string()));
             }
-            let project = crate::project::inspect(params.path)
+            let project = crate::project::inspect(params.op_id, params.name, params.paths)
                 .await
                 .map_err(|error| (-32004, error.to_string()))?;
             journal
@@ -1418,6 +1590,11 @@ async fn dispatch(
                 .await
                 .map_err(|_| (-32603, "state unavailable".to_owned()))?;
             snapshot["dispatchPaused"] = json!(paused.paused());
+            snapshot["scheduling"] = serde_json::to_value(runtime.capacity()).unwrap();
+            snapshot["hostMemory"] =
+                serde_json::to_value(runtime.host_memory().snapshot()).unwrap();
+            snapshot["plannerScheduling"] =
+                serde_json::to_value(runtime.assistant_capacity()).unwrap();
             if paused.paused() {
                 match runtime.process_audit().await {
                     Ok(audit) => {
@@ -1690,6 +1867,16 @@ async fn dispatch(
                 .await
                 .map_err(|error| (-32002, error.to_string()))
         }
+        "plan.edit" => {
+            let params: crate::plan_rewrite::Request =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            let result = journal
+                .edit_plan(params)
+                .await
+                .map_err(|error| (-32002, error.to_string()))?;
+            wake.notify_one();
+            serde_json::to_value(result).map_err(|_| invalid())
+        }
         "utterance.edit" => {
             let params: crate::edit_hold::Request =
                 serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
@@ -1713,6 +1900,13 @@ async fn dispatch(
                 #[serde(rename = "attachmentIds")]
                 attachment_ids: Vec<uuid::Uuid>,
                 sources: Option<Vec<crate::request_sources::Source>>,
+                #[serde(
+                    rename = "executeAllowed",
+                    default = "crate::request_sources::execution_allowed"
+                )]
+                execute_allowed: bool,
+                #[serde(rename = "planItem")]
+                plan_item: Option<crate::request_sources::PlanItemContext>,
             }
             let params: Params =
                 serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
@@ -1731,6 +1925,8 @@ async fn dispatch(
                     selected_track_id: params.selected,
                     attachment_ids: params.attachment_ids,
                     sources: params.sources,
+                    execute_allowed: params.execute_allowed,
+                    plan_item: params.plan_item,
                 })
                 .await
                 .map_err(|_| (-32002, "operation could not be accepted".to_owned()))?;

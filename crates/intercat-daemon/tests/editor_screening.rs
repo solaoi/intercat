@@ -547,6 +547,8 @@ async fn pasted_title_retains_its_full_source_for_fingerprints_registered_later(
     let saved = journal
         .stage_document(Submission {
             op_id: first,
+            execute_allowed: true,
+            plan_item: None,
             text: String::new(),
             target: Target::New,
             selected_track_id: None,

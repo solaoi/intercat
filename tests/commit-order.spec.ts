@@ -16,11 +16,11 @@ for (const zoom of [1, 2]) {
         const tracks = ['A', 'B'].map((label, index) => ({ id: `01a1a200-0000-7000-8000-00000000000${index + 2}`, label,
           title: `${label}：キャッシュと同じファイルの変更を確認するダミー作業`, included: true, checkpointCount: 1, lastClip: 1, checkpoint: { sha: 'a'.repeat(40) } }));
         const job: IntegrationJob = { id: '01a1a200-0000-7000-8000-000000000001', revision: 1, status: 'ordering',
-          sessionName: 'Order fixture', slug: 'order-fixture', project: { name: 'Dummy project', root: '/fixture', path: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'main' },
-          error: null, tracks, candidate: null, messages: {}, keptSecrets: [], contributions: {}, assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0,
+          sessionName: 'Order fixture', slug: 'order-fixture', project: { id: 'dummy-folder', name: 'Dummy project', root: '/fixture', path: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'main' },
+          error: null, tracks, candidate: null, messages: {}, keptSecrets: [], contributions: {}, exclusions: [], assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0,
           plan: { targetRef: 'refs/heads/intercat/order-fixture', tree: null, rows: tracks.map(track => ({ track: track.id, state: 'waiting', changes: [], conflicts: [] })) },
           orderReview: { order: tracks.map(track => track.id), confirmed: false, overlaps: [{ path: 'src/キャッシュ/shared.ts', tracks: tracks.map(track => track.id) }] } };
-        const state: DaemonStatus & { sequence: number } = { connected: true, sequence: 1, integration: job, project: job.project,
+        const state: DaemonStatus & { sequence: number } = { connected: true, sequence: 1, integration: job, project: { id: 'dummy-project', name: job.project.name, folders: [job.project] }, trackFolders: Object.fromEntries(tracks.map(track => [track.id,job.project.id])),
           tracks: tracks.map(track => ({ ...track, status: 'done' })), workspaces: tracks.map(track => ({ trackId: track.id, state: 'ready', path: '/fixture', reference: '', base: '', attachmentRoots: [], error: null })), workers: [], utterances: [] };
         const memory = { state, calls: [] as IntegrationRequest[], applied: new Set<string>(), orders: 0, lose: zoom === 2 };
         Object.assign(globalThis, { commitOrderFixture: memory });

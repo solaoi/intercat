@@ -218,7 +218,15 @@ async fn repair_start_rejects_stale_secret_hosts_and_requeues_without_losing_its
     };
     let (f, journal) = repair_run_fixture(false).await?;
     journal
-        .configure_project(Uuid::now_v7(), project::inspect(f.source.clone()).await?)
+        .configure_project(
+            Uuid::now_v7(),
+            project::inspect(
+                uuid::Uuid::now_v7(),
+                "Dummy project".into(),
+                vec![f.source.clone()],
+            )
+            .await?,
+        )
         .await?;
     let store = Store::default();
     project_secret_fixture(&journal, &store, 1, Some("dummy-repair-secret")).await?;
@@ -450,11 +458,12 @@ async fn repair_followup_preserves_its_session_and_replays_once_without_storing_
     let (f, journal) = repair_run_fixture(false).await?;
     let held = held_repair_session(&f, &journal).await?;
     let runtime = repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         journal.clone(),
         f.root.path().join("integration"),
         f.root.path().join("data"),
         f.root.path().join("rpc"),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(0)),
         integration::Service::new(journal.clone(), f.root.path().join("integration")),
         Default::default(),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -635,11 +644,12 @@ async fn repair_scheduler_requires_configuration_and_records_preparation_failure
     use intercat_daemon::{repair_run::Phase, repair_service, runtime::Config};
     let (f, journal) = repair_run_fixture(false).await?;
     let runtime = repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         journal.clone(),
         scheduler_candidate(&f)?,
         f.root.path().join("data"),
         f.root.path().join("rpc"),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(4)),
         integration::Service::new(journal.clone(), f.root.path().join("integration")),
         Default::default(),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -714,11 +724,12 @@ async fn repair_preparation_rebuilds_incomplete_initialization_after_stop() -> R
     )?;
     invalid_worker(&f, &journal).await?;
     let runtime = repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         journal.clone(),
         root,
         f.root.path().join("data"),
         f.root.path().join("rpc"),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(1)),
         integration::Service::new(journal.clone(), f.root.path().join("integration")),
         Default::default(),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -795,11 +806,12 @@ async fn repair_preparation_keeps_a_ready_workspaces_edits_on_resume() -> Result
     .await?;
     invalid_worker(&f, &journal).await?;
     let runtime = repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         journal.clone(),
         root,
         f.root.path().join("data"),
         f.root.path().join("rpc"),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(1)),
         integration::Service::new(journal.clone(), f.root.path().join("integration")),
         Default::default(),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -842,11 +854,12 @@ async fn repair_preparation_does_not_remove_a_foreign_symlink_target() -> Result
     std::os::unix::fs::symlink(&foreign, &working)?;
     invalid_worker(&f, &journal).await?;
     let runtime = repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         journal.clone(),
         root,
         f.root.path().join("data"),
         f.root.path().join("rpc"),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(1)),
         integration::Service::new(journal.clone(), f.root.path().join("integration")),
         Default::default(),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -899,8 +912,9 @@ async fn real_repair_scheduler_shares_capacity_stops_follows_up_and_admits_check
     let rpc = f.root.path().join("rpc");
     fs::create_dir(&rpc)?;
     fs::set_permissions(&rpc, fs::Permissions::from_mode(0o700))?;
-    let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let capacity = std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(0));
     let runtime = repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         journal.clone(),
         root.clone(),
         f.root.path().join("data"),
@@ -987,7 +1001,7 @@ async fn real_repair_scheduler_shares_capacity_stops_follows_up_and_admits_check
             fs::read_to_string(&edit)? == "Preserve this held edit.\n",
             "Resume overwrote the held edit.",
         )?;
-        capacity.add_permits(1);
+        capacity.set_limit(1, 1);
         let done = tokio::time::timeout(std::time::Duration::from_secs(150), async {
             loop {
                 let current = journal.repair_input(run.id).await;
@@ -1877,6 +1891,7 @@ async fn repair_host_rejects_an_unverified_program_before_starting_it() -> Resul
             &mut run,
             &wrong,
             repair_host::Launch {
+                memory: intercat_daemon::host_memory::Pool::new(),
                 one_time: None,
                 project_secrets: Default::default(),
                 worker: &config,
@@ -1894,6 +1909,7 @@ async fn repair_host_rejects_an_unverified_program_before_starting_it() -> Resul
         &mut run,
         &workspace,
         repair_host::Launch {
+            memory: intercat_daemon::host_memory::Pool::new(),
             one_time: None,
             project_secrets: Default::default(),
             worker: &config,
@@ -1951,6 +1967,7 @@ async fn repair_host_does_not_launch_if_stop_was_saved_during_preparation() -> R
             &mut run,
             &workspace,
             repair_host::Launch {
+                memory: intercat_daemon::host_memory::Pool::new(),
                 one_time: None,
                 project_secrets: Default::default(),
                 worker: &config,
@@ -2009,6 +2026,7 @@ async fn real_repair_host_registers_its_session_and_closes_without_stopping_anot
         std::ffi::OsStr::new(&config.path),
         Some(&config.credentials),
         host::Boundary {
+            steps: None,
             profile: intercat_daemon::host::Profile::Worker,
             secrets: &[],
             rpc: &rpc,
@@ -2028,6 +2046,7 @@ async fn real_repair_host_registers_its_session_and_closes_without_stopping_anot
             &mut run,
             &workspace,
             repair_host::Launch {
+                memory: intercat_daemon::host_memory::Pool::new(),
                 one_time: None,
                 project_secrets: Default::default(),
                 worker: &config,
@@ -2040,6 +2059,7 @@ async fn real_repair_host_registers_its_session_and_closes_without_stopping_anot
             &mut competing,
             &workspace,
             repair_host::Launch {
+                memory: intercat_daemon::host_memory::Pool::new(),
                 one_time: None,
                 project_secrets: Default::default(),
                 worker: &config,
@@ -2112,6 +2132,7 @@ async fn real_repair_host_registers_its_session_and_closes_without_stopping_anot
         &mut run,
         &workspace,
         repair_host::Launch {
+            memory: intercat_daemon::host_memory::Pool::new(),
             one_time: None,
             project_secrets: Default::default(),
             worker: &config,
@@ -2174,7 +2195,15 @@ async fn real_repair_waits_for_project_secrets_and_apply_stops_only_its_host() -
     let (f, journal) = repair_run_fixture(false).await?;
     let mut evidence = RepairEvidence::new(&f, "project-apply")?;
     journal
-        .configure_project(Uuid::now_v7(), project::inspect(f.source.clone()).await?)
+        .configure_project(
+            Uuid::now_v7(),
+            project::inspect(
+                uuid::Uuid::now_v7(),
+                "Dummy project".into(),
+                vec![f.source.clone()],
+            )
+            .await?,
+        )
         .await?;
     let binary = host::prepare_binary(
         &PathBuf::from(std::env::var("INTERCAT_TEST_MUSE_BINARY")?),
@@ -2198,6 +2227,7 @@ async fn real_repair_waits_for_project_secrets_and_apply_stops_only_its_host() -
         std::ffi::OsStr::new(&config.path),
         Some(&config.credentials),
         host::Boundary {
+            steps: None,
             profile: intercat_daemon::host::Profile::Worker,
             secrets: &[],
             rpc: &rpc,
@@ -2211,11 +2241,12 @@ async fn real_repair_waits_for_project_secrets_and_apply_stops_only_its_host() -
     let root = scheduler_candidate(&f)?;
     let integration = intercat_daemon::integration::Service::new(journal.clone(), root.clone());
     let runtime = intercat_daemon::repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         journal.clone(),
         root,
         f.root.path().join("data"),
         rpc,
-        std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(0)),
         integration.clone(),
         secrets.clone(),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -2273,7 +2304,15 @@ async fn real_repair_uses_project_secrets_and_resumes_without_a_removed_value() 
     let (f, journal) = repair_run_fixture(false).await?;
     let mut evidence = RepairEvidence::new(&f, "project-secrets")?;
     journal
-        .configure_project(Uuid::now_v7(), project::inspect(f.source.clone()).await?)
+        .configure_project(
+            Uuid::now_v7(),
+            project::inspect(
+                uuid::Uuid::now_v7(),
+                "Dummy project".into(),
+                vec![f.source.clone()],
+            )
+            .await?,
+        )
         .await?;
     let secrets = intercat_daemon::project_secrets::Store::default();
     let value = format!("dummy-repair-project-{}", Uuid::now_v7());
@@ -2338,6 +2377,7 @@ async fn real_repair_uses_project_secrets_and_resumes_without_a_removed_value() 
             &mut run,
             &workspace,
             repair_host::Launch {
+                memory: intercat_daemon::host_memory::Pool::new(),
                 one_time: None,
                 worker: &config,
                 directory: &f.root.path().join(format!("host-{pass}")),
@@ -2374,7 +2414,7 @@ async fn real_repair_uses_project_secrets_and_resumes_without_a_removed_value() 
                     &working,
                     repair_execution::Task {
                         instruction,
-                        capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+                        capacity: std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(1)),
                         shutdown,
                         project_secrets: store,
                     },
@@ -2528,6 +2568,7 @@ async fn live_repair(
         &mut run,
         &workspace,
         repair_host::Launch {
+            memory: intercat_daemon::host_memory::Pool::new(),
             one_time: None,
             project_secrets: Default::default(),
             worker: &config,
@@ -2562,6 +2603,7 @@ async fn real_repair_stop_interrupts_its_shell_and_preserves_another_host() -> R
         std::ffi::OsStr::new(&live.config.path),
         Some(&live.config.credentials),
         host::Boundary {
+            steps: None,
             profile: intercat_daemon::host::Profile::Worker,
             secrets: &[],
             rpc: &f.root.path().join("rpc"),
@@ -2581,7 +2623,7 @@ async fn real_repair_stop_interrupts_its_shell_and_preserves_another_host() -> R
     let workspace = live.workspace.clone();
     let writer = journal.clone();
     let mut running = tokio::spawn(async move {
-        runner.execute(live.hosted,writer,&workspace,repair_execution::Task{project_secrets: Default::default(),instruction:"This is a disposable test repository. Work only in this workspace. Run exactly this bash command:\n/usr/bin/touch stop-marker; /bin/sleep 60\nWait for it to finish before your final answer. Do not edit other files, commit, or use network services.".into(),capacity:std::sync::Arc::new(tokio::sync::Semaphore::new(1)),shutdown}).await
+        runner.execute(live.hosted,writer,&workspace,repair_execution::Task{project_secrets: Default::default(),instruction:"This is a disposable test repository. Work only in this workspace. Run exactly this bash command:\n/usr/bin/touch stop-marker; /bin/sleep 60\nWait for it to finish before your final answer. Do not edit other files, commit, or use network services.".into(),capacity:std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(1)),shutdown}).await
     });
     let observed = tokio::time::timeout(std::time::Duration::from_secs(110), async {
         loop {
@@ -2663,7 +2705,7 @@ async fn real_repair_push_waits_for_its_own_approval_and_denial_preserves_remote
                 repair_execution::Task {
                     project_secrets: Default::default(),
                     instruction,
-                    capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+                    capacity: std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(1)),
                     shutdown,
                 },
             )
@@ -2757,6 +2799,7 @@ async fn real_repair_turn_fixes_candidate_and_rechecks_without_changing_original
         &mut run,
         &workspace,
         repair_host::Launch {
+            memory: intercat_daemon::host_memory::Pool::new(),
             one_time: None,
             project_secrets: Default::default(),
             worker: &config,
@@ -2770,7 +2813,7 @@ async fn real_repair_turn_fixes_candidate_and_rechecks_without_changing_original
     let writer = journal.clone();
     let working = workspace.clone();
     let mut running = tokio::spawn(async move {
-        runner.execute(hosted,writer,&working,repair_execution::Task{project_secrets: Default::default(),instruction:"This is a disposable test repository. First send a Japanese progress update of about 100 characters describing the planned edit and verification. Work only in this workspace. Replace file.txt with exactly the single line fixed followed by a newline. Use the file editing tools. Keep other.txt unchanged. Do not make Git commits, start background processes, or access network services. Finish with an English report describing what changed, why, how it was verified, and any remaining work.".into(),capacity:std::sync::Arc::new(tokio::sync::Semaphore::new(1)),shutdown}).await
+        runner.execute(hosted,writer,&working,repair_execution::Task{project_secrets: Default::default(),instruction:"This is a disposable test repository. First send a Japanese progress update of about 100 characters describing the planned edit and verification. Work only in this workspace. Replace file.txt with exactly the single line fixed followed by a newline. Use the file editing tools. Keep other.txt unchanged. Do not make Git commits, start background processes, or access network services. Finish with an English report describing what changed, why, how it was verified, and any remaining work.".into(),capacity:std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(1)),shutdown}).await
     });
     let db = rusqlite::Connection::open(f.root.path().join("events.sqlite"))?;
     let mut previews = Vec::new();
@@ -3448,7 +3491,14 @@ impl Fixture {
         git(&source, &["commit", "-qm", "base"], None);
         let base = git(&source, &["rev-parse", "HEAD"], None);
         let index = fs::read(source.join(".git/index"))?;
-        let project = project::inspect(source.clone()).await?;
+        let project = project::inspect(
+            uuid::Uuid::now_v7(),
+            "Dummy project".into(),
+            vec![source.clone()],
+        )
+        .await?
+        .only_folder()?
+        .clone();
         let session = Uuid::now_v7();
         let slug = "candidate-fixture";
         let repo = Repository::open(&source)?;
@@ -3456,6 +3506,8 @@ impl Fixture {
         repo.sync_objects(&[marker])?;
         repo.compare_and_swap(&format!("refs/intercat/{slug}/session"), None, marker)?;
         let job = Job {
+            lineage: Default::default(),
+            omitted_conflicts: Default::default(),
             order_review: None,
             assumptions: Vec::new(),
             assumptions_changed: false,
@@ -3521,7 +3573,7 @@ impl Fixture {
             id: Uuid::now_v7().to_string(),
             label: label.into(),
             title: format!("Work on {label}"),
-            initial_base: self.base.clone(),
+            basis: intercat_daemon::lineage::Basis::root(self.base.clone()),
             checkpoint: Some(intercat_daemon::checkpoint::Checkpoint {
                 turn_id: turn,
                 sha: sha.to_string(),
@@ -3534,6 +3586,18 @@ impl Fixture {
             included: true,
             integration_count: 0,
         });
+        let track = self.job.tracks.last().unwrap();
+        self.job
+            .lineage
+            .points
+            .push(intercat_daemon::lineage::Point {
+                track: track.id.clone(),
+                number: 1,
+                sha: sha.to_string(),
+                base_at: self.base.clone(),
+                base_inherits_at: Default::default(),
+                inherits: Default::default(),
+            });
         Ok(())
     }
     fn settings(&mut self, command: Option<&str>) -> Result<Settings> {
@@ -4331,8 +4395,9 @@ async fn real_repair_secret(msp_question: bool) -> Result<()> {
     let rpc = f.root.path().join("rpc");
     fs::create_dir(&rpc)?;
     let integration = integration::Service::new(journal.clone(), root.clone());
-    let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let capacity = std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(0));
     let runtime = intercat_daemon::repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         journal.clone(),
         root.clone(),
         f.root.path().join("data"),
@@ -4353,7 +4418,7 @@ async fn real_repair_secret(msp_question: bool) -> Result<()> {
         let digest=Sha256::digest(value.as_bytes()).iter().map(|b|format!("{b:02x}")).collect::<String>();
         fs::write(work.join("verify_token.py"),format!("import os,hashlib\nfrom pathlib import Path\nv=os.environ.get('DEMO_TOKEN','')\nassert hashlib.sha256(v.encode()).hexdigest()=='{digest}'\nprint(v)\nPath('verified.txt').write_text('verified\\n')\n"))?;
         fs::write(work.join("verify_absent.py"),"import os\nfrom pathlib import Path\nassert 'DEMO_TOKEN' not in os.environ\nPath('absent.txt').write_text('absent\\n')\nprint('absent')\n")?;
-        capacity.add_permits(1);
+        capacity.set_limit(1, 1);
         let first=wait_repair(&journal,run.id,|run|if msp_question { !run.prompts.is_empty() || matches!(run.phase,Phase::Failed|Phase::Held) } else { matches!(run.phase,Phase::Held|Phase::Failed) }).await?;
         assert_eq!(first.phase,if msp_question {Phase::Running} else {Phase::Held});
         if !msp_question {assert!(first.output.as_ref().unwrap().contains("Waiting for you:"));}
@@ -4502,11 +4567,12 @@ async fn repair_secret_host_failure_keeps_checkpoint_and_requires_reentry() -> R
     let request = repair_secret_request(&journal, &held, "dummy-repair-host-failure").await?;
     let service = integration::Service::new(journal.clone(), root.clone());
     let runtime = intercat_daemon::repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         journal.clone(),
         root,
         f.root.path().join("data"),
         f.root.path().join("rpc"),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(1)),
         service.clone(),
         Default::default(),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -4834,7 +4900,9 @@ async fn exact_check_value_blocks_the_first_commit_even_when_a_later_track_remov
         let value = "ordinary-value-known-only-to-check";
         f.track("A", &[("fixture.txt", Some(value), false)])?;
         f.track("B", &[("fixture.txt", None, false)])?;
-        f.job.tracks[1].initial_base = f.job.tracks[0].checkpoint.as_ref().unwrap().sha.clone();
+        f.job.tracks[1].basis = intercat_daemon::lineage::Basis::root(
+            f.job.tracks[0].checkpoint.as_ref().unwrap().sha.clone(),
+        );
         let file = f.source.join(".env.ci");
         fs::write(&file, format!("CHECK_VALUE='{value}'\n"))?;
         let mut settings = f.settings(command)?;

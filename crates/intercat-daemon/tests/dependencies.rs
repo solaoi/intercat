@@ -833,6 +833,8 @@ async fn candidate_fixture(
     repo.compare_and_swap(&reference, None, checkpoint)?;
     repo.sync_objects(&[marker, checkpoint])?;
     let mut job = Job {
+        lineage: Default::default(),
+        omitted_conflicts: Default::default(),
         order_review: None,
         assumptions: Vec::new(),
         assumptions_changed: false,
@@ -845,12 +847,19 @@ async fn candidate_fixture(
         session_id: session.to_string(),
         slug: slug.into(),
         session_name: "Dependencies".into(),
-        project: intercat_daemon::project::inspect(f.source.root.clone()).await?,
+        project: intercat_daemon::project::inspect(
+            uuid::Uuid::now_v7(),
+            "Dummy project".into(),
+            vec![f.source.root.clone()],
+        )
+        .await?
+        .only_folder()?
+        .clone(),
         tracks: vec![Track {
             id: uuid::Uuid::now_v7().to_string(),
             label: "A".into(),
             title: "Change input".into(),
-            initial_base: f.source.head.to_string(),
+            basis: intercat_daemon::lineage::Basis::root(f.source.head.to_string()),
             checkpoint: Some(Checkpoint {
                 turn_id: uuid::Uuid::now_v7(),
                 sha: checkpoint.to_string(),
@@ -871,6 +880,14 @@ async fn candidate_fixture(
         kept_secrets: Default::default(),
         contributions: Default::default(),
     };
+    job.lineage.points.push(intercat_daemon::lineage::Point {
+        track: job.tracks[0].id.clone(),
+        number: 1,
+        sha: checkpoint.to_string(),
+        base_at: f.source.head.to_string(),
+        base_inherits_at: Default::default(),
+        inherits: Default::default(),
+    });
     job.plan = Some(integration::freeze(&job)?);
     job.plan = Some(integration::plan(&job)?);
     let settings = Settings {

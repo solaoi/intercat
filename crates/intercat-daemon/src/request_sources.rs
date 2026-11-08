@@ -20,7 +20,7 @@ pub struct Source {
     pub after: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Submission {
     pub op_id: Uuid,
@@ -29,6 +29,19 @@ pub struct Submission {
     pub selected_track_id: Option<String>,
     pub attachment_ids: Vec<Uuid>,
     pub sources: Option<Vec<Source>>,
+    #[serde(default = "execution_allowed")]
+    pub execute_allowed: bool,
+    pub plan_item: Option<PlanItemContext>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanItemContext {
+    pub plan_id: Uuid,
+    pub item_id: Uuid,
+    pub revision: u64,
+}
+pub(crate) fn execution_allowed() -> bool {
+    true
 }
 
 #[derive(Clone, Deserialize, Serialize)]

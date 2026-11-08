@@ -156,7 +156,7 @@ test('local editor classifies a queued request through the UI and exits with its
     await expect(page.getByRole('row')).toHaveCount(1);
     await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).workspaces?.[0]?.state).toBe('ready');
     const prepared = (await page.evaluate(() => window.intercat.getStatus())).workspaces![0];
-    expect(prepared.base).toBe(classified.project!.base);
+    expect(prepared.base).toBe(classified.project!.folders[0].base);
     expect(await readFile(path.join(prepared.path, 'arithmetic.js'), 'utf8')).toBe('export const add = (a, b) => a + b;\n');
     if (process.env.INTERCAT_TEST_MUSE_BINARY) {
       await page.getByRole('button', { name: 'Connect workers', exact: true }).click();

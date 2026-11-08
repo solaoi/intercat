@@ -4,6 +4,7 @@ import { DeletionRecovery } from './DeletionRecovery';
 import { Effects } from '../desk/Effects';
 import { MarkdownMessage } from '../markdown/MarkdownMessage';
 import { WorkerModel } from '../desk/WorkerModel';
+import { ReviewNotes } from './ReviewNotes';
 
 interface Patch { files: { path: string; hunks: { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] }[] }[] }
 function patchText(output: OutputResult): string | null {
@@ -34,7 +35,7 @@ function Item({ item }: { item: StepItem }) {
     {item.outputRef && <Artifact name="Full output" output={item.outputs.outputRef} />}
   </article>;
 }
-export default function StepInspector({ clipId, sequence }: { clipId: string; sequence?: number }) {
+export default function StepInspector({ clipId, sequence, openClip }: { clipId: string; sequence?: number; openClip?: (id: string) => void }) {
   const [detail, setDetail] = useState<StepDetail | null>(null);
   const [error, setError] = useState('');
   useEffect(() => { setDetail(null); setError(''); }, [clipId]);
@@ -43,10 +44,12 @@ export default function StepInspector({ clipId, sequence }: { clipId: string; se
     void window.intercat.getClipDetail(clipId).then(value => { if (!disposed) { setDetail(value); setError(''); } }).catch(() => { if (!disposed) setError('This step could not be loaded.'); });
     return () => { disposed = true; };
   }, [clipId, sequence]);
-  return <div className="step-detail" aria-label="Step details">{error && <p role="alert">{error}</p>}{!detail && !error && <p>Loading step…</p>}{detail && <>
-    <div className="step-metadata"><span>{detail.clip.category === 'snapshot' ? 'Recovered history · timing unavailable' : <>{detail.clip.running ? 'In progress' : 'Finished'} · {((detail.clip.end - detail.clip.start) / 1000).toFixed(1)} s{detail.clip.approximate ? ' · approximate duration' : ''}</>}</span><span>{detail.clip.turnId ? `Turn ${detail.clip.turnId}` : 'Session history'}</span><WorkerModel model={detail.model} /></div>
+  return <section className="step-detail" aria-label="Step details">{error && <p role="alert">{error}</p>}{!detail && !error && <p>Loading step…</p>}{detail && <>
+    <div className="step-metadata"><span>{detail.clip.category === 'snapshot' ? 'Recovered history · timing unavailable' : <>{detail.clip.running ? 'In progress' : 'Finished'} · {((detail.clip.end - detail.clip.start) / 1000).toFixed(1)} s{detail.clip.approximate ? ' · approximate duration' : ''}</>}</span><span>{detail.clip.category === 'review' ? 'Saved checkpoint review' : detail.clip.turnId ? `Turn ${detail.clip.turnId}` : 'Session history'}</span>{detail.clip.category !== 'review' && <WorkerModel model={detail.model} />}</div>
     {detail.clip.summary && <section aria-label="Step summary"><h3>{detail.clip.title}</h3><p>{detail.clip.summary}</p></section>}
     {!!detail.clip.warnings?.length && <section className="step-warnings" aria-label="Step warnings">{detail.clip.warnings.map(warning => <p key={`${warning.kind}:${warning.text}`}>{warning.text}</p>)}</section>}
+    {!!detail.reviewedClips?.length && <section aria-label="Reviewed steps"><h3>Reviewed steps</h3>{detail.reviewedClips.map(target=><button key={target.id} disabled={!openClip} onClick={()=>openClip?.(target.id)}>Open {target.label}</button>)}</section>}
+    <ReviewNotes reviews={detail.reviews} notes={detail.reviewNotes} refresh={() => { void window.intercat.getClipDetail(clipId).then(setDetail).catch(() => setError('This step could not be loaded.')); }} />
     {(detail.assumptions?.length ?? 0) > 0 && <section aria-label="Step assumptions"><h3>Assumptions</h3>
       {detail.assumptions!.map(assumption => <article key={assumption.id}>
         <strong>{assumption.text}</strong><p>{assumption.questionId && 'Worker asked · '}{assumption.question}</p>
@@ -56,6 +59,6 @@ export default function StepInspector({ clipId, sequence }: { clipId: string; se
     <Effects effects={detail.effects ?? []} />
     {detail.deletionSnapshots?.map(snapshot => <DeletionRecovery key={snapshot.id} snapshot={snapshot} />)}
     {detail.items.filter(item => item.patchRef).map(item => <Artifact key={item.itemId} name="Patch" output={item.outputs.patchRef} />)}
-    {detail.items.length ? detail.items.map(item => <Item item={item} key={item.itemId} />) : <p>Waiting for the next worker item.</p>}
-  </>}</div>;
+    {detail.items.length ? detail.items.map(item => <Item item={item} key={item.itemId} />) : detail.clip.category === 'review' ? null : <p>Waiting for the next worker item.</p>}
+  </>}</section>;
 }

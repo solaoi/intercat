@@ -153,8 +153,10 @@ fn eligible(db: &Connection, track: &str) -> Result<bool> {
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let worker: Value = serde_json::from_str(&record)?;
-    if !matches!(worker["phase"].as_str(), Some("ready" | "held" | "stopped"))
-        || !worker["activeTurn"].is_null()
+    if !matches!(
+        worker["phase"].as_str(),
+        Some("ready" | "held" | "stopped" | "sleeping")
+    ) || !worker["activeTurn"].is_null()
         || worker["checkpointPending"] == true
     {
         return Ok(false);

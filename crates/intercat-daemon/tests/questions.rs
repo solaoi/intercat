@@ -82,6 +82,7 @@ struct Harness {
     outgoing: DuplexStream,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<()>>,
+    capacity: Arc<intercat_daemon::scheduler::Capacity>,
 }
 
 #[tokio::test]
@@ -137,6 +138,221 @@ async fn a_recovered_answer_waits_for_host_resolution_and_cannot_be_sent_again()
 
 fn approval(id: &str, argv: &[&str]) -> Value {
     json!({"sessionId":"session","approvalId":id,"turnId":"turn","itemId":format!("item-{id}"),"rawArgs":"{}","subject":{"kind":"shell","command":argv.join(" "),"stages":[{"argv":argv,"argvComplete":true}]},"currentRequirementId":{"approvalId":id,"sourceIndex":0},"availableChoices":[{"scope":"once","decision":"approved","choiceId":"yes"},{"scope":"once","decision":"denied","choiceId":"no"}]})
+}
+
+#[tokio::test]
+async fn question_responses_reuse_the_held_slot_while_other_work_waits() -> Result<()> {
+    for method in [
+        "userInput/answer",
+        "userInput/clarify",
+        "userInput/interrupt",
+    ] {
+        let turn = Uuid::now_v7();
+        let mut h = Harness::build(
+            false,
+            Some(intercat_daemon::reconcile::State {
+                resume_turn: Some(turn),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        h.capacity.set_limit(1, 1);
+        let mut request = prompt();
+        request["turnId"] = json!(turn);
+        h.send(json!({"method":"userInput/request","params":request}))
+            .await?;
+        assert_eq!(h.read().await?["method"], "userInput/engaged");
+        let shown = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(value) = h.state().await?["prompts"]
+                    .as_array()
+                    .and_then(|values| values.first())
+                {
+                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(value.clone());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        let response = match method {
+            "userInput/answer" => serde_json::from_value(answers())?,
+            "userInput/clarify" => Response::Explain {
+                content: "Dummy clarification.".into(),
+            },
+            _ => Response::Stop { answers: vec![] },
+        };
+        let mut other = h.capacity.request(
+            "later-work".into(),
+            intercat_daemon::scheduler::Priority::User,
+        );
+        assert!(other.try_acquire().is_none());
+        let port = h.port.clone();
+        let id = Uuid::now_v7();
+        let answering = tokio::spawn(async move {
+            port.respond(
+                id,
+                "prompt".into(),
+                shown["revision"].as_str().unwrap().into(),
+                response,
+            )
+            .await
+        });
+        let sent = h.read().await?;
+        assert_eq!(sent["method"], method);
+        assert_eq!(h.capacity.snapshot().active, 1);
+        assert!(other.try_acquire().is_none());
+        if method != "userInput/interrupt" {
+            h.send(json!({"id":sent["id"],"result":{"commandId":id,"userInputId":"prompt","status":"accepted"}})).await?;
+        }
+        answering.await??;
+        assert_eq!(h.capacity.snapshot().active, 1);
+        assert!(other.try_acquire().is_none());
+        let capacity = h.capacity.clone();
+        h.close().await?;
+        assert_eq!(capacity.snapshot().active, 0);
+        assert!(other.try_acquire().is_some());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn approval_responses_reuse_the_held_slot_while_other_work_waits() -> Result<()> {
+    for choice in ["allow", "deny", "reply"] {
+        let turn = Uuid::now_v7();
+        let mut h = Harness::build(
+            false,
+            Some(intercat_daemon::reconcile::State {
+                resume_turn: Some(turn),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        h.capacity.set_limit(1, 1);
+        h.journal
+            .set_stops(
+                Uuid::now_v7(),
+                intercat_daemon::policy::Stops::EveryApproval,
+            )
+            .await?;
+        let mut request = approval("held-approval", &["node", "--test"]);
+        request["turnId"] = json!(turn);
+        request["availableChoices"][1]["acceptsFeedback"] = json!(true);
+        h.send(json!({"method":"approval/request","params":request}))
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while h.state().await?["approvals"].as_array().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        })
+        .await??;
+        let response = match choice {
+            "allow" => intercat_daemon::approval::Response::Allow,
+            "deny" => intercat_daemon::approval::Response::Deny,
+            _ => intercat_daemon::approval::Response::Reply {
+                text: "Dummy denial with clarification.".into(),
+                mode: intercat_daemon::approval::ReplyMode::Feedback,
+            },
+        };
+        let mut other = h.capacity.request(
+            "later-work".into(),
+            intercat_daemon::scheduler::Priority::User,
+        );
+        assert!(other.try_acquire().is_none());
+        let port = h.port.clone();
+        let id = Uuid::now_v7();
+        let answering = tokio::spawn(async move {
+            port.answer(
+                id,
+                "held-approval".into(),
+                json!({"approvalId":"held-approval","sourceIndex":0}),
+                response,
+            )
+            .await
+        });
+        let sent = h.read().await?;
+        assert_eq!(sent["method"], "approval/decide");
+        assert_eq!(
+            sent["params"]["choiceId"],
+            if choice == "allow" { "yes" } else { "no" }
+        );
+        assert_eq!(h.capacity.snapshot().active, 1);
+        assert!(other.try_acquire().is_none());
+        h.send(json!({"id":sent["id"],"result":{"commandId":id,"approvalId":"held-approval","status":"accepted","terminal":true}})).await?;
+        answering.await??;
+        assert_eq!(h.capacity.snapshot().active, 1);
+        assert!(other.try_acquire().is_none());
+        let capacity = h.capacity.clone();
+        h.close().await?;
+        assert_eq!(capacity.snapshot().active, 0);
+        assert!(other.try_acquire().is_some());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn timed_out_questions_and_approvals_keep_the_running_turn_slot() -> Result<()> {
+    for question in [true, false] {
+        let turn = Uuid::now_v7();
+        let mut h = Harness::build(
+            false,
+            Some(intercat_daemon::reconcile::State {
+                resume_turn: Some(turn),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        h.capacity.set_limit(1, 1);
+        if question {
+            let mut request = prompt();
+            request["turnId"] = json!(turn);
+            request["autoResolutionMs"] = json!(25);
+            h.send(json!({"method":"userInput/request","params":request}))
+                .await?;
+            assert_eq!(h.read().await?["method"], "userInput/engaged");
+        } else {
+            h.journal
+                .set_stops(
+                    Uuid::now_v7(),
+                    intercat_daemon::policy::Stops::EveryApproval,
+                )
+                .await?;
+            let mut request = approval("expired-approval", &["node", "--test"]);
+            request["turnId"] = json!(turn);
+            h.send(json!({"method":"approval/request","params":request}))
+                .await?;
+        }
+        let field = if question { "prompts" } else { "approvals" };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while h.state().await?[field].as_array().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        })
+        .await??;
+        let mut other = h.capacity.request(
+            "later-work".into(),
+            intercat_daemon::scheduler::Priority::User,
+        );
+        assert!(other.try_acquire().is_none());
+        if question {
+            h.send(json!({"method":"userInput/settled","params":{"sessionId":"session","userInputId":"prompt","outcome":"timedOut","answers":[]}})).await?;
+        } else {
+            h.send(json!({"method":"approval/resolved","params":{"sessionId":"session","approvalId":"expired-approval","decision":"timedOut"}})).await?;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !h.state().await?[field].as_array().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        })
+        .await??;
+        assert_eq!(h.capacity.snapshot().active, 1);
+        assert!(other.try_acquire().is_none());
+        h.close().await?;
+        assert!(other.try_acquire().is_some());
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -275,7 +491,7 @@ async fn a_boundary_hold_keeps_current_approval_actionable() -> Result<()> {
     h.port.hold(Uuid::now_v7())?;
     let answer = h.port.clone();
     let requirement = request["currentRequirementId"].clone();
-    let reply = tokio::spawn(async move {
+    let mut reply = tokio::spawn(async move {
         answer
             .answer(
                 Uuid::now_v7(),
@@ -285,7 +501,10 @@ async fn a_boundary_hold_keeps_current_approval_actionable() -> Result<()> {
             )
             .await
     });
-    let sent = h.read().await?;
+    let sent = tokio::select! {
+        sent = h.read() => sent?,
+        early = &mut reply => return Err(format!("Approval ended before its wire request: {early:?}").into()),
+    };
     assert_eq!(sent["method"], "approval/decide");
     assert_eq!(sent["params"]["choiceId"], "no");
     h.send(json!({"id":sent["id"],"result":{"commandId":sent["params"]["commandId"],"approvalId":"boundary-push","status":"accepted","terminal":true}})).await?;
@@ -622,12 +841,13 @@ impl Harness {
         ));
         port.attach(connection.client.clone(), "session".into());
         let editor = Manager::new(root.path(), &root.path().join("editor.log"))?;
+        let capacity = Arc::new(intercat_daemon::scheduler::Capacity::new(4));
         let mut context = Context {
             project_secrets: intercat_daemon::project_secrets::Store::default(),
             port: port.clone(),
             commands,
             editor,
-            capacity: Arc::new(tokio::sync::Semaphore::new(4)),
+            capacity: capacity.clone(),
         };
         let (stop, mut stopped) = watch::channel(false);
         let record = journal.clone();
@@ -663,6 +883,7 @@ impl Harness {
             outgoing,
             stop,
             task,
+            capacity,
         })
     }
     async fn send(&mut self, mut value: Value) -> Result<()> {
@@ -673,9 +894,11 @@ impl Harness {
         Ok(())
     }
     async fn read(&mut self) -> Result<Value> {
+        // Cold local privacy initialization can exceed two seconds. Tests of
+        // Stop and engagement latency keep their own shorter outer deadlines.
         let mut line = String::new();
         tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(10),
             self.incoming.read_line(&mut line),
         )
         .await??;

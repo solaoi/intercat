@@ -29,6 +29,7 @@ sys.stdin.read()
         &std::env::var_os("PATH").unwrap(),
         None,
         Boundary {
+            steps: None,
             profile: intercat_daemon::host::Profile::Worker,
             secrets: &[],
             rpc: &root.path().join("rpc"),

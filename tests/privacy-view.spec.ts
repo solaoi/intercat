@@ -183,7 +183,7 @@ test('Full display retries when the local Editor becomes ready without a policy 
     });
     await page.reload();
     const dialog = await openDetails(page);
-    await expect(dialog.locator('.privacy-pending')).toContainText('Privacy check unavailable');
+    await expect(dialog.locator('.request-original .privacy-pending')).toContainText('Privacy check unavailable');
     await app.evaluate(() => {
       const f = (globalThis as any).privacyFixture;
       f.fail = false;
@@ -191,6 +191,7 @@ test('Full display retries when the local Editor becomes ready without a policy 
       f.state.sequence++;
     });
     await expect(dialog.getByRole('button', { name: 'Show original email value' })).toBeVisible();
+    await expect(dialog.locator('.privacy-pending')).toHaveCount(0);
   } finally { await cleanup(); }
 });
 

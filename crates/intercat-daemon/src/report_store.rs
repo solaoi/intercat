@@ -45,7 +45,15 @@ pub fn active_questions(connection: &Connection) -> Result<Vec<Value>> {
             let late = current
                 .as_deref()
                 .is_some_and(|turn| question.turn_id.to_string() != turn);
-            let mut value = serde_json::to_value(question)?;
+            let mut value = serde_json::to_value(&question)?;
+            if let Some((plan, item)) = crate::plan_execution::turn_owner(
+                connection,
+                &question.session_id,
+                &question.turn_id.to_string(),
+            )? {
+                value["planId"] = plan.to_string().into();
+                value["planItemId"] = item.to_string().into();
+            }
             value["askedBeforeLastMessage"] = late.into();
             Ok(value)
         })
@@ -341,6 +349,13 @@ pub fn respond(
             let decision = json!({"kind":"extend","trackId":q.track_id,"boundary":"after-turn","command":null,"confidence":1.0,"inferenceMs":0.0,"timedOut":false,"scores":null});
             tx.execute("INSERT INTO utterances(id,text,created_at,target,selected,state,revision,decision,reason,provisional,question_id,question_revision) VALUES(?1,?2,?3,?4,?5,?6,1,?7,?8,?5,?9,?10)",params![id,text,crate::journal::timestamp(),json!({"mode":"lock","trackId":q.track_id}).to_string(),q.track_id,if orphaned.is_some() { "orphaned" } else { "placed" },orphaned.is_none().then(|| decision.to_string()),orphaned,q.id,revision])?;
             if orphaned.is_none() {
+                crate::review_fix_store::human_input(&tx, &id, 1, &q.track_id)?;
+                crate::plan_continuation::attach_to_turn(
+                    &tx,
+                    &id,
+                    &q.session_id,
+                    &q.turn_id.to_string(),
+                )?;
                 q.reply_utterance_id = Some(id.clone());
                 q.state = "queued".into();
             }

@@ -56,6 +56,9 @@ pub enum Edit {
         #[serde(skip_serializing_if = "Option::is_none")]
         sources: Option<Vec<crate::request_sources::Source>>,
     },
+    WaitFor {
+        source: crate::start_condition::Target,
+    },
     ReadAs {
         #[serde(rename = "trackId")]
         track: String,
@@ -165,6 +168,9 @@ pub fn change(db: &mut Connection, request: Request, now: Stamp) -> Result<Optio
             input,
             revision,
         } => {
+            if crate::review_fix_store::for_input(&tx, &input)?.is_some() {
+                return Err("Review fixes keep their reviewed target. Take back the fix or use the review decision.".into());
+            }
             if token.get_version_num() != 7 || revision < 1 {
                 return Err("Invalid edit lease.".into());
             }
@@ -382,7 +388,10 @@ fn apply_edit(
     revision: i64,
     edit: &Edit,
 ) -> Result<()> {
-    if matches!(edit, Edit::Text { .. } | Edit::ReadAs { .. }) {
+    if matches!(
+        edit,
+        Edit::Text { .. } | Edit::ReadAs { .. } | Edit::WaitFor { .. }
+    ) {
         crate::timeline_history::abandon_redo(db)?;
     }
     match edit {
@@ -400,6 +409,35 @@ fn apply_edit(
             crate::start_condition::capture(db, input)?;
             crate::app_commands::capture(db, input)?;
             crate::inference_store::reworded(db, input, &before)?;
+        }
+        Edit::WaitFor { source } => {
+            let raw: Option<String> = db.query_row(
+                "SELECT decision FROM utterances WHERE id=?1",
+                [input],
+                |row| row.get(0),
+            )?;
+            let mut decision: Decision = serde_json::from_str(
+                &raw.ok_or("Choose a destination before choosing work to wait for.")?,
+            )?;
+            if !matches!(decision.kind, Kind::Fork | Kind::Extend | Kind::Schedule)
+                || decision.track_id.is_none()
+            {
+                return Err("Choose a destination before choosing work to wait for.".into());
+            }
+            crate::start_condition::select(db, input, source)?;
+            if decision.kind != Kind::Fork {
+                decision.kind = Kind::Schedule;
+            }
+            decision.boundary = Some("after-turn".into());
+            decision.scores = json!({"human":true});
+            crate::input_feedback::read_as(db, input, revision, &decision)?;
+            crate::redirect::forget(db, input)?;
+            crate::report_store::detach_orphaned_reply(db, input)?;
+            db.execute(
+                "UPDATE utterances SET revision=revision+1 WHERE id=?1",
+                [input],
+            )?;
+            crate::journal::apply_outcome(db, input, revision + 1, Outcome::Classified(decision))?;
         }
         Edit::ReadAs {
             track,
@@ -434,6 +472,11 @@ fn apply_edit(
                     "The worker moved to another turn. Reopen this request before stopping it."
                         .into(),
                 );
+            }
+            if *boundary == Boundary::AfterTurn {
+                crate::start_condition::bind_turn(db, input, track, turn.as_ref())?;
+            } else {
+                crate::start_condition::clear(db, input)?;
             }
             let active = current.is_some();
             let kind = match boundary {

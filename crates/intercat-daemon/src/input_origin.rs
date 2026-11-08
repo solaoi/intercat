@@ -121,6 +121,26 @@ pub async fn diff(journal: &Journal, request: DiffRequest) -> Result<crate::inte
     Ok(diff)
 }
 
+pub(crate) fn turn_checkpoint(
+    db: &Connection,
+    track: &str,
+    turn: Uuid,
+) -> Result<Option<Checkpoint>> {
+    let checkpoint: Option<String>=db.query_row("SELECT json_extract(payload,'$.checkpoint') FROM operations
+        WHERE id=?1 AND kind='checkpoint.save' AND state='complete' AND json_extract(payload,'$.trackId')=?2",
+        params![Uuid::new_v5(&turn,b"checkpoint").to_string(),track],|row|row.get(0)).optional()?;
+    let checkpoint = checkpoint
+        .map(|raw| serde_json::from_str::<Checkpoint>(&raw))
+        .transpose()?;
+    if checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.turn_id != turn)
+    {
+        return Err("The saved changes belong to another turn.".into());
+    }
+    Ok(checkpoint)
+}
+
 pub(crate) fn read(db: &Connection, input: Uuid) -> Result<Option<Origin>> {
     crate::session_retirement::ensure_input(db, &input.to_string())?;
     let row: Option<(String,String,String,String,i64)> = db.query_row(
@@ -137,18 +157,7 @@ pub(crate) fn read(db: &Connection, input: Uuid) -> Result<Option<Origin>> {
     let turn: Uuid = turn.parse()?;
     let terminal: bool=db.query_row("SELECT coalesce(json_extract(record,'$.terminal'),0) FROM timeline_turns WHERE session=?1 AND turn=?2",
         params![session,turn.to_string()],|row|row.get(0)).optional()?.unwrap_or(false);
-    let checkpoint: Option<String>=db.query_row("SELECT json_extract(payload,'$.checkpoint') FROM operations
-        WHERE id=?1 AND kind='checkpoint.save' AND state='complete' AND json_extract(payload,'$.trackId')=?2",
-        params![Uuid::new_v5(&turn,b"checkpoint").to_string(),track],|row|row.get(0)).optional()?;
-    let checkpoint = checkpoint
-        .map(|raw| serde_json::from_str::<Checkpoint>(&raw))
-        .transpose()?;
-    if checkpoint
-        .as_ref()
-        .is_some_and(|checkpoint| checkpoint.turn_id != turn)
-    {
-        return Err("The saved changes belong to another turn.".into());
-    }
+    let checkpoint = turn_checkpoint(db, &track, turn)?;
     let worker: Option<String> = db
         .query_row(
             "SELECT record FROM workers WHERE track_id=?1",

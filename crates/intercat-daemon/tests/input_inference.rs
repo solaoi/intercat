@@ -380,6 +380,8 @@ async fn pasted_request_text_is_compared_in_full_and_reference_text_is_excluded(
         let id = Uuid::now_v7();
         journal
             .stage_document(Submission {
+                execute_allowed: true,
+                plan_item: None,
                 op_id: id,
                 text: String::new(),
                 target: Target::None,

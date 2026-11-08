@@ -811,6 +811,7 @@ mod tests {
             &std::env::var_os("PATH").ok_or("Missing PATH")?,
             Some(&auth),
             host::Boundary {
+                steps: None,
                 profile: host::Profile::Worker,
                 secrets: &[],
                 rpc: &directory.path().join("rpc"),

@@ -40,7 +40,7 @@ npm start
 ```
 
 1. Choose **Download Glimmer** and select the Python executable from `.venv/bin/`.
-2. Open **Choose project folder** and select a clean Git repository to work in.
+2. Open **Choose project folder** and select one to eight clean Git repositories to work in.
 3. Choose **Connect workers**, select the Muse Code executable, and enter your first instruction.
 
 Intercat was built for the Meta Global AI Developer Hackathon. The [design handoff](docs/design-handoff.md), [implementation notes](docs/implementation.md), and [milestone acceptance results](docs/m1-acceptance.md) document the design and what has been verified. These documents are in Japanese.

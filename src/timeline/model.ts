@@ -2,7 +2,10 @@ import type { ClipWarning, TrackCompletion } from '../bridge';
 
 export type TrackStatus = 'working' | 'waiting' | 'done' | 'stopped';
 export interface Clip {
+  reviewOffset?: number;
   id: string;
+  planId?: string;
+  planItemId?: string;
   label: string;
   start: number;
   end: number;
@@ -17,15 +20,22 @@ export interface Clip {
   approximate?: boolean;
   toolTicks?: { itemId: string; tool: string; status: string }[];
 }
-export interface PlannedTurn { id: string; label: string; after: string }
+export interface PlanDependency { id: string; trackId: string; clipId: string | null; at: number | null }
+export interface PlannedTurn { reviewFix?: boolean; id: string; label: string; after: string; planId?: string; dependencies?: PlanDependency[]; blocked?: boolean }
 export interface RepairLane { id: string; status: TrackStatus; canStop: boolean; clips: Clip[] }
 export interface Track {
+  reviewer?: boolean;
+  reviewJobs?: {id:string;revision:number;state:'queued'|'running'}[];
+  reviewRows?: number;
   id: string;
+  planId?: string;
   label: string;
   title: string;
   folder: string;
   status: TrackStatus;
   completion?: TrackCompletion | null;
+  queuePosition?: number;
+  waitingForMemory?: boolean;
   nextWaitsForAnswer?: boolean;
   color: number;
   clips: Clip[];
@@ -75,12 +85,12 @@ export function trackLayout(tracks: Track[]) {
   let top = TOP_HEIGHT;
   return tracks.map(track => {
     const row = { track, top, repairs: track.repairs.map((repair, index) => ({ repair, top: top + ROW_HEIGHT + index * REPAIR_ROW_HEIGHT })) };
-    top += ROW_HEIGHT + track.repairs.length * REPAIR_ROW_HEIGHT;
+    top += ROW_HEIGHT + Math.max(0,(track.reviewRows ?? 1)-1)*40 + track.repairs.length * REPAIR_ROW_HEIGHT;
     return row;
   });
 }
 export function timelineHeight(tracks: Track[]) {
-  return TOP_HEIGHT + tracks.reduce((sum, track) => sum + ROW_HEIGHT + track.repairs.length * REPAIR_ROW_HEIGHT, 0);
+  return TOP_HEIGHT + tracks.reduce((sum, track) => sum + ROW_HEIGHT + Math.max(0,(track.reviewRows ?? 1)-1)*40 + track.repairs.length * REPAIR_ROW_HEIGHT, 0);
 }
 
 export function cutPlannedTurn(tracks: Track[], id: string): Track[] {

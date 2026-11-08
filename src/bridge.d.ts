@@ -1,3 +1,9 @@
+export interface ExecutionLimitsSetting { revision: number; parallelWorkers: number; plannerReviewerTurns: number }
+export interface PendingInheritance { operationId: string; trackId: string; sourceInputId: string; sourceState: string | null; state: 'prepared' | 'dispatched' }
+export interface InheritanceIssue { id: string; input: string; trackId: string; sessionId: string | null; revision: number; parents: string[]; applicationId: string | null; blocker: { kind: 'processes' } | { kind: 'conflict'; paths: string[]; base: boolean } | { kind: 'other'; message: string }; kept: boolean; planId?: string; itemId?: string }
+import type { Plan, PlanCommand } from './plans/types';
+export interface ExecutionLimitsChange { opId: string; revision: number; parallelWorkers: number; plannerReviewerTurns: number }
+export interface SchedulingStatus { limit: number; active: number; waiting: { id: string; priority: 'continuation' | 'user' | 'plan'; position: number }[] }
 export interface PrivacyState { revision: number; mode: 'basic' | 'full' }
 export interface PrivacyChange { opId: string; revision: number; mode: PrivacyState['mode'] }
 export interface PrivacyView { text: string; parts: ({ kind: 'text'; text: string } | { kind: 'redaction'; id: number; category: 'api-key' | 'token' | 'email' | 'phone' | 'password' | 'name' | 'address' })[] }
@@ -5,7 +11,9 @@ export interface PickupState { opId: string; trackId: string; sessionId: string;
 import type { IntegrationJob, IntegrationRequest, DiffRequest, Diff } from './commit/types';
 import type { RepairRequest, RepairRun, RepairRefreshRequest, RepairResponse } from './commit/repair';
 export type InputTarget = { mode: 'none' | 'new' } | { mode: 'lock'; trackId: string };
-export type RequestEdit = { kind: 'cancel' | 'takeBack' } | { kind: 'text'; text: string; sources?: RequestSource[] } | { kind: 'readAs'; trackId: string; boundary: 'now' | 'after-turn' | 'when-told'; turn: { sessionId: string; turnId: string } | null };
+export type WaitSource = { kind: 'turn'; value: StartTurn } | { kind: 'clip'; value: { id: string; ordinal: number; turn: StartTurn } } | { kind: 'plan-item'; value: { planId: string; itemId: string; title: string; label: string } };
+export type WaitTarget = { kind: 'clip'; clipId: string } | { kind: 'plan-item'; planId: string; itemId: string; revision: number };
+export type RequestEdit = { kind: 'cancel' | 'takeBack' } | { kind: 'text'; text: string; sources?: RequestSource[] } | { kind: 'waitFor'; source: WaitTarget } | { kind: 'readAs'; trackId: string; boundary: 'now' | 'after-turn' | 'when-told'; turn: { sessionId: string; turnId: string } | null };
 export type EditAction = { kind: 'begin'; token: string; utteranceId: string; revision: number } | { kind: 'renew'; token: string } | { kind: 'apply'; opId: string; token: string; revision: number; edit: RequestEdit } | { kind: 'end'; token: string; revision: number; edit: RequestEdit };
 export interface TimelineEdit { entryId: string; label: string; text: string; at: number; blocked: string | null }
 export interface EditHistory { undo: TimelineEdit | null; redo: TimelineEdit | null; takenBack: { id: string; text: string; revision: number }[] }
@@ -13,17 +21,19 @@ export type HistoryAction = { kind: 'undo' | 'redo'; entryId: string } | { kind:
 export interface HistoryRequest { opId: string; action: HistoryAction }
 export type Stops = 'irreversible-only' | 'every-approval';
 export interface Effect { id: string; trackId: string; sessionId: string; itemId: string; turnId: string; clipId: string | null; kind: string; target: string; ruleId: string; outcome: 'done' | 'failed' | 'unknown'; running: boolean; at: number; reason: string | null }
-export interface ClipWarning { kind: 'duplicate-title' | 'same-file'; text: string }
-export interface TimelineClip { warnings?: ClipWarning[]; assumptionTimes?: number[]; assumptionCount?: number; assumptionIds?: string[]; title?: string; summary?: string; id: string; trackId: string; repairRunId: string | null; ordinal: number; sessionId: string; turnId: string | null; category: 'step' | 'shell' | 'snapshot'; effectCount?: number; label: string; kind: 'read' | 'think' | 'edit' | 'shell'; start: number; end: number; running: boolean; generationEnd: number | null; approximate: boolean; toolTicks: { itemId: string; tool: string; status: string }[] }
+export interface ClipWarning { kind: 'duplicate-title' | 'same-file' | 'file-comparison-unavailable'; text: string }
+export interface TimelineClip { planId?: string; planItemId?: string; warnings?: ClipWarning[]; assumptionTimes?: number[]; assumptionCount?: number; assumptionIds?: string[]; title?: string; summary?: string; id: string; trackId: string; repairRunId: string | null; ordinal: number; sessionId: string; turnId: string | null; category: 'step' | 'shell' | 'snapshot' | 'review'; effectCount?: number; label: string; kind: 'read' | 'think' | 'edit' | 'shell'; start: number; end: number; running: boolean; generationEnd: number | null; approximate: boolean; toolTicks: { itemId: string; tool: string; status: string }[] }
 export interface TimelineMark { operation?: InputDecision['kind'] | null; command?: string | null; state?: Utterance['state']; attached?: boolean; id: string; trackId: string | null; repairRunId: string | null; at: number; inputId: string | null; text: string }
 export interface TimelineState { clock: { epochMs: number; monoMs: number; bootId: string; timelineMs: number }; summaries: { trackId: string; sessionId: string; repairRunId: string | null; boundaryCursor: string }[] }
 export interface OutputResult { content?: string; encoding?: string; byteLen?: number; eof?: boolean; unavailable?: boolean; _intercatTruncated?: string[] }
 export interface StepItem { itemId: string; kind: string; revision: number; status: string; tool?: string; args?: string; commandText?: string; text?: string; visibleOutput?: string; failureReason?: string; recordedAt?: string; retracted?: boolean; truncated?: boolean; _intercatTruncated?: string[]; patchRef?: { id: string }; outputRef?: { id: string }; outputs: { patchRef?: OutputResult; outputRef?: OutputResult } }
 export interface SessionModel { modelId: string | null; providerId: string | null; reasoningEffort: string | null }
-export interface StepDetail { model?: SessionModel | null; assumptions?: Assumption[]; clip: TimelineClip; items: StepItem[]; deletionSnapshots?: DeletionSnapshot[]; effects?: Effect[] }
+export interface ReviewSummary { retryable?: boolean; id: string; revision: number; state: 'queued' | 'running' | 'complete' | 'failed' | 'held'; summary: string | null; detail: string | null }
+export interface ReviewNote { fix?: { state: ReviewFix['state']; detail: string | null; inputId: string | null; inputRevision: number | null }; id: string; reviewId: string; targetSha: string; checkedSha: string; outdated: boolean; kind: 'issue' | 'suggestion' | 'question' | 'nitpick'; blocking: boolean; clipId: string; path: string; startLine: number; endLine: number; text: string }
+export interface StepDetail { reviewedClips?: {id: string; label: string}[]; model?: SessionModel | null; assumptions?: Assumption[]; clip: TimelineClip; items: StepItem[]; deletionSnapshots?: DeletionSnapshot[]; effects?: Effect[]; reviews?: ReviewSummary[]; reviewNotes?: ReviewNote[] }
 export interface StartTurn { trackId: string; label: string; sessionId: string; turnId: string }
-export type InputChoice = { kind: 'instruction' | 'stop-and-send' | 'after-turn' | 'when-told' | 'now' } | { kind: 'command'; command: string } | { kind: 'after-worker-turn'; source: StartTurn };
-export interface WaitingRequest { inputId: string; revision: number }
+export type InputChoice = { kind: 'instruction' | 'stop-and-send' | 'after-turn' | 'when-told' | 'now' } | { kind: 'command'; command: string } | { kind: 'after'; source: WaitSource };
+export type WaitingRequest = { kind: 'input'; inputId: string; revision: number } | { kind: 'plan'; planId: string; revision: number };
 export interface CommandPresentation { command: 'commit' | 'settings' | 'stage-mode' | 'branch-from'; operationId: string; receiptId: string; trackId: string | null; commitTracks?: string[] | null }
 export type InputResolution = { action: 'retry'; target: InputTarget } | { action: 'hold' } | { action: 'confirm'; choice: InputChoice } | { action: 'startWaiting'; choice: WaitingRequest } | { action: 'presented' };
 export interface InputReview { stage: 'operation' | 'lane' | 'trim' | 'boundary' | 'command' | 'stale-turn' | 'start-turn'; turn: { sessionId: string; turnId: string } | null }
@@ -31,11 +41,13 @@ export interface InputDecision { description?: { detail: string; line: string; t
 export interface Attachment { id: string; name: string; byteLen: number; sha256: string }
 export interface RequestSource { attachmentId: string; role: 'request' | 'reference'; after: string }
 export interface RephraseSubmission { opId: string; utteranceId: string; revision: number; text: string }
-export interface Utterance { reasonReview?: { label: string; reportId: string; reportRevision: number; turnId: string; checkpoint: string } | null; rephrase?: { state: string; proposal: string | null } | null; deadline?: { trackId: string | null; recommendation: { trackId: string | null } | null } | null; presentation?: CommandPresentation | null; startWaiting?: { candidates: (WaitingRequest & { text: string; label: string | null; available: boolean })[]; started: WaitingRequest | null } | null; startCondition?: { source: StartTurn | null; candidates: StartTurn[]; ready: boolean } | null; confirmation?: { decisionId: string; turn: { sessionId: string; turnId: string } | null } | null; correction?: { explicit: number; inferred: number; misread: boolean } | null; reading?: { index: number; kind: 'input' | 'park'; state: 'queued' | 'running' | 'late' | 'complete' | 'stale' } | null; sourceText?: string; sources?: RequestSource[]; interruptStarted?: boolean; editHold?: { owner: string; token: string; revision: number } | null; id: string; text: string; attachments: Attachment[]; createdAt: number; state: 'staged' | 'reading' | 'placed' | 'asked' | 'held' | 'cut' | 'redirecting' | 'starting' | 'sent' | 'landed' | 'orphaned'; replyTo?: { id: string; revision: number; question?: ReportQuestion | null } | null; revision: number; target: InputTarget; provisionalTrackId?: string; decision: InputDecision | null; review?: InputReview | null; reason: string | null }
+export interface ReviewFix { id: string; revision: number; noteId: string; inputId: string | null; trackId: string; state: 'planned' | 'held' | 'reserved' | 'running' | 'awaiting-review' | 'unresolved' | 'superseded' | 'resolved' | 'outdated' | 'cut' | 'blocked' | 'kept'; path: string; clipId: string; text: string; reason: string | null; fileAttempts: number; trackAttempts: number; attempts: { inputId: string; state: ReviewFix['state']; reason: string | null }[] }
+export interface Utterance { reviewFix?: { id: string; state: ReviewFix['state']; path: string; clipId: string } | null; reviewFixRunnable?: boolean; dependencyRetry?: { clipId: string; title: string }; dependencyRetryRunnable?: boolean; planManualStart?: boolean; planContinuation?: { title: string }; planId?: string; planItemId?: string; planRunnable?: boolean; executeAllowed?: boolean; reasonReview?: { label: string; reportId: string; reportRevision: number; turnId: string; checkpoint: string } | null; rephrase?: { state: string; proposal: string | null } | null; deadline?: { trackId: string | null; recommendation: { trackId: string | null } | null } | null; presentation?: CommandPresentation | null; startWaiting?: { candidates: (WaitingRequest & { text: string; label: string | null; available: boolean; reason: string | null })[]; started: WaitingRequest | null } | null; startCondition?: { source: WaitSource | null; candidates: WaitSource[]; ready: boolean; detail?: string | null } | null; confirmation?: { decisionId: string; turn: { sessionId: string; turnId: string } | null } | null; correction?: { explicit: number; inferred: number; misread: boolean } | null; reading?: { index: number; kind: 'input' | 'park'; state: 'queued' | 'running' | 'late' | 'complete' | 'stale' } | null; sourceText?: string; sources?: RequestSource[]; interruptStarted?: boolean; editHold?: { owner: string; token: string; revision: number } | null; id: string; text: string; attachments: Attachment[]; createdAt: number; state: 'staged' | 'reading' | 'placed' | 'asked' | 'held' | 'cut' | 'redirecting' | 'starting' | 'sent' | 'landed' | 'orphaned'; planReply?: { planId: string; question: string; state: 'landed' | 'orphaned' } | null; replyTo?: { id: string; revision: number; question?: ReportQuestion | null } | null; revision: number; target: InputTarget; provisionalTrackId?: string; decision: InputDecision | null; review?: InputReview | null; reason: string | null }
 export interface TrackCompletion { sessionId: string; turnId: string; result: { itemId: string; revision: number; kind: 'done' | 'partial' | 'failed'; reason: string } | null }
 export interface LiveTrack { id: string; label: string; title: string; status: string; completion?: TrackCompletion | null }
 export interface EditorStatus { pid?: number | null; phase: 'not_configured' | 'starting' | 'ready' | 'unavailable' | 'stopped' | 'downloading' | 'download_paused'; process: boolean; accepting: boolean; modelLoaded: boolean; generation: number; restart: number; canRetry: boolean; detail?: string; download?: { received: number; total: number; phase: string; file: string | null } | null }
-export interface Project { name: string; path: string; root: string; commonDir: string; base: string; baseBranch: string | null }
+export interface Folder { id: string; name: string; path: string; root: string; commonDir: string; base: string; baseBranch: string | null }
+export interface Project { id: string; name: string; folders: Folder[] }
 export interface Session { id: string; slug: string; name: string; createdAt: number; bound?: boolean }
 export interface Workspace { trackId: string; path: string; reference: string; base: string; attachmentRoots: string[]; state: 'pending' | 'preparing' | 'branching' | 'recovering' | 'ready' | 'failed'; error: string | null }
 export interface BranchRequest { opId: string; parentTrackId: string; turnId: string }
@@ -57,7 +69,7 @@ export interface Assumption {
   clipId: string;
   questionId?: string | null;
   question: string;
-  options: [string, string];
+  options: string[];
   text: string;
   evidence: string;
   revision: number;
@@ -73,11 +85,13 @@ export interface AssumptionCommand {
   revision: number;
   answer: { action: 'keep' } | { action: 'change'; text: string };
 }
-export type ProposalAction = 'commit' | 'continue' | 'later';
-export interface Proposal { id: string; kind: 'work-completed' | 'quiet-changes' | 'work-overlap'; trackId: string; label: string; createdAt: number; text: string; detail: string; options: { action: ProposalAction; text: string }[] }
+export type ProposalAction = 'commit' | 'continue' | 'later' | 'keep-plan' | 'parallel-plan';
+export type Proposal = { id: string; label: string; createdAt: number; text: string; detail: string; options: { action: ProposalAction; text: string; disabledReason?: string | null }[] } & ({ kind: 'work-completed' | 'quiet-changes' | 'work-overlap'; trackId: string } | { kind: 'plan-conflict'; planId: string; planRevision: number; replyBlockedReason: string | null });
+export interface PlanReplyRequest { opId: string; planId: string; revision: number; questionId: string; question: string; text: string }
+export interface PlanReplyResult { inputId: string; planId: string; state: 'landed' | 'orphaned' }
 export interface ProposalCommand { opId: string; proposalId: string; action: ProposalAction }
-export interface ProposalResponse { proposalId: string; action: ProposalAction; trackId: string; inputId?: string }
-export interface ReportQuestion { id: string; reportId: string; trackId: string; sessionId: string; turnId: string; revision: number; kind: 'question' | 'review'; text: string; state: 'open' | 'queued' | 'held' | 'answered' | 'superseded'; replyUtteranceId: string | null; askedBeforeLastMessage?: boolean }
+export interface ProposalResponse { proposalId: string; action: ProposalAction; trackId?: string; planId?: string; planRevision?: number; inputId?: string }
+export interface ReportQuestion { planId?: string; planItemId?: string; id: string; reportId: string; trackId: string; sessionId: string; turnId: string; revision: number; kind: 'question' | 'review'; text: string; state: 'open' | 'queued' | 'held' | 'answered' | 'superseded'; replyUtteranceId: string | null; askedBeforeLastMessage?: boolean }
 export type ReportAnswer = { action: 'reply'; text: string } | { action: 'continue' | 'hold' };
 export interface ProjectSecretState { projectId: string; revision: number; names: string[]; allNames: string[]; ready: boolean }
 export interface ProjectSecretSettings { project: ProjectSecretState; savedRevision: number; savedNames: string[]; issue: string | null }
@@ -87,7 +101,7 @@ export type SecretQuestion = { kind: 'msp'; id: string; revision: string } | { k
 export interface SecretEntry { scope: 'once' | 'project'; opId: string; fingerprintOpId: string; name: string; value: string }
 export type SecretOwner = { kind: 'work' } | { kind: 'repair'; runId: string };
 export interface SecretInputState { owner: SecretOwner; inputId: string; opId: string; trackId: string; name: string; state: 'prepared' | 'stopping' | 'settled' | 'restarting' | 'ready' | 'expired' | 'failed'; detail: string | null }
-export interface WorkerState { model?: SessionModel | null; trackId: string; phase: 'starting' | 'waiting-secrets' | 'reconfiguring' | 'installing-secret' | 'reconnecting' | 'lost' | 'after-connection-loss' | 'ready' | 'failed' | 'stopped' | 'needs-recovery' | 'retry' | 'working' | 'held' | 'stopping' | 'restoring' | 'approval' | 'question' | 'checkpoint'; sessionId: string | null; identity: { pid: number } | null; detail: string | null; activeTurn: string | null; output: string | null; checkpointPending: boolean; prompts: Prompt[]; checkpoint: { turnId: string; sha: string; reference: string; unmergedPaths: string[]; liveProcesses: boolean } | null; approvals: Approval[] }
+export interface WorkerState { model?: SessionModel | null; trackId: string; phase: 'waiting-memory' | 'sleeping' | 'reviewing-fix' | 'review-conflict' | 'starting' | 'waiting-secrets' | 'reconfiguring' | 'installing-secret' | 'reconnecting' | 'lost' | 'after-connection-loss' | 'ready' | 'failed' | 'stopped' | 'needs-recovery' | 'retry' | 'working' | 'held' | 'stopping' | 'restoring' | 'stopping-processes' | 'finishing-inheritance' | 'approval' | 'question' | 'checkpoint'; sessionId: string | null; identity: { pid: number } | null; detail: string | null; activeTurn: string | null; output: string | null; checkpointPending: boolean; prompts: Prompt[]; checkpoint: { turnId: string; sha: string; reference: string; unmergedPaths: string[]; liveProcesses: boolean } | null; approvals: Approval[] }
 export interface OutputPreview { sessionId: string; itemId: string; turnId: string; text: string; truncated: boolean }
 export interface OutputFlow { preview?: OutputPreview | null; trackId?: string; repairRunId: string | null; queuedBytes: number; oldestQueuedMs: number; droppedDeltas: number; lagging: boolean; interrupted: boolean }
 export interface RedirectState { inputId: string; revision: number; trackId: string; sessionId: string; turnId: string; phase: 'stopping' | 'interrupting' | 'ready' | 'sent' | 'done' | 'held' }
@@ -111,7 +125,9 @@ export interface EditorPresentation { character: 'speak' | 'mute'; hidden: boole
 export interface EditorAwayPage { updates: number; effects: number; clips: number; waiting: string[]; entries: EditorEntry[]; before: number | null }
 export interface EditorNotice extends EditorEntry { away?: { interval: EditorReturn; page: EditorAwayPage } }
 export interface EditorLogPage { entries: EditorEntry[]; before: number | null }
-export interface DaemonStatus { proposal?: Proposal | null; editorEntries?: EditorEntry[]; privacy?: PrivacyState; privacyRevision?: number; confirmation?: ConfirmationStatus; assumptions?: Assumption[]; editHistory?: EditHistory; logUnavailable?: boolean; unloggedControls?: UnloggedControl[]; dispatchPaused?: boolean; runningProcesses?: number; processIssues?: string[]; fingerprintRecovery?: FingerprintRecoveryState | null; branches?: BranchState[]; pickups?: PickupState[]; redirects?: RedirectState[]; projectSecretIssue?: string | null; projectSecrets?: ProjectSecretState | null; secretInputs?: SecretInputState[]; outputFlows?: OutputFlow[]; repairRuns?: RepairRun[]; integration?: IntegrationJob | null; effects?: Effect[]; stops?: Stops; timeline?: TimelineState; connected: boolean; mode?: 'preview' | 'unavailable'; message?: string; daemonPid?: number; sequence?: number; editor?: EditorStatus; input?: { running: boolean; detail: string | null }; utterances?: Utterance[]; tracks?: LiveTrack[]; project?: Project | null; session?: Session | null; workspaces?: Workspace[]; preparation?: { phase: string; detail: string | null }; workerConfigured?: boolean; workers?: WorkerState[]; reportQuestions?: ReportQuestion[]; reports?: { id: string; trackId: string; pending: boolean }[] }
+export interface PlanDependencyLocation { unavailable?: boolean; id: string; planId: string | null; itemId: string | null; retryable: boolean; trackId: string; title: string; state: import('./plans/types').PlanItem['state']; unclear: boolean; clipId: string | null; atMs: number | null }
+export interface HostMemoryStatus { sample: { freeBytes: number; pressured: boolean } | null; error: string | null; estimatedHostBytes: number; hosts: number; waiting: { owner: string; position: number }[] }
+export interface DaemonStatus { hostMemory?: HostMemoryStatus; reviewerLane?: {id: string; label: string; title: string; status: 'working' | 'waiting' | 'done' | 'stopped'; active: number; queued: number; jobs?: {id: string; revision: number; state: 'queued'|'running'}[]} | null; reviewFixes?: ReviewFix[]; planAssumptions?: import('./plans/types').PlanAssumptionCard[]; planDependencies?: Record<string, PlanDependencyLocation>; trackFolders?: Record<string,string>; sessionFolders?: { sessionId: string; folderId: string; slug: string }[]; inheritanceIssues?: InheritanceIssue[]; pendingInheritance?: PendingInheritance[]; plans?: Plan[]; scheduling?: SchedulingStatus; plannerScheduling?: SchedulingStatus; proposal?: Proposal | null; editorEntries?: EditorEntry[]; privacy?: PrivacyState; privacyRevision?: number; confirmation?: ConfirmationStatus; assumptions?: Assumption[]; editHistory?: EditHistory; logUnavailable?: boolean; unloggedControls?: UnloggedControl[]; dispatchPaused?: boolean; runningProcesses?: number; processIssues?: string[]; fingerprintRecovery?: FingerprintRecoveryState | null; branches?: BranchState[]; pickups?: PickupState[]; redirects?: RedirectState[]; projectSecretIssue?: string | null; projectSecrets?: ProjectSecretState | null; secretInputs?: SecretInputState[]; outputFlows?: OutputFlow[]; repairRuns?: RepairRun[]; integration?: IntegrationJob | null; effects?: Effect[]; stops?: Stops; timeline?: TimelineState; connected: boolean; mode?: 'preview' | 'unavailable'; message?: string; daemonPid?: number; sequence?: number; editor?: EditorStatus; input?: { running: boolean; detail: string | null }; utterances?: Utterance[]; tracks?: LiveTrack[]; project?: Project | null; session?: Session | null; workspaces?: Workspace[]; preparation?: { phase: string; detail: string | null }; workerConfigured?: boolean; workers?: WorkerState[]; reportQuestions?: ReportQuestion[]; reports?: { id: string; trackId: string; pending: boolean }[] }
 declare global {
   interface Window {
     intercat: {
@@ -163,6 +179,9 @@ declare global {
       branchFromCheckpoint(request: BranchRequest): Promise<BranchState>;
       getBranchPoints(request: { trackId: string; before: number | null }): Promise<BranchPoints>;
       getClipDetail(clipId: string): Promise<StepDetail>;
+      commandReviewFix(request: {opId: string; fixId: string; revision: number; action: 'fixOnceMore' | 'keepIt'}): Promise<unknown>;
+      stopReview(request: {opId: string; reviewId: string; revision: number}): Promise<ReviewSummary>;
+      retryReview(request: {opId: string; reviewId: string; revision: number}): Promise<ReviewSummary>;
       createOperationId(): Promise<string>;
       editHistory(request: HistoryRequest): Promise<DaemonStatus>;
       onHistoryShortcut(listener: (direction: 'undo' | 'redo') => void): () => void;
@@ -171,15 +190,26 @@ declare global {
       retryEditor(opId: string): Promise<EditorStatus>;
       downloadEditor(opId: string): Promise<EditorStatus>;
       pauseEditorDownload(): Promise<EditorStatus>;
+      assignFolder(request: { opId: string; trackId: string; folderId: string }): Promise<void>;
       configureProject(): Promise<{ project: Project | null; error?: string }>;
       configureWorkers(): Promise<{ configured: boolean; error?: string }>;
       startWorker(request: { opId: string; trackId: string }): Promise<void>;
+      finishInheritance(request: { opId: string; trackId: string; applicationId: string }): Promise<void>;
+      resolveInheritanceIssue(request: { opId: string; issueId: string; action: 'keep' | 'stop' }): Promise<void>;
       holdWorker(request: { opId: string; trackId: string }): Promise<void>;
       startHeldUtterance(request: { opId: string; utteranceId: string; revision: number }): Promise<Utterance>;
       stopWorker(request: { opId: string; trackId: string; turnId: string | null }): Promise<void>;
       answerWorker(request: { opId: string; trackId: string; approvalId: string; requirement: unknown; response: ApprovalResponse }): Promise<void>;
       getProjectSecretUsage(): Promise<ProjectSecretUsage[]>;
       getProjectSecretSettings(): Promise<ProjectSecretSettings>;
+      replyToPlan(request: PlanReplyRequest): Promise<PlanReplyResult>;
+      commandPlan(request: PlanCommand): Promise<Plan>;
+      editPlan(action: import('./plans/types').PlanRewriteAction): Promise<Plan | null>;
+      getExecutionLimits(): Promise<ExecutionLimitsSetting>;
+      getPlansStart(): Promise<import('./plans/types').PlansStartSetting>;
+      changePlansStart(request: import('./plans/types').PlansStartChange): Promise<import('./plans/types').PlansStartSetting>;
+      observePlans(request: import('./plans/types').PlanObservation): Promise<import('./plans/types').PlanStartUpdate>;
+      changeExecutionLimits(request: ExecutionLimitsChange): Promise<ExecutionLimitsSetting>;
       getCheckEnvironment(): Promise<CheckEnvironmentState>;
       chooseCheckEnvironment(): Promise<string | null>;
       changeCheckEnvironment(request: CheckEnvironmentChange): Promise<CheckEnvironmentSelection>;
@@ -204,7 +234,7 @@ declare global {
       readPastedReferences(request: { trackId: string; after: string | null }): Promise<{ items: Attachment[]; next: string | null }>;
       attachReference(reselect: boolean): Promise<Attachment | null>;
       attachDroppedReference(file: File): Promise<Attachment>;
-      stageUtterance(request: { opId: string; text: string; attachmentIds: string[]; sources?: RequestSource[]; target: InputTarget; selectedTrackId: string | null }): Promise<Utterance>;
+      stageUtterance(request: { opId: string; text: string; executeAllowed?: boolean; planItem?: { planId: string; itemId: string; revision: number }; attachmentIds: string[]; sources?: RequestSource[]; target: InputTarget; selectedTrackId: string | null }): Promise<Utterance>;
       cutUtterance(id: string): Promise<Utterance>;
       rephraseUtterance(request: RephraseSubmission): Promise<Utterance>;
       resolveUtterance(request: { opId: string; utteranceId: string; revision: number; resolution: InputResolution }): Promise<Utterance>;

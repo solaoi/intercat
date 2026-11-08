@@ -143,6 +143,7 @@ pub(crate) fn confirm(db: &Connection, job: &mut Job, order: &[String]) -> Resul
     if order.len() != expected.len() || order.iter().collect::<BTreeSet<_>>() != expected {
         return Err("Include each selected track exactly once in the Commit order.".into());
     }
+    crate::integration_exclusions::validate_order(job, order)?;
     // Excluded tracks stay visible after the selected, ordered tracks.
     let mut old = std::mem::take(&mut job.tracks);
     for id in order {

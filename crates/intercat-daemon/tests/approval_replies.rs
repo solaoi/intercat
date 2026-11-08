@@ -40,6 +40,17 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, WorkerState, Request)>
         .unwrap()
         .to_owned();
     let turn = Uuid::now_v7();
+    journal
+        .workspace_result(intercat_daemon::preparation::Workspace {
+            track_id: track.clone(),
+            path: root.path().join("worker"),
+            reference: "refs/intercat/reply/tracks/A".into(),
+            base: "0".repeat(40),
+            state: "ready".into(),
+            error: None,
+            attachment_roots: vec![],
+        })
+        .await?;
     let worker = WorkerState {
         track_id: track.clone(),
         phase: "working".into(),

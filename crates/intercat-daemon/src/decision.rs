@@ -124,6 +124,7 @@ pub struct PendingInput {
     pub expanded_tracks: Vec<Candidate>,
     pub sources: Vec<crate::request_sources::Source>,
     pub has_attachments: bool,
+    pub single_job: bool,
     pub context: Option<String>,
     pub reading_index: i64,
     pub history: crate::input_context::Context,
@@ -138,6 +139,30 @@ pub enum Outcome {
 }
 
 impl Request {
+    pub fn run_as_one(&mut self) -> Result<()> {
+        for stage in self.wire["stages"]
+            .as_array_mut()
+            .ok_or("Missing decision stages")?
+        {
+            let excluded = match stage["name"].as_str() {
+                Some("decision") => " G",
+                Some("command") => "9",
+                _ => continue,
+            };
+            stage["candidates"]
+                .as_array_mut()
+                .ok_or("Missing decision candidates")?
+                .retain(|value| value != excluded);
+        }
+        let mut tail: Value = serde_json::from_str(
+            self.wire["tail"]
+                .as_str()
+                .ok_or("Missing decision context")?,
+        )?;
+        tail["runAsOneJob"] = true.into();
+        self.wire["tail"] = crate::input_context::serialize_tail(&tail)?.into();
+        Ok(())
+    }
     pub fn new(
         text: &str,
         tracks: Vec<Candidate>,

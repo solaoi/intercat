@@ -1,5 +1,14 @@
 use super::*;
 
+#[path = "runtime_native_inheritance.rs"]
+mod inheritance_recovery;
+
+#[path = "host_memory_native.rs"]
+mod host_memory_native;
+
+#[path = "runtime_native_queue.rs"]
+mod queue_acceptance;
+
 #[test]
 fn reopening_keeps_unresolved_progress_until_reconciliation_succeeds() {
     let mut previous = WorkerState::starting("track".into(), None);
@@ -62,8 +71,10 @@ async fn reconnect_fixture(
     let (retry, retrying) = mpsc::unbounded_channel();
     let project_secrets = crate::project_secrets::Store::default();
     let service = Service {
+        host_memory: crate::host_memory::Pool::new(),
+        assistant_capacity: Arc::new(crate::scheduler::Capacity::new(2)),
         paused_ports: std::sync::Arc::default(),
-        capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+        capacity: Arc::new(crate::scheduler::Capacity::new(1)),
         project_secrets: project_secrets.clone(),
         data: root.path().into(),
         rpc: root.path().join("rpc"),
@@ -75,6 +86,7 @@ async fn reconnect_fixture(
         ports: Arc::new(Mutex::new(HashMap::from([(track, port.clone())]))),
     };
     let runner = WorkerRunner {
+        host_memory: service.host_memory.clone(),
         config: Config {
             source: root.path().join("absent"),
             binary: root.path().join("absent"),
@@ -92,7 +104,7 @@ async fn reconnect_fixture(
             port: port.clone(),
             commands,
             editor: crate::editor::Manager::new(root.path(), &root.path().join("editor.log"))?,
-            capacity: Arc::new(tokio::sync::Semaphore::new(1)),
+            capacity: Arc::new(crate::scheduler::Capacity::new(1)),
         },
         continuity: crate::execution::Continuity::default(),
         tracker: None,
@@ -101,6 +113,67 @@ async fn reconnect_fixture(
         secret: None,
     };
     Ok((root, runner, port, service, retrying, stop))
+}
+
+#[tokio::test]
+async fn sleeping_worker_start_releases_the_saved_request_once() -> Result<()> {
+    let (_root, runner, _port, service, mut retries, _stop) =
+        reconnect_fixture("RESTING_WORKER_REQUEST").await?;
+    let mut state = runner.state.clone();
+    state.phase = "sleeping".into();
+    state.active_turn = None;
+    state.checkpoint_pending = false;
+    state.identity = None;
+    let track = state.track_id.clone();
+    service.journal.worker_state(state).await?;
+    drop(runner);
+    let id = Uuid::now_v7();
+    service.start_turn(id, &track).await?;
+    service.start_turn(id, &track).await?;
+    assert_eq!(retries.try_recv()?, track);
+    assert!(retries.try_recv().is_err());
+    let snapshot = service.journal.snapshot().await?;
+    assert_eq!(snapshot["utterances"][0]["decision"]["boundary"], "now");
+    assert_eq!(snapshot["utterances"][0]["state"], "placed");
+    assert_eq!(
+        service.journal.operation(id).await?.unwrap()["kind"],
+        "utterance.start"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sleeping_worker_keeps_its_completed_track_status() -> Result<()> {
+    let (_root, runner, _port, service, _retries, _stop) =
+        reconnect_fixture("COMPLETED_BEFORE_SLEEP").await?;
+    let mut state = runner.state.clone();
+    let turn = Uuid::now_v7();
+    state.active_turn = None;
+    state.checkpoint_pending = false;
+    state.identity = None;
+    state.phase = "ready".into();
+    state.checkpoint = Some(crate::checkpoint::Checkpoint {
+        turn_id: turn,
+        sha: "dummy".into(),
+        reference: "refs/intercat/dummy".into(),
+        unmerged_paths: vec![],
+        live_processes: false,
+    });
+    let db = rusqlite::Connection::open(_root.path().join("db"))?;
+    db.execute("INSERT INTO events(ts,mono,boot,position,track_id,session_id,kind,payload) VALUES(0,0,'fixture',0,?1,?2,'msp.applied',?3)",rusqlite::params![state.track_id,state.session_id,json!({"method":"turn/completed","params":{"turnId":turn,"terminal":"completed"}}).to_string()])?;
+    drop(db);
+    service.journal.worker_state(state.clone()).await?;
+    assert_eq!(
+        service.journal.snapshot().await?["tracks"][0]["status"],
+        "done"
+    );
+    state.phase = "sleeping".into();
+    service.journal.worker_state(state).await?;
+    assert_eq!(
+        service.journal.snapshot().await?["tracks"][0]["status"],
+        "done"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -140,7 +213,12 @@ async fn recovery_reserves_its_execution_slot_and_stop_interrupts_the_wait() -> 
             .await?;
         let capacity = runner.execution.capacity.clone();
         let occupied_slot = if occupied {
-            Some(capacity.clone().acquire_owned().await?)
+            Some(
+                capacity
+                    .request("occupied".into(), crate::scheduler::Priority::User)
+                    .acquire()
+                    .await,
+            )
         } else {
             None
         };
@@ -157,7 +235,7 @@ async fn recovery_reserves_its_execution_slot_and_stop_interrupts_the_wait() -> 
             tokio::time::timeout(std::time::Duration::from_secs(3), task).await??;
         assert_eq!(result?, !occupied);
         assert_eq!(runner.continuity.has_slot(), !occupied);
-        assert_eq!(capacity.available_permits(), 0);
+        assert_eq!(capacity.available(), 0);
         assert!(runner.tracker.is_none());
         assert_eq!(
             runner.journal.operation(command).await?.unwrap()["state"],
@@ -165,7 +243,7 @@ async fn recovery_reserves_its_execution_slot_and_stop_interrupts_the_wait() -> 
         );
         runner.continuity.release_slot();
         drop(occupied_slot);
-        assert_eq!(capacity.available_permits(), 1);
+        assert_eq!(capacity.available(), 1);
     }
     Ok(())
 }
@@ -312,6 +390,14 @@ async fn wait_for_lost(journal: &Journal, database: &Path, expected: i64) -> Res
 async fn failed_reconnects_are_bounded_and_retry_reuses_the_existing_worker() -> Result<()> {
     let (root, mut runner, port, service, mut scheduled, _stop) =
         reconnect_fixture("waiting").await?;
+    let capacity = runner.execution.capacity.clone();
+    // Model the slot already held by the turn before its connection was lost.
+    runner.continuity.retain_slot(
+        capacity
+            .request("disconnected-turn".into(), crate::scheduler::Priority::User)
+            .acquire()
+            .await,
+    );
     let journal = runner.journal.clone();
     let track = runner.state.track_id.clone();
     let task = tokio::spawn(async move {
@@ -319,6 +405,7 @@ async fn failed_reconnects_are_bounded_and_retry_reuses_the_existing_worker() ->
         (result, runner.state)
     });
     wait_for_lost(&journal, &root.path().join("db"), 1).await?;
+    assert_eq!(capacity.snapshot().active, 1);
     let id = Uuid::now_v7();
     service.retry(id, track).await?;
     service
@@ -335,9 +422,11 @@ async fn failed_reconnects_are_bounded_and_retry_reuses_the_existing_worker() ->
         "Retry must not create a second worker actor"
     );
     wait_for_lost(&journal, &root.path().join("db"), 2).await?;
+    assert_eq!(capacity.snapshot().active, 1);
     port.stop(Uuid::now_v7())?;
     let (result, state) = task.await?;
     result?;
+    assert_eq!(capacity.snapshot().active, 0);
     assert!(state.active_turn.is_none());
     assert!(!state.checkpoint_pending);
     assert_eq!(state.phase, "after-connection-loss");
@@ -838,11 +927,12 @@ async fn real_file_pickup_preserves_edits_and_runs_one_handoff_in_a_new_session(
     let rpc = root.path().join("rpc");
     std::fs::create_dir(&rpc)?;
     let runtime = Runtime::start(
+        crate::host_memory::Pool::new(),
         root.path().into(),
         rpc.clone(),
         journal.clone(),
         editor.clone(),
-        Arc::new(tokio::sync::Semaphore::new(1)),
+        Arc::new(crate::scheduler::Capacity::new(1)),
         std::sync::Arc::new(crate::dispatch_control::Gate::new(false)),
     );
     let request = crate::pickup::Request {
@@ -874,7 +964,7 @@ async fn real_file_pickup_preserves_edits_and_runs_one_handoff_in_a_new_session(
         assert_eq!(std::fs::read(&index_path)?,index);
         assert_eq!(native_git(&path,&["rev-parse",&format!("{}-checkpoint",workspace.reference)])?,checkpoint.sha);
         // Replaying the same session/start on another real host must keep its identity.
-        let mut replay=host::Host::spawn(&config.binary,&root.path().join("replay-host"),&path,config.path.as_ref(),Some(&config.credentials),host::Boundary{profile: crate::host::Profile::Worker,
+        let mut replay=host::Host::spawn(&config.binary,&root.path().join("replay-host"),&path,config.path.as_ref(),Some(&config.credentials),host::Boundary{steps:None,profile: crate::host::Profile::Worker,
 secrets:&[],rpc:&rpc,denied:&[]}).await?;
         replay.connection.client.initialize().await?;
         let response=replay.connection.client.request("session/start",json!({"commandId":recovery.start_command,"sessionId":recovery.session_id,"workspaceRoot":path,"approvalMode":"promptUnmatched","providerId":"meta","modelId":"muse-spark-1.3-contributor","recoveryMode":"on"})).await;
@@ -919,7 +1009,7 @@ secrets:&[],rpc:&rpc,denied:&[]}).await?;
     }
     verification
 }
-async fn native_editor(root: &Path) -> Result<crate::editor::Manager> {
+pub(crate) async fn native_editor(root: &Path) -> Result<crate::editor::Manager> {
     let source = root.join("editor/intercat_editor");
     std::fs::create_dir_all(&source)?;
     std::fs::write(source.join("__init__.py"), "")?;
@@ -989,7 +1079,12 @@ async fn real_budget_omitted_history_recovers_and_runs_the_next_input_once() -> 
     journal
         .configure_project(
             Uuid::now_v7(),
-            crate::project::inspect(source.clone()).await?,
+            crate::project::inspect(
+                uuid::Uuid::now_v7(),
+                "Dummy project".into(),
+                vec![source.clone()],
+            )
+            .await?,
         )
         .await?;
     journal
@@ -1051,6 +1146,7 @@ async fn real_budget_omitted_history_recovers_and_runs_the_next_input_once() -> 
                 runner.config.path.as_ref(),
                 Some(&credentials),
                 host::Boundary {
+                    steps: None,
                     profile: host::Profile::Worker,
                     secrets: &[],
                     rpc: &runner.rpc,
@@ -1294,7 +1390,12 @@ async fn real_local_dependency_reaches_a_checked_commit() -> Result<()> {
     journal
         .configure_project(
             Uuid::now_v7(),
-            crate::project::inspect(source.clone()).await?,
+            crate::project::inspect(
+                uuid::Uuid::now_v7(),
+                "Dummy project".into(),
+                vec![source.clone()],
+            )
+            .await?,
         )
         .await?;
     journal
@@ -1459,7 +1560,12 @@ async fn real_attachment_original_is_copied_and_read_without_entering_the_checkp
     std::fs::write(source.join("README.txt"), "Disposable attachment test.\n")?;
     native_git(&source, &["add", "."])?;
     native_git(&source, &["commit", "-qm", "base"])?;
-    let project = crate::project::inspect(source.clone()).await?;
+    let project = crate::project::inspect(
+        uuid::Uuid::now_v7(),
+        "Dummy project".into(),
+        vec![source.clone()],
+    )
+    .await?;
     let journal = runner.journal.clone();
     let track = runner.state.track_id.clone();
     journal
@@ -1498,11 +1604,11 @@ async fn real_attachment_original_is_copied_and_read_without_entering_the_checkp
         .prepare_detached(&inspected, &path)
         .await?;
     let workspace = crate::preparation::Workspace {
-        attachment_roots: crate::attachments::reserve(&path, &project.base)?,
+        attachment_roots: crate::attachments::reserve(&path, &project.only_folder()?.base)?,
         track_id: track.clone(),
         path: path.clone(),
         reference: "refs/intercat/attachment/A".into(),
-        base: project.base.clone(),
+        base: project.only_folder()?.base.clone(),
         state: "ready".into(),
         error: None,
     };
@@ -1631,7 +1737,7 @@ async fn real_active_host_crash_recovers_without_replaying_its_turn_or_approval(
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         }).await??;
-        if capacity.available_permits()!=0{return Err("Active worker did not hold its slot".into());}
+        if capacity.available()!=0{return Err("Active worker did not hold its slot".into());}
         let identity:crate::process::Identity=serde_json::from_value(first["identity"].clone())?;
         if crate::process::identity(identity.pid)?!=identity{return Err("Test host identity changed".into());}
         let began=std::time::Instant::now();
@@ -2237,7 +2343,12 @@ async fn real_branch_uses_the_early_tree_and_inherits_secret_fingerprints() -> R
     native_git(&source, &["init", "-q", "-b", "main"])?;
     native_git(&source, &["add", "."])?;
     native_git(&source, &["commit", "-qm", "fixture"])?;
-    let project = crate::project::inspect(source.clone()).await?;
+    let project = crate::project::inspect(
+        uuid::Uuid::now_v7(),
+        "Dummy project".into(),
+        vec![source.clone()],
+    )
+    .await?;
     let journal = runner.journal.clone();
     let track = runner.state.track_id.clone();
     let initial = journal.snapshot().await?["utterances"][0]["id"]
@@ -2291,11 +2402,11 @@ async fn real_branch_uses_the_early_tree_and_inherits_secret_fingerprints() -> R
     runner.path = source.clone();
     std::fs::create_dir(&runner.rpc)?;
     let workspace = crate::preparation::Workspace {
-        attachment_roots: crate::attachments::reserve(&source, &project.base)?,
+        attachment_roots: crate::attachments::reserve(&source, &project.only_folder()?.base)?,
         track_id: track.clone(),
         path: source.clone(),
         reference: "refs/intercat/branch/tracks/A".into(),
-        base: project.base.clone(),
+        base: project.only_folder()?.base.clone(),
         state: "ready".into(),
         error: None,
     };
@@ -2337,7 +2448,7 @@ async fn real_branch_uses_the_early_tree_and_inherits_secret_fingerprints() -> R
         let child_session=branch.session_id.clone().unwrap();
         let previous:WorkerState=serde_json::from_value(journal.snapshot().await?["workers"].as_array().unwrap().iter().find(|w|w["trackId"]==branch.track_id).unwrap().clone())?;
         let (port,commands)=crate::execution::Port::new(std::sync::Arc::new(crate::dispatch_control::Gate::new(false)));
-        let mut child=WorkerRunner {config:config.clone(),data:root.path().into(),rpc:root.path().join("rpc"),journal:journal.clone(),path:branch.workspace.path.clone(),state:WorkerState::starting(branch.track_id.clone(),Some(&previous)),stopping:stop.subscribe(),execution:crate::execution::Context {project_secrets:service.project_secrets(),port:port.clone(),commands,editor:editor.clone(),capacity:capacity.clone()},continuity:crate::execution::Continuity::default(),tracker:None,stable:false,environment:vec![],secret:None};
+        let mut child=WorkerRunner {host_memory:crate::host_memory::Pool::new(),config:config.clone(),data:root.path().into(),rpc:root.path().join("rpc"),journal:journal.clone(),path:branch.workspace.path.clone(),state:WorkerState::starting(branch.track_id.clone(),Some(&previous)),stopping:stop.subscribe(),execution:crate::execution::Context {project_secrets:service.project_secrets(),port:port.clone(),commands,editor:editor.clone(),capacity:capacity.clone()},continuity:crate::execution::Continuity::default(),tracker:None,stable:false,environment:vec![],secret:None};
         child_task=Some(tokio::spawn(async move {let result=child.manage().await;let cleanup=child.stop_owned().await;(result,cleanup)}));
         tokio::time::timeout(std::time::Duration::from_secs(20),async {while port.output_flow().is_none(){tokio::time::sleep(std::time::Duration::from_millis(25)).await;}}).await?;
         branch_checkpoint(&journal,&branch.track_id,None).await?;

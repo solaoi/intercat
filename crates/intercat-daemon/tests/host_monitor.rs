@@ -40,6 +40,7 @@ time.sleep(60)
         &std::env::var_os("PATH").ok_or("PATH is missing")?,
         None,
         Boundary {
+            steps: None,
             profile: intercat_daemon::host::Profile::Worker,
             secrets: &[],
             rpc: &directory.path().join("rpc"),

@@ -21,7 +21,7 @@ test.beforeAll(async () => {
   data = await mkdtemp('/private/tmp/ic-external-');
   await execute('cargo', ['build', '--offline', '-q', '--bin', 'intercatd']);
   token = randomBytes(32).toString('hex');
-  daemon = spawn(path.resolve('target/debug/intercatd'), ['serve', data, path.resolve('services/editor/src')], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, INTERCAT_GITLEAKS: path.resolve('.tools/gitleaks-8.30.1/gitleaks') } });
+  daemon = spawn(path.resolve(process.env.CARGO_TARGET_DIR ?? 'target', 'debug/intercatd'), ['serve', data, path.resolve('services/editor/src')], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, INTERCAT_GITLEAKS: path.resolve('.tools/gitleaks-8.30.1/gitleaks') } });
   let error = '';
   daemon.stderr!.on('data', chunk => { error += chunk.toString(); });
   const lines = createInterface({ input: daemon.stdout! });

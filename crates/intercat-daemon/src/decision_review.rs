@@ -40,8 +40,8 @@ pub enum Choice {
     Instruction,
     StopAndSend,
     AfterTurn,
-    AfterWorkerTurn {
-        source: crate::start_condition::Turn,
+    After {
+        source: crate::start_condition::Source,
     },
     WhenTold,
     Now,
@@ -168,7 +168,7 @@ pub fn reason(review: &Review, label: &str) -> String {
         Stage::StaleTurn => {
             "The turn it was for has ended · Send as instruction or take back".into()
         }
-        Stage::StartTurn => "Which running turn should the new track wait for?".into(),
+        Stage::StartTurn => "Which work should this request wait for?".into(),
     }
 }
 
@@ -182,8 +182,8 @@ pub fn confirm(
         (Stage::Operation | Stage::StaleTurn, Choice::Instruction) => decision.track_id.is_some(),
         (Stage::Trim, Choice::StopAndSend | Choice::AfterTurn) => decision.track_id.is_some(),
         (Stage::Boundary, Choice::Now | Choice::AfterTurn | Choice::WhenTold) => true,
-        (Stage::StartTurn, Choice::Now | Choice::WhenTold | Choice::AfterWorkerTurn { .. }) => {
-            decision.kind == Kind::Fork
+        (Stage::StartTurn, Choice::Now | Choice::WhenTold | Choice::After { .. }) => {
+            matches!(decision.kind, Kind::Fork | Kind::Extend | Kind::Schedule)
         }
         (Stage::Command, Choice::Command { command }) => COMMANDS.contains(&command.as_str()),
         _ => false,
@@ -200,7 +200,7 @@ pub fn confirm(
             decision.kind = Kind::Extend;
             decision.boundary = Some("after-turn".into());
         }
-        Choice::AfterTurn | Choice::AfterWorkerTurn { .. } => {
+        Choice::AfterTurn | Choice::After { .. } => {
             if decision.kind != Kind::Fork {
                 decision.kind = Kind::Schedule;
             }

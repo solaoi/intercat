@@ -8,7 +8,7 @@ import { SecretForm } from '../desk/SecretForm';
 import { MarkdownMessage } from '../markdown/MarkdownMessage';
 import type { RepairRun } from './repair';
 
-export function RepairPanel({ run, label, preview, secretInputs, changed }: { secretInputs: SecretInputState[]; preview?: OutputPreview | null; run: RepairRun; label: string; changed: () => Promise<void> }) {
+export function RepairPanel({ waitingForMemory, run, label, preview, secretInputs, changed }: { waitingForMemory?: boolean; secretInputs: SecretInputState[]; preview?: OutputPreview | null; run: RepairRun; label: string; changed: () => Promise<void> }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [secret, setSecret] = useState(false);
@@ -56,7 +56,7 @@ export function RepairPanel({ run, label, preview, secretInputs, changed }: { se
   }
   const state = { queued: 'Waiting for a worker', preparing: 'Preparing repair', running: 'Repairing', stopping: 'Stopping', held: 'Repair held', captured: 'Preparing Check', applying: 'Checking the repair', done: 'Repair finished', failed: 'Repair needs attention', 'needs-recovery': 'Repair needs recovery', discarded: 'Repair discarded' }[run.phase];
   return <section className="commit-repair" aria-label={title}>
-    <header><strong>{title}</strong><span role="status">{run.restoring ? 'Restoring saved files' : refreshing ? 'Stopping repair and refreshing' : state}</span><div>
+    <header><strong>{title}</strong><span role="status">{run.restoring ? 'Restoring saved files' : refreshing ? 'Stopping repair and refreshing' : waitingForMemory ? 'queued · waiting for memory' : state}</span><div>
       {(['queued', 'preparing', 'running', 'stopping'].includes(run.phase) || preparing || busy) && <button disabled={stopping} onClick={() => { void stop(); }}>Stop repair</button>}
       {run.phase === 'held' && <button disabled={busy || preparing || refreshing || !!run.restoring} onClick={() => { void control('resume'); }}>Resume repair</button>}
       {['queued', 'held', 'captured', 'failed'].includes(run.phase) && <button disabled={busy || refreshing || !!run.restoring} onClick={() => { void control('discard'); }}>Discard repair</button>}

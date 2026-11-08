@@ -35,7 +35,7 @@ test('go-ahead uses the stored choice after restart and automatically starts a s
     }
     await page.getByRole('textbox', { name: 'Request draft', exact: true }).fill('Start waiting work');
     await page.getByRole('button', { name: 'Put', exact: true }).click();
-    await expect(page.getByRole('group', { name: 'Start waiting work', exact: true })).toContainText('Which waiting request should start?');
+    await expect(page.getByRole('group', { name: 'Start waiting work', exact: true })).toContainText('Which waiting request or plan should start?');
     await stop();
     app = await electron.launch({ args: ['.', '--user-data-dir=' + data] });
     page = await app.firstWindow();

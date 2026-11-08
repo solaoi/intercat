@@ -49,6 +49,7 @@ async fn inspect_recorded_view_event_keys_without_a_model_turn() -> Result<()> {
         &std::env::var_os("PATH").ok_or("Missing PATH")?,
         Some(&credentials),
         Boundary {
+            steps: None,
             profile: intercat_daemon::host::Profile::Worker,
             secrets: &[],
             rpc: &rpc,
@@ -114,6 +115,7 @@ async fn verify_pending_recovery(kill_host: bool) -> Result<()> {
         &std::env::var_os("PATH").ok_or("Missing PATH")?,
         Some(&credentials),
         Boundary {
+            steps: None,
             profile: intercat_daemon::host::Profile::Worker,
             secrets: &[],
             rpc: &rpc,
@@ -151,7 +153,7 @@ async fn verify_pending_recovery(kill_host: bool) -> Result<()> {
             let began=std::time::Instant::now();
             let signal=host.tracker.lock().unwrap().terminate(host.identity,true)?;
             assert!(matches!(signal,intercat_daemon::process::SignalResult::Sent));
-            let replacement=Host::spawn(&binary,&root.path().join("resumed-host"),&project,&std::env::var_os("PATH").ok_or("Missing PATH")?,Some(&credentials),Boundary{profile: intercat_daemon::host::Profile::Worker,
+            let replacement=Host::spawn(&binary,&root.path().join("resumed-host"),&project,&std::env::var_os("PATH").ok_or("Missing PATH")?,Some(&credentials),Boundary{steps: None, profile: intercat_daemon::host::Profile::Worker,
 secrets:&[],rpc:&rpc,denied:&denied}).await?;
             let lost=std::mem::replace(&mut host,replacement);
             let mut lost_frames=fs::File::create(target.join("lost-host-frames.jsonl"))?;

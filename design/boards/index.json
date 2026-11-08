@@ -53,7 +53,17 @@
   "QuitLeftover.html",
   "Home.html",
   "SmallWindow.html",
-  "SheetSmallWindow.html"
+  "SheetSmallWindow.html",
+  "PlanItem.html",
+  "DeletedPlans.html",
+  "PlanItemEditing.html",
+  "DependencyFailed.html",
+  "DependencyUnclear.html",
+  "PlanUnlockMove.html",
+  "PlanUnlock.html",
+  "RequestWait.html",
+  "PlanReply.html",
+  "PlanAssumptions.html"
  ],
  "boards": {
   "Onboarding.html": {
@@ -537,6 +547,86 @@
    "title": "14 · 最小の窓（1040×760）で Commit シートを開いたまま、A の承認に答える：シートはモーダルではない領域で、舞台と台本だけを覆う。本文はフォルダを切り替える一列で（「lycoris-next · A」と「hitoiro-api · B · 1 assumption」）、差分は Expand で広げる。Check は「Merged checks passed · log」。確定のボタンの列（Discard と Commit）は下に固定し、右上の閉じるボタンはこの窓のシートを閉じるだけ。フォーカスは ⌃Tab で机の承認のカードに移っている（輪郭）。状態の行の左の端に「■ Stop all turns · 2 sessions」、その右に「■ Stop A」。見出しは仕事の名前（「[A] login retry」など）で、再生ヘッドは時間の領域の 80% にある",
    "expand": "fill",
    "stale": "2026-11-05: 再生ヘッドの時刻札と末尾の時刻目盛を削除した。描き直すまでは設計書3.4の時刻表示と現行UIを正とする。"
+  },
+  "PlanItem.html": {
+   "x": 12160,
+   "y": 0,
+   "w": 1040,
+   "h": 760,
+   "title": "M3 · 項目詳細。元の依頼・実行本文・制約・完了条件を表示する。別の版が届いた状態では「The plan changed · review again」を出し、変更操作を止める",
+   "expand": "fill"
+  },
+  "DeletedPlans.html": {
+   "x": 14400,
+   "y": 0,
+   "w": 1040,
+   "h": 760,
+   "title": "M3 · Deleted plans · 2から個別にRestoreする。通常のUndoが別項目の実行で止まっても、元のcutを復元できる",
+   "expand": "fill"
+  },
+  "PlanItemEditing.html": {
+   "x": 13280,
+   "y": 0,
+   "w": 1040,
+   "h": 760,
+   "title": "M3 · 項目の修正。入力欄の「about · Docs page」とRevise itemで修正を送る。対象はeditingとなり、計画のStartは出さない",
+   "expand": "fill"
+  },
+  "DependencyFailed.html": {
+   "x": 15520,
+   "y": 0,
+   "w": 1040,
+   "h": 760,
+   "title": "M3 · 依存元がfailedの札。Open A・Retry A’s item・Start anywayと依存変更を示す",
+   "expand": "fill"
+  },
+  "DependencyUnclear.html": {
+   "x": 16640,
+   "y": 0,
+   "w": 1040,
+   "h": 760,
+   "title": "M3 · 依存元の結果が不明な札。保存したクリップを開くか、その仕事を明示的に再試行する",
+   "expand": "fill"
+  },
+  "PlanUnlockMove.html": {
+   "x": 17760,
+   "y": 0,
+   "w": 1040,
+   "h": 760,
+   "title": "M3 · 錠付き項目の移動。Yesで計画の錠を外してBへ移す。Keep on Aは移動せず現在の計画を保つ",
+   "expand": "fill"
+  },
+  "PlanUnlock.html": {
+   "x": 18880,
+   "y": 0,
+   "w": 1040,
+   "h": 760,
+   "title": "M3 · 錠に合わない生成案。Yesで保存済みの案を採用し、Keep on Aで元の依頼をAの一つの仕事にする",
+   "expand": "fill"
+  },
+  "RequestWait.html": {
+   "x": 20000,
+   "y": 0,
+   "w": 1040,
+   "h": 760,
+   "title": "M3 · 言葉の待ち先。実行中のクリップを含むターンと未開始の計画項目から選び、失敗時はheldを示す",
+   "expand": "fill"
+  },
+  "PlanReply.html": {
+   "x": 21120,
+   "y": 0,
+   "w": 1040,
+   "h": 900,
+   "title": "M3 · 計画の衝突へのReply。元の下書きと宛先を保ち、計画の版に結び付いた訂正文を書く",
+   "expand": "fill"
+  },
+  "PlanAssumptions.html": {
+   "x": 22240,
+   "y": 0,
+   "w": 1040,
+   "h": 900,
+   "title": "M3 · Plannerの仮定。Keepで既定値を確認し、Changeで計画に結び付く訂正を書く。未回答でも実行できる",
+   "expand": "fill"
   }
  }
 }

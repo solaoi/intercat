@@ -81,6 +81,7 @@ pub struct Host {
     output_monitor: Option<crate::host_monitor::OutputMonitor>,
     process_monitor: Option<crate::process_ledger::Monitor>,
     _auth_link: Option<AuthLink>,
+    _step_capture: Option<crate::step_capture::Service>,
 }
 
 struct AuthLink(PathBuf);
@@ -95,18 +96,21 @@ pub struct Boundary<'a> {
     pub secrets: &'a [crate::secret_input::Value],
     pub rpc: &'a Path,
     pub denied: &'a [PathBuf],
+    pub steps: Option<crate::step_capture::Service>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
     Worker,
-    Planner,
+    Reader,
+    Summary,
 }
 impl Profile {
     pub fn id(self) -> &'static str {
         match self {
             Self::Worker => "intercat-worker",
-            Self::Planner => ":read-only",
+            Self::Reader => "intercat-reader",
+            Self::Summary => ":read-only",
         }
     }
 }
@@ -123,9 +127,10 @@ impl Host {
     ) -> Result<Self> {
         let workspace = workspace.canonicalize()?;
         fs::create_dir_all(host_dir)?;
-        fs::set_permissions(host_dir, fs::Permissions::from_mode(0o700))?;
+        let host_dir = host_dir.canonicalize()?;
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o700))?;
         let nonce = uuid::Uuid::now_v7().to_string();
-        let mut tracker = process::Tracker::prepare(host_dir, &workspace, nonce.clone())?;
+        let mut tracker = process::Tracker::prepare(&host_dir, &workspace, nonce.clone())?;
         let setup = (|| -> Result<_> {
             let config = host_dir.join("config/muse");
             fs::create_dir_all(config.join("skills/intercat-report"))?;
@@ -142,6 +147,16 @@ impl Host {
             let mut filesystem = serde_json::Map::new();
             filesystem.insert(boundary.rpc.to_string_lossy().into_owned(), json!("deny"));
             filesystem.insert(":workspace_roots".into(), secret_denies);
+            if let Some(steps) = &boundary.steps {
+                if boundary.profile != Profile::Worker {
+                    return Err("Only worker hosts capture step files.".into());
+                }
+                filesystem.insert(
+                    steps.directory().to_string_lossy().into_owned(),
+                    json!("deny"),
+                );
+                filesystem.insert(host_dir.to_string_lossy().into_owned(), json!("deny"));
+            }
             for denied in boundary.denied {
                 let denied = denied.canonicalize()?;
                 if workspace.starts_with(&denied) {
@@ -152,14 +167,24 @@ impl Host {
             let mut settings = json!({"schema_version":1,"provider":"meta","model":"muse-spark-1.3-contributor","contributor_mode_enabled":false,
             "agents":{"execution_capacity":1},"run":{"toolset":["read_file","write_file","edit_file","bash","bash_input","search","web_fetch","web_search","request_user_input"]},
             "permissions":{"schema_version":1,"default_profile":"intercat-worker","profiles":{"intercat-worker":{"extends":":ask-me","filesystem":filesystem}}}});
-            if boundary.profile == Profile::Planner {
+            if let Some(steps) = &boundary.steps {
+                settings["hooks"] = steps.hooks();
+            }
+            if matches!(boundary.profile, Profile::Reader | Profile::Summary) {
                 if !boundary.secrets.is_empty() {
                     return Err("A planner must not receive environment secrets.".into());
                 }
                 settings["model"] = json!("muse-wonder-1.0");
-                settings["run"]["toolset"] = json!([]);
-                settings["permissions"] =
-                    json!({"schema_version":1,"default_profile":":read-only"});
+                if boundary.profile == Profile::Summary {
+                    settings["run"]["toolset"] = json!([]);
+                    settings["permissions"] =
+                        json!({"schema_version":1,"default_profile":":read-only"});
+                } else {
+                    settings["run"]["toolset"] = json!(["read_file", "search"]);
+                    let permissions =
+                        settings["permissions"]["profiles"]["intercat-worker"].clone();
+                    settings["permissions"] = json!({"schema_version":1,"default_profile":"intercat-reader","profiles":{"intercat-reader":permissions}});
+                }
             }
             #[cfg(test)]
             if OFFLINE_ECHO.try_with(|_| ()).is_ok() {
@@ -194,6 +219,15 @@ impl Host {
                 .stderr(Stdio::null())
                 .process_group(0)
                 .kill_on_drop(true);
+            if boundary.profile == Profile::Reader {
+                command.args([
+                    "--trust-workspace",
+                    "--disable-write",
+                    "--disable-shell",
+                    "--sandbox-network",
+                    "restricted",
+                ]);
+            }
             for secret in boundary.secrets {
                 secret.apply(&mut command);
             }
@@ -206,6 +240,14 @@ impl Host {
                 return Err(error);
             }
         };
+        if let Some(steps) = &boundary.steps
+            && let Err(error) = steps
+                .register(&host_dir.join("config/muse/settings.json"))
+                .await
+        {
+            tracker.cancel_launch()?;
+            return Err(error);
+        }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -238,6 +280,7 @@ impl Host {
             output_monitor,
             process_monitor,
             _auth_link: auth_link,
+            _step_capture: boundary.steps,
         })
     }
     /// End one transport while retaining ownership of its surviving children.

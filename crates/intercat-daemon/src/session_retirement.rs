@@ -97,8 +97,18 @@ pub(crate) fn retire(
     operation: Uuid,
 ) -> Result<()> {
     ensure_open(tx, session)?;
+    // Internal fix inputs have no You mark; retire them through their review origin.
+    tx.execute("INSERT INTO retired_inputs SELECT i.input,?1 FROM review_fix_inputs i
+        JOIN review_fixes f ON f.id=i.fix JOIN review_notes n ON n.id=f.note JOIN review_jobs j ON j.id=n.job
+        WHERE json_extract(j.record,'$.target.sessionId')=?1 ON CONFLICT DO NOTHING",[session])?;
+    tx.execute("DELETE FROM timeline_clips WHERE id IN (SELECT c.clip FROM review_clips c JOIN review_jobs j ON j.id=c.job WHERE json_extract(j.record,'$.target.sessionId')=?1)",[session])?;
+    tx.execute(
+        "DELETE FROM review_jobs WHERE json_extract(record,'$.target.sessionId')=?1",
+        [session],
+    )?;
     crate::proposals::retire(tx, session)?;
     tx.execute("INSERT INTO retired_inputs SELECT id,?1 FROM utterances WHERE id IN (SELECT input FROM timeline_marks WHERE session=?1 AND input IS NOT NULL) OR dispatch_command IN (SELECT command FROM attachment_turns WHERE session=?1) ON CONFLICT DO NOTHING",[session])?;
+    crate::plan_store::retire_history(tx, session)?;
     tx.execute(
         "DELETE FROM redirects WHERE input IN (SELECT input FROM retired_inputs WHERE session=?1)",
         [session],
@@ -162,6 +172,7 @@ pub(crate) fn retire(
     )?;
     tx.execute("DELETE FROM attachment_turns WHERE session=?1", [session])?;
     tx.execute("DELETE FROM operations WHERE json_extract(payload,'$.sessionId')=?1 OR id IN (SELECT input FROM retired_inputs WHERE session=?1)",[session])?;
+    tx.execute("DELETE FROM operations WHERE kind='workspace.apply-inheritance' AND json_extract(payload,'$.session')=?1", [session])?;
     tx.execute("DELETE FROM events WHERE session_id=?1 OR json_extract(payload,'$.sessionId')=?1 OR json_extract(payload,'$.session')=?1 OR json_extract(payload,'$.payload.sessionId')=?1 OR json_extract(payload,'$.id') IN (SELECT input FROM retired_inputs WHERE session=?1)",[session])?;
     tx.execute(
         "INSERT INTO retired_sessions VALUES(?1,?2,?3)",

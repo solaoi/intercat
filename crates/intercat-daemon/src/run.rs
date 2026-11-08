@@ -14,6 +14,7 @@ pub enum Hold {
     Approval,
     Auth,
     Report,
+    Review,
     Redirect,
 }
 

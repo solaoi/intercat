@@ -2,6 +2,7 @@ import type { Track } from './model';
 
 export function completionLabel(track: Track) {
   if (track.status !== 'done') return null;
+  if (track.reviewer) return {text:'reviewed',mark:'✓',tone:'result-done'};
   switch (track.completion?.result?.kind) {
     case 'done': return { text: 'done', mark: '✓', tone: 'result-done' };
     case 'partial': return { text: 'done · partial', mark: '◐', tone: 'result-partial' };

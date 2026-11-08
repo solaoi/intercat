@@ -54,6 +54,35 @@ async fn a_checkpoint_keeps_its_original_session_after_file_recovery() -> Result
     assert_eq!(branch.parent_session_id, "parent-session");
     Ok(())
 }
+
+#[tokio::test]
+async fn a_branch_copies_the_saved_basis_even_after_the_parent_basis_changes() -> Result<()> {
+    let (root, journal, request) = fixture().await?;
+    let db = rusqlite::Connection::open(root.path().join("db"))?;
+    let saved: String = db.query_row(
+        "SELECT record FROM checkpoint_lineage WHERE track=?1",
+        [&request.parent_track_id],
+        |row| row.get(0),
+    )?;
+    let saved: intercat_daemon::lineage::Point = serde_json::from_str(&saved)?;
+    let later = intercat_daemon::lineage::Basis::root("f".repeat(40));
+    db.execute(
+        "UPDATE track_lineage SET record=?2 WHERE track=?1",
+        rusqlite::params![request.parent_track_id, serde_json::to_string(&later)?],
+    )?;
+    let branch = journal.branch(Change::Prepare(request.clone())).await?;
+    let child: String = db.query_row(
+        "SELECT record FROM track_lineage WHERE track=?1",
+        [&branch.track_id],
+        |row| row.get(0),
+    )?;
+    let child: intercat_daemon::lineage::Basis = serde_json::from_str(&child)?;
+    assert_eq!(child.base, saved.base_at);
+    assert_eq!(child.base_inherits, saved.base_inherits_at);
+    assert_eq!(child.inherits[&request.parent_track_id], saved.inherited());
+    assert_ne!(child.base, later.base);
+    Ok(())
+}
 async fn save_checkpoint(
     journal: &Journal,
     db: &rusqlite::Connection,

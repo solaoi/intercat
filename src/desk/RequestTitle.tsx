@@ -10,6 +10,8 @@ export function generatedTitle(word: Utterance) {
 }
 
 export function requestTitle(word: Utterance) {
+  if (word.planContinuation) return `About ${word.planContinuation.title}`;
+  if (word.dependencyRetry) return `Retry ${word.dependencyRetry.title}`;
   return generatedTitle(word) ?? word.text;
 }
 

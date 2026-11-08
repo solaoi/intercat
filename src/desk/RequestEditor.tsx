@@ -1,5 +1,7 @@
+import type { Plan } from '../plans/types';
+import { waitSourceLabel } from '../waitSource';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { EditAction, LiveTrack, RequestEdit, Utterance, WorkerState } from '../bridge';
+import type { EditAction, LiveTrack, RequestEdit, Utterance, WorkerState, TimelineClip, WaitTarget } from '../bridge';
 import { DecisionTiming } from './DecisionTiming';
 import { RequestTurn } from './RequestTurn';
 import { PrivacyText, usePrivacyLabels } from './PrivacyText';
@@ -11,6 +13,8 @@ interface Props {
   word: Utterance;
   tracks: LiveTrack[];
   workers: WorkerState[];
+  clips: TimelineClip[];
+  plans: Plan[];
   initialEditing: boolean;
   initialLease?: Lease | null;
   compose: (word: Utterance, lease: Lease | null) => void;
@@ -18,8 +22,8 @@ interface Props {
   close: () => void;
 }
 
-export function RequestEditor({ word, tracks, workers, initialEditing, initialLease, compose, update, close }: Props) {
-  const privateLabel = usePrivacyLabels(tracks.map(track => track.title));
+export function RequestEditor({ word, tracks, workers, clips, plans, initialEditing, initialLease, compose, update, close }: Props) {
+  const privateLabel = usePrivacyLabels([...tracks.map(track => track.title), ...clips.map(clip => clip.title ?? clip.label), ...plans.flatMap(plan => plan.items.map(item => item.title))]);
   const [current, setCurrent] = useState(word);
   const [track, setTrack] = useState(word.decision?.trackId ?? (word.target.mode === 'lock' ? word.target.trackId : ''));
   const [boundary, setBoundary] = useState(word.decision?.boundary ?? 'after-turn');
@@ -212,16 +216,26 @@ export function RequestEditor({ word, tracks, workers, initialEditing, initialLe
   const label = tracks.find(candidate => candidate.id === track)?.label ?? '?';
   const missingTrack = !!track && !tracks.some(candidate => candidate.id === track);
   const completedCommand = current.state === 'landed' && current.decision?.kind === 'command';
-  const startedRequest = current.startWaiting?.candidates.find(candidate => candidate.inputId === current.startWaiting?.started?.inputId);
+  const started = current.startWaiting?.started;
+  const startedRequest = current.startWaiting?.candidates.find(candidate => candidate.kind === 'plan'
+    ? started?.kind === 'plan' && candidate.planId === started.planId
+    : started?.kind === 'input' && candidate.inputId === started.inputId);
   let interpretation = 'The Editor will read this request.';
   if (current.decision?.kind === 'command') interpretation = `Application command · ${current.decision.command}`;
   else if (current.decision?.trackId) {
-    const timing = current.startCondition?.source ? `after ${current.startCondition.source.label}’s recorded turn`
+    const timing = current.startCondition?.source ? `after ${waitSourceLabel(current.startCondition.source)}`
       : boundary === 'when-told' ? 'when I say' : boundary === 'now' ? 'now' : 'after this turn';
     interpretation = `${current.decision.kind === 'trim' ? 'Redirect' : 'Send to'} Worker ${label} · ${timing}`;
   } else if (current.decision?.kind === 'park') interpretation = 'Parked · choose a track to place it';
   else if (current.state === 'asked') interpretation = 'Waiting for clarification';
+  const selectedWait = current.startCondition?.source;
+  const selectedWaitKey = selectedWait?.kind === 'clip' ? `clip:${selectedWait.value.id}` : selectedWait?.kind === 'plan-item' ? `plan:${selectedWait.value.itemId}` : selectedWait?.kind === 'turn' && (selectedWait.value.trackId !== track || selectedWait.value.sessionId !== shownTurn?.sessionId || selectedWait.value.turnId !== shownTurn?.turnId) ? `turn:${selectedWait.value.sessionId}/${selectedWait.value.turnId}` : '';
   const disabled = !lease || busy || pending.current !== null;
+  const waits: { key: string; label: string; source: WaitTarget }[] = [
+    ...clips.filter(clip => clip.running && !clip.repairRunId && clip.turnId).map(clip => ({ key: `clip:${clip.id}`, label: `Turn containing ${tracks.find(track => track.id === clip.trackId)?.label ?? '?'}:${clip.ordinal} · ${privateLabel(clip.title ?? clip.label)}`, source: { kind: 'clip' as const, clipId: clip.id } })),
+    ...plans.filter(plan => plan.generation.state === 'ready').flatMap(plan => plan.items.filter(item => item.state === 'planned' || item.state === 'editing').map(item => ({ key: `plan:${item.planItemId}`, label: `${tracks.find(track => track.id === item.trackRef)?.label ?? 'New track'} · ${privateLabel(item.title)}`, source: { kind: 'plan-item' as const, planId: plan.id, itemId: item.planItemId, revision: plan.rev } }))),
+  ];
+
   return <div popover="manual" className="request-editor" role="dialog" aria-modal="false" aria-labelledby="request-editor-title" tabIndex={-1} ref={popup} style={position} onKeyDown={event => {
     if (event.nativeEvent.isComposing) return;
     if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); void finish({ kind: 'cancel' }); }
@@ -234,7 +248,8 @@ export function RequestEditor({ word, tracks, workers, initialEditing, initialLe
         <button disabled={busy || (!lease && !alreadySent)} onClick={() => enterComposer()}>Edit text</button>
       </section>
       <section aria-labelledby="request-read-as"><h3 id="request-read-as">Read as</h3>
-        <p className="request-interpretation">{interpretation}</p>
+        <p className="request-interpretation"><PrivacyText text={interpretation} interactive={false} /></p>
+        {current.startCondition?.detail && <p>{current.startCondition.detail} · change the wait target or start time to continue.</p>}
         {current.reasonReview && <p className="request-reason-review">{alreadySent ? 'Sent' : 'Ready to check'} with {current.reasonReview.label}’s reasons</p>}
         {completedCommand && startedRequest && <p className="request-started">Start requested{startedRequest.label ? ` · Worker ${startedRequest.label}` : ''}<span><PrivacyText text={startedRequest.text} interactive={false} /></span></p>}
         <label>Send to<select aria-label="Edited request destination" value={track} disabled={disabled} onChange={event => {
@@ -251,9 +266,14 @@ export function RequestEditor({ word, tracks, workers, initialEditing, initialLe
         </select></label>
         <fieldset disabled={disabled || !track || missingTrack}><legend>When</legend>
           <label><input type="radio" name="request-boundary" checked={boundary === 'now'} onChange={() => { setBoundary('now'); void apply({ kind: 'readAs', trackId: track, boundary: 'now', turn: shownTurn }); }} />{shownTurn ? `Stop ${label} and send` : 'Now'}<small>{shownTurn ? 'stops the current turn, then sends this (⌘.)' : 'Starts when the worker is ready'}</small></label>
-          <label><input type="radio" name="request-boundary" checked={boundary === 'after-turn'} onChange={() => { setBoundary('after-turn'); void apply({ kind: 'readAs', trackId: track, boundary: 'after-turn', turn: shownTurn }); }} />After this turn</label>
+          <label><input type="radio" name="request-boundary" checked={boundary === 'after-turn' && !selectedWaitKey} onChange={() => { setBoundary('after-turn'); void apply({ kind: 'readAs', trackId: track, boundary: 'after-turn', turn: shownTurn }); }} />After this turn</label>
           <label><input type="radio" name="request-boundary" checked={boundary === 'when-told'} onChange={() => { setBoundary('when-told'); void apply({ kind: 'readAs', trackId: track, boundary: 'when-told', turn: shownTurn }); }} />When I say</label>
         </fieldset>
+        <label className="request-wait-target">Wait for work<select aria-label="Wait for work" value={selectedWaitKey} disabled={disabled || !track || missingTrack} onChange={event => {
+          const choice = waits.find(choice => choice.key === event.target.value);
+          if (choice) void apply({ kind: 'waitFor', source: choice.source });
+        }}><option value="">Choose a running clip or planned item</option>{selectedWaitKey && !waits.some(choice => choice.key === selectedWaitKey) && <option value={selectedWaitKey} disabled>{waitSourceLabel(selectedWait!)}</option>}{waits.map(choice => <option key={choice.key} value={choice.key}>{choice.label}</option>)}</select></label>
+        <p className="request-wait-hint">Waits for the selected turn to end, or the planned item to succeed. Files are not inherited.</p>
         {current.decision && <details className="decision-details"><summary>Decision details</summary><dl>
           <dt>Operation</dt><dd>{current.decision.kind}</dd>
           <dt>Track</dt><dd>{current.decision.trackId ?? 'None'}</dd>

@@ -10,6 +10,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 pub struct Launch<'a> {
+    pub memory: std::sync::Arc<crate::host_memory::Pool>,
     pub worker: &'a Config,
     pub directory: &'a Path,
     pub rpc: &'a Path,
@@ -18,6 +19,7 @@ pub struct Launch<'a> {
 }
 
 pub struct Hosted {
+    _memory: crate::host_memory::Lease,
     host: Host,
     run: Uuid,
 }
@@ -155,6 +157,7 @@ pub async fn open(
         secrets.push(value.clone());
     }
     let workspace_path = workspace.checkout.workdir.canonicalize()?;
+    let memory = tokio::select! {biased; _=stopping(journal,run.id)=>return Err("Repair preparation was stopped.".into()), result=launch.memory.request(run.id.to_string()).acquire(crate::msp::StartGuard::Stopped(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))))=>result?};
     let mut host = match Host::spawn(
         &launch.worker.binary,
         launch.directory,
@@ -162,6 +165,7 @@ pub async fn open(
         std::ffi::OsStr::new(&launch.worker.path),
         Some(&launch.worker.credentials),
         host::Boundary {
+            steps: None,
             profile: crate::host::Profile::Worker,
             secrets: &secrets,
             rpc: launch.rpc,
@@ -188,6 +192,7 @@ pub async fn open(
             return Err("The repair host could not start.".into());
         }
     };
+    memory.attach(host.identity);
     let prepared = async {
         // A Stop can race spawn. Register the host even in Stopping so cleanup
         // retains its exact identity instead of leaving an unowned process.
@@ -243,7 +248,11 @@ pub async fn open(
             format!("The repair host did not complete session preparation: {detail}").into(),
         );
     }
-    Ok(Hosted { host, run: run.id })
+    Ok(Hosted {
+        _memory: memory,
+        host,
+        run: run.id,
+    })
 }
 
 /// A failed shutdown retains the host identity for recovery. It must never be

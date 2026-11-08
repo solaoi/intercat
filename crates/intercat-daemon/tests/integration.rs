@@ -17,6 +17,180 @@ use std::{
 };
 use uuid::Uuid;
 
+#[path = "support/commit_exclusions.rs"]
+mod exclusions;
+
+fn inherit_dummy_checkpoint(
+    f: &Fixture,
+    child: usize,
+    parent: usize,
+    checkpoint: &Checkpoint,
+) -> Result<()> {
+    use intercat_daemon::lineage::{Basis, Point, include};
+    let db = rusqlite::Connection::open(f._root.path().join("events.sqlite"))?;
+    let raw: String = db.query_row(
+        "SELECT record FROM checkpoint_lineage WHERE track=?1 AND sha=?2",
+        rusqlite::params![f.workspaces[parent].track_id, checkpoint.sha],
+        |row| row.get(0),
+    )?;
+    let point: Point = serde_json::from_str(&raw)?;
+    let raw: String = db.query_row(
+        "SELECT record FROM track_lineage WHERE track=?1",
+        [&f.workspaces[child].track_id],
+        |row| row.get(0),
+    )?;
+    let mut basis: Basis = serde_json::from_str(&raw)?;
+    for (track, mark) in &point.inherits {
+        include(&mut basis.inherits, track, mark)?;
+    }
+    include(&mut basis.inherits, &point.track, &point.inherited())?;
+    db.execute(
+        "UPDATE track_lineage SET record=?2 WHERE track=?1",
+        rusqlite::params![f.workspaces[child].track_id, serde_json::to_string(&basis)?],
+    )?;
+    Ok(())
+}
+
+fn record_simulated_integration(
+    f: &Fixture,
+    tracks: &[intercat_daemon::integration::Track],
+) -> Result<()> {
+    let db = rusqlite::Connection::open(f._root.path().join("events.sqlite"))?;
+    for track in tracks {
+        let Some(checkpoint) = &track.checkpoint else {
+            continue;
+        };
+        let raw: String = db.query_row(
+            "SELECT record FROM checkpoint_lineage WHERE track=?1 AND sha=?2",
+            rusqlite::params![track.id, checkpoint.sha],
+            |row| row.get(0),
+        )?;
+        let point: intercat_daemon::lineage::Point = serde_json::from_str(&raw)?;
+        let mut basis = track.basis.clone();
+        basis.base = point.sha.clone();
+        basis.base_inherits = point.inherits.clone();
+        db.execute(
+            "UPDATE track_lineage SET record=?2 WHERE track=?1",
+            rusqlite::params![track.id, serde_json::to_string(&basis)?],
+        )?;
+        db.execute(
+            "INSERT INTO integrated_lineage VALUES(?1,?2)",
+            rusqlite::params![track.id, serde_json::to_string(&point.inherited())?],
+        )?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_cannot_capture_half_of_an_inherited_checkpoint_update() -> Result<()> {
+    let f = Fixture::new(1).await?;
+    fs::write(f.workspaces[0].path.join("file.txt"), "saved child work\n")?;
+    let checkpoint = f.save(0, None).await?;
+    let db = rusqlite::Connection::open(f._root.path().join("events.sqlite"))?;
+    let operation = Uuid::now_v7().to_string();
+    db.execute(
+        "INSERT INTO operations VALUES(?1,'workspace.apply-inheritance',?2,'dispatched')",
+        rusqlite::params![operation,json!({"operation":operation,"dependencies":{"track":f.workspaces[0].track_id,"input":Uuid::now_v7(),"points":[]},"revision":1,"requestDigest":"dummy","session":"dummy","workspace":f.workspaces[0],"previous":null,"before":checkpoint.sha,"after":checkpoint.sha,"beforeBasis":{"base":f.workspaces[0].base,"baseInherits":{},"inherits":{}},"basis":{"base":f.workspaces[0].base,"baseInherits":{},"inherits":{}},"checkpointTurn":Uuid::now_v7(),"expectedBase":null}).to_string()],
+    )?;
+    let error = f.open().await.unwrap_err();
+    assert!(error.to_string().contains("inherited file update"));
+    db.execute(
+        "UPDATE operations SET state='complete' WHERE id=?1",
+        [operation],
+    )?;
+    assert_eq!(
+        f.open().await?.plan.as_ref().unwrap().rows[0].state,
+        RowState::Included
+    );
+    f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inherited_line_edit_integrates_in_order_and_persists_the_number_boundary() -> Result<()> {
+    let f = Fixture::new(2).await?;
+    fs::write(f.workspaces[0].path.join("file.txt"), "200\n")?;
+    let parent = f.save(0, None).await?;
+    inherit_dummy_checkpoint(&f, 1, 0, &parent)?;
+    fs::write(f.workspaces[1].path.join("file.txt"), "300\n")?;
+    f.save(1, None).await?;
+    let open = f.open().await?;
+    assert_eq!(
+        open.plan.as_ref().unwrap().rows[1].state,
+        RowState::Included
+    );
+    f.action(Action::Prepare {
+        id: open.id,
+        revision: open.revision,
+    })
+    .await?;
+    let checked = finished(&f.journal).await?;
+    assert_eq!(checked.status, Status::Checked, "{:?}", checked.error);
+    let candidate = checked.candidate.as_ref().unwrap();
+    assert_eq!(
+        git(
+            &f.source,
+            &["show", &format!("{}:file.txt", candidate.head)]
+        ),
+        "300"
+    );
+    f.action(commit_action(&checked)).await?;
+    assert_eq!(finished(&f.journal).await?.status, Status::Done);
+    let db = rusqlite::Connection::open(f._root.path().join("events.sqlite"))?;
+    let count: i64 = db.query_row("SELECT count(*) FROM integrated_lineage", [], |row| {
+        row.get(0)
+    })?;
+    assert_eq!(count, 2);
+    f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inherited_checkpoint_does_not_restore_a_file_deleted_by_a_newer_parent_commit()
+-> Result<()> {
+    let f = Fixture::new(2).await?;
+    fs::write(f.workspaces[0].path.join("old.txt"), "old parent file\n")?;
+    let a1 = f.save(0, None).await?;
+    inherit_dummy_checkpoint(&f, 1, 0, &a1)?;
+    fs::write(f.workspaces[1].path.join("old.txt"), "old parent file\n")?;
+    fs::write(f.workspaces[1].path.join("child.txt"), "child work\n")?;
+    f.save(1, None).await?;
+    fs::remove_file(f.workspaces[0].path.join("old.txt"))?;
+    f.save(0, Some(a1)).await?;
+    let open = f
+        .action(Action::Open {
+            tracks: Some(vec![f.workspaces[0].track_id.clone()]),
+        })
+        .await?;
+    f.action(Action::Prepare {
+        id: open.id,
+        revision: open.revision,
+    })
+    .await?;
+    let checked = finished(&f.journal).await?;
+    assert_eq!(checked.status, Status::Checked, "{:?}", checked.error);
+    f.action(commit_action(&checked)).await?;
+    assert_eq!(finished(&f.journal).await?.status, Status::Done);
+    let open = f
+        .action(Action::Open {
+            tracks: Some(vec![f.workspaces[1].track_id.clone()]),
+        })
+        .await?;
+    f.action(Action::Prepare {
+        id: open.id,
+        revision: open.revision,
+    })
+    .await?;
+    let checked = finished(&f.journal).await?;
+    assert_eq!(checked.status, Status::Checked, "{:?}", checked.error);
+    let tree = Repository::open(&f.source)?
+        .saved_files(checked.candidate.as_ref().unwrap().head.parse()?)?;
+    assert!(!tree.contains_key("old.txt"));
+    assert!(tree.contains_key("child.txt"));
+    f.source_unchanged()?;
+    Ok(())
+}
+
 fn selected_edit(job: &Job, text: &str) -> intercat_daemon::repair_run::Request {
     use intercat_daemon::repair_run::{Purpose, Request, Selection, Side};
     let candidate = job.candidate.as_ref().unwrap();
@@ -132,11 +306,12 @@ async fn repair_with_saved_deletion(
             .is_none()
     );
     let runtime = intercat_daemon::repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         f.journal.clone(),
         f._root.path().join("integration"),
         f._root.path().join("data"),
         f._root.path().join("rpc"),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(0)),
         f.service.clone(),
         f.project_secrets.clone(),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -187,11 +362,12 @@ async fn repair_deletion_restore_is_private_owner_bound_and_idempotent() -> Resu
         .is_err()
     );
     let runtime = intercat_daemon::repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         f.journal.clone(),
         f._root.path().join("integration"),
         f._root.path().join("data"),
         f._root.path().join("rpc"),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(0)),
         f.service.clone(),
         f.project_secrets.clone(),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -289,11 +465,12 @@ async fn repair_deletion_restore_resumes_after_partial_writes_and_keeps_the_retr
     .await?;
     let integration = Service::new(reopened.clone(), f._root.path().join("integration"));
     let runtime = intercat_daemon::repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         reopened.clone(),
         f._root.path().join("integration"),
         f._root.path().join("data"),
         f._root.path().join("rpc"),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(0)),
         integration.clone(),
         empty_project_secrets(&reopened).await?,
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -438,11 +615,12 @@ async fn selected_edit_rejects_stale_forged_missing_lines_and_secrets_before_dis
         )
         .await?;
     let runtime = intercat_daemon::repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         f.journal.clone(),
         f._root.path().join("integration"),
         f._root.path().join("data"),
         f._root.path().join("rpc"),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(0)),
         f.service.clone(),
         f.project_secrets.clone(),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -1033,11 +1211,12 @@ async fn refresh_repair_background_driver_finishes_without_an_open_window() -> R
     .await?;
     let integration = Service::new(reopened.clone(), f._root.path().join("integration"));
     let runtime = intercat_daemon::repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         reopened.clone(),
         f._root.path().join("integration"),
         f._root.path().join("data"),
         f._root.path().join("rpc"),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(4)),
         integration.clone(),
         empty_project_secrets(&reopened).await?,
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -1137,11 +1316,12 @@ async fn real_refresh_stops_the_prepared_repair_before_rebuilding() -> Result<()
     fs::create_dir(&rpc)?;
     fs::set_permissions(&rpc, fs::Permissions::from_mode(0o700))?;
     let runtime = repair_service::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         f.journal.clone(),
         f._root.path().join("integration"),
         f._root.path().join("data"),
         rpc,
-        std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(0)),
         f.service.clone(),
         f.project_secrets.clone(),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
@@ -1870,7 +2050,15 @@ impl Fixture {
         )
         .await?;
         journal
-            .configure_project(Uuid::now_v7(), project::inspect(source.clone()).await?)
+            .configure_project(
+                Uuid::now_v7(),
+                project::inspect(
+                    uuid::Uuid::now_v7(),
+                    "Dummy project".into(),
+                    vec![source.clone()],
+                )
+                .await?,
+            )
             .await?;
         let project_secrets = empty_project_secrets(&journal).await?;
         for i in 0..count {
@@ -2115,6 +2303,7 @@ async fn selection_retains_frozen_refs_and_refresh_reads_the_new_boundaries() ->
         repo.compare_and_swap(reference, None, next)?;
         repo.sync_ref(reference)?;
     }
+    record_simulated_integration(&f, &opened.tracks)?;
     let selected = f
         .action(Action::Select {
             id: opened.id,
@@ -2296,6 +2485,7 @@ async fn a_second_integration_only_carries_new_work_and_keeps_other_tracks_chang
             repo.sync_ref(reference)?;
         }
     }
+    record_simulated_integration(&f, &first.tracks)?;
     f.action(Action::Discard {
         id: first.id,
         revision: first.revision,

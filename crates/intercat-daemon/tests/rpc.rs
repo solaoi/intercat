@@ -37,6 +37,258 @@ async fn client(path: &std::path::Path) -> BufReader<UnixStream> {
 }
 
 #[tokio::test]
+async fn multiple_project_folders_are_authenticated_and_replayed_without_reinspection() {
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let _lock = DaemonLock::acquire(root.path()).unwrap().unwrap();
+    let paths: Vec<_> = ["dummy-a", "dummy-b"]
+        .iter()
+        .map(|name| {
+            let path = root.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            gix::init(&path).unwrap();
+            path
+        })
+        .collect();
+    let journal = Journal::open(
+        root.path().join("events.sqlite"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await
+    .unwrap();
+    let token = "c7".repeat(32);
+    let server = Server::bind(
+        root.path(),
+        Token::parse(&token).unwrap(),
+        journal,
+        intercat_daemon::editor::Manager::new(root.path(), &root.path().join("editor.log"))
+            .unwrap(),
+        &root.path().join("workspaces"),
+    )
+    .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.serve(async {
+        let _ = stopped.await;
+    }));
+    let socket = root.path().join("rpc.sock");
+    let request = json!({"opId":uuid::Uuid::now_v7(),"name":"Dummy folders","paths":paths});
+    assert_eq!(
+        call(
+            &mut client(&socket).await,
+            "project.configure",
+            request.clone()
+        )
+        .await["error"]["code"],
+        -32001
+    );
+    let mut stream = client(&socket).await;
+    call(&mut stream, "rpc.authenticate", json!({"token":token})).await;
+    let first = call(&mut stream, "project.configure", request.clone()).await;
+    assert_eq!(first["result"]["folders"].as_array().unwrap().len(), 2);
+    assert_eq!(first["result"]["id"], request["opId"]);
+    assert!(first["result"].get("root").is_none());
+    std::fs::write(paths[0].join("unsaved.txt"), "dummy unsaved contents").unwrap();
+    assert_eq!(
+        call(&mut stream, "project.configure", request.clone()).await["result"],
+        first["result"]
+    );
+    let mut changed = request.clone();
+    changed["paths"] = json!([paths[1], paths[0]]);
+    assert!(call(&mut stream, "project.configure", changed).await["error"].is_object());
+    assert!(
+        call(
+            &mut stream,
+            "project.configure",
+            json!({"opId":uuid::Uuid::now_v7(),"path":paths[0]})
+        )
+        .await["error"]
+            .is_object()
+    );
+    let state = call(&mut stream, "system.status", json!({})).await;
+    let secret_id = state["result"]["projectSecrets"]["projectId"]
+        .as_str()
+        .unwrap();
+    assert_eq!(secret_id.len(), 64);
+    assert!(secret_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn plan_only_is_authenticated_and_remains_a_plan_without_a_worker() {
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let _lock = DaemonLock::acquire(root.path()).unwrap().unwrap();
+    let journal = Journal::open(
+        root.path().join("events.sqlite"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await
+    .unwrap();
+    let token = "c8".repeat(32);
+    let server = Server::bind(
+        root.path(),
+        Token::parse(&token).unwrap(),
+        journal.clone(),
+        intercat_daemon::editor::Manager::new(root.path(), &root.path().join("editor.log"))
+            .unwrap(),
+        &root.path().join("workspaces"),
+    )
+    .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.serve(async {
+        let _ = stopped.await;
+    }));
+    let request = json!({"opId":uuid::Uuid::now_v7(),"text":"Plan a dummy task only.","target":{"mode":"new"},"selectedTrackId":null,"attachmentIds":[],"executeAllowed":false});
+    let path = root.path().join("rpc.sock");
+    assert_eq!(
+        call(
+            &mut client(&path).await,
+            "utterance.create",
+            request.clone()
+        )
+        .await["error"]["code"],
+        -32001
+    );
+    let mut stream = client(&path).await;
+    call(&mut stream, "rpc.authenticate", json!({"token":token})).await;
+    let saved = call(&mut stream, "utterance.create", request.clone()).await;
+    assert_eq!(saved["result"]["executeAllowed"], false);
+    assert_eq!(saved["result"]["state"], "landed");
+    let state = call(&mut stream, "system.status", json!({})).await;
+    assert_eq!(state["result"]["plans"].as_array().unwrap().len(), 1);
+    assert!(state["result"]["workers"].as_array().unwrap().is_empty());
+    let plan = &state["result"]["plans"][0];
+    // Item context must reach the journal. Dropping this field would silently
+    // create ordinary work instead of rejecting the unavailable item.
+    for context in [
+        json!({"planId":plan["id"],"itemId":uuid::Uuid::now_v7(),"revision":plan["rev"]}),
+        json!({"planId":plan["id"],"itemId":uuid::Uuid::now_v7(),"revision":plan["rev"],"extra":true}),
+        json!({"planId":plan["id"],"itemId":"invalid","revision":plan["rev"]}),
+    ] {
+        let input = uuid::Uuid::now_v7();
+        let rejected = call(&mut stream, "utterance.create", json!({"opId":input,"text":"Add a dummy detail.","target":{"mode":"lock","trackId":uuid::Uuid::now_v7()},"selectedTrackId":null,"attachmentIds":[],"executeAllowed":true,"planItem":context})).await;
+        assert!(rejected["error"].is_object());
+        assert!(journal.read_utterance(input.to_string()).await.is_err());
+    }
+    let held=call(&mut stream,"plan.command",json!({"opId":uuid::Uuid::now_v7(),"planId":plan["id"],"revision":plan["rev"],"action":{"kind":"hold"}})).await;
+    assert_eq!(held["result"]["state"], "held");
+    let reply = json!({"opId":uuid::Uuid::now_v7(),"planId":plan["id"],"revision":plan["rev"],"questionId":uuid::Uuid::now_v7(),"question":"Dummy old plan question","text":"Keep the dummy reply for review."});
+    let saved = call(&mut stream, "plan.reply", reply.clone()).await;
+    assert_eq!(saved["result"]["state"], "orphaned");
+    assert_eq!(
+        call(&mut stream, "plan.reply", reply.clone()).await["result"],
+        saved["result"]
+    );
+    let word = call(
+        &mut stream,
+        "utterance.read",
+        json!({"utteranceId":saved["result"]["inputId"]}),
+    )
+    .await;
+    assert_eq!(
+        word["result"]["planReply"]["question"],
+        "Dummy old plan question"
+    );
+    let mut bad_reply = reply;
+    bad_reply["opId"] = json!(uuid::Uuid::now_v7());
+    bad_reply["extra"] = json!(true);
+    assert!(call(&mut stream, "plan.reply", bad_reply).await["error"].is_object());
+    let mut invalid = request;
+    invalid["opId"] = json!(uuid::Uuid::now_v7());
+    invalid["executeAllowed"] = json!("false");
+    assert!(call(&mut stream, "utterance.create", invalid).await["error"].is_object());
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn execution_limits_is_applied_after_commit_and_restored_on_restart() {
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let _lock = DaemonLock::acquire(root.path()).unwrap().unwrap();
+    let journal = Journal::open(
+        root.path().join("events.sqlite"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await
+    .unwrap();
+    let editor =
+        intercat_daemon::editor::Manager::new(root.path(), &root.path().join("editor.log"))
+            .unwrap();
+    let token = "a5".repeat(32);
+    let first = json!({"opId":uuid::Uuid::now_v7(),"revision":0,"parallelWorkers":1,"plannerReviewerTurns":1});
+    for restart in 0..2 {
+        let server = Server::bind(
+            root.path(),
+            Token::parse(&token).unwrap(),
+            journal.clone(),
+            editor.clone(),
+            &root.path().join("workspaces"),
+        )
+        .unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.serve(async {
+            let _ = stopped.await;
+        }));
+        let mut stream = client(&root.path().join("rpc.sock")).await;
+        assert_eq!(
+            call(&mut stream, "rpc.authenticate", json!({"token":token})).await["result"]["protocol"],
+            1
+        );
+        if restart == 0 {
+            assert_eq!(
+                call(&mut stream, "execution-limits.get", json!({})).await["result"]["parallelWorkers"],
+                4
+            );
+            assert_eq!(
+                call(&mut stream, "execution-limits.change", first.clone()).await["result"]["parallelWorkers"],
+                1
+            );
+            assert_eq!(
+                call(&mut stream, "system.status", json!({})).await["result"]["scheduling"]["limit"],
+                1
+            );
+            assert_eq!(
+                call(&mut stream, "system.status", json!({})).await["result"]["plannerScheduling"]
+                    ["limit"],
+                1
+            );
+            let next = json!({"opId":uuid::Uuid::now_v7(),"revision":1,"parallelWorkers":3,"plannerReviewerTurns":2});
+            assert_eq!(
+                call(&mut stream, "execution-limits.change", next).await["result"]["parallelWorkers"],
+                3
+            );
+            assert_eq!(
+                call(&mut stream, "execution-limits.change", first.clone()).await["result"]["parallelWorkers"],
+                3
+            );
+        }
+        assert_eq!(
+            call(&mut stream, "system.status", json!({})).await["result"]["scheduling"]["limit"],
+            3
+        );
+        assert_eq!(
+            call(&mut stream, "system.status", json!({})).await["result"]["plannerScheduling"]["limit"],
+            2
+        );
+        let invalid = json!({"opId":uuid::Uuid::now_v7(),"revision":2,"parallelWorkers":0,"plannerReviewerTurns":2});
+        assert!(call(&mut stream, "execution-limits.change", invalid).await["error"].is_object());
+        assert_eq!(
+            call(&mut stream, "system.status", json!({})).await["result"]["scheduling"]["limit"],
+            3
+        );
+        assert_eq!(
+            call(&mut stream, "system.status", json!({})).await["result"]["plannerScheduling"]["limit"],
+            2
+        );
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn global_pause_holds_inputs_and_replays_never_reverse_a_newer_control() {
     let root = tempfile::tempdir_in("/private/tmp").unwrap();
     let _lock = DaemonLock::acquire(root.path()).unwrap().unwrap();
@@ -381,6 +633,26 @@ async fn authenticates_before_any_method_and_persists_effect_once_for_multiple_c
     persisted.as_object_mut().unwrap().remove("input");
     persisted.as_object_mut().unwrap().remove("preparation");
     persisted.as_object_mut().unwrap().remove("outputFlows");
+    assert_eq!(
+        persisted.as_object_mut().unwrap().remove("scheduling"),
+        Some(json!({"limit":4,"active":0,"waiting":[]}))
+    );
+    assert_eq!(
+        persisted
+            .as_object_mut()
+            .unwrap()
+            .remove("plannerScheduling"),
+        Some(json!({"limit":2,"active":0,"waiting":[]}))
+    );
+    // Live memory readings belong to the process, not the saved journal.
+    let memory = persisted
+        .as_object_mut()
+        .unwrap()
+        .remove("hostMemory")
+        .unwrap();
+    assert_eq!(memory["hosts"], 0);
+    assert_eq!(memory["waiting"], json!([]));
+    assert!(memory["estimatedHostBytes"].as_u64().unwrap() > 0);
     let mut actual = recovered.snapshot().await.unwrap();
     assert!(
         actual["timeline"]["clock"]["monoMs"].as_i64().unwrap()
@@ -551,6 +823,18 @@ async fn correction_resume_requires_authentication_and_stays_held_without_its_wo
         [],
     )
     .unwrap();
+    journal
+        .workspace_result(intercat_daemon::preparation::Workspace {
+            track_id: "track".into(),
+            path: root.path().join("worker"),
+            reference: "refs/intercat/test/tracks/A".into(),
+            base: "0".repeat(40),
+            state: "ready".into(),
+            error: None,
+            attachment_roots: vec![],
+        })
+        .await
+        .unwrap();
     let mut worker = WorkerState {
         track_id: "track".into(),
         phase: "working".into(),

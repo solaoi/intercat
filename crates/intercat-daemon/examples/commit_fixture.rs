@@ -72,7 +72,15 @@ async fn main() -> Result<()> {
     )
     .await?;
     journal
-        .configure_project(Uuid::now_v7(), project::inspect(source.clone()).await?)
+        .configure_project(
+            Uuid::now_v7(),
+            project::inspect(
+                uuid::Uuid::now_v7(),
+                "Dummy project".into(),
+                vec![source.clone()],
+            )
+            .await?,
+        )
         .await?;
     for title in ["Update the exported value", "Document the change"] {
         journal

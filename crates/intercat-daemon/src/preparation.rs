@@ -2,7 +2,7 @@
 use crate::{
     Result,
     journal::{Admission, Journal},
-    project::Project,
+    project::{Folder, Project},
     worktree,
 };
 use intercat_git::Repository;
@@ -114,7 +114,7 @@ async fn finish(journal: &Journal, id: &str, admission: Admission) -> Result<()>
     Ok(())
 }
 
-async fn reserve_session(project: &Project, session: &Value, journal: &Journal) -> Result<String> {
+async fn reserve_session(project: &Folder, session: &Value, journal: &Journal) -> Result<String> {
     project.source().await?;
     let session_id = Uuid::parse_str(
         session["id"]
@@ -139,7 +139,10 @@ async fn reserve_session(project: &Project, session: &Value, journal: &Journal) 
             format!("{preferred}-{suffix}")
         };
         let reference = format!("refs/intercat/{slug}/session");
-        let operation_id = Uuid::new_v5(&session_id, format!("reserve:{slug}").as_bytes());
+        let operation_id = Uuid::new_v5(
+            &session_id,
+            format!("reserve:{}:{slug}", project.id()).as_bytes(),
+        );
         let root = project.root.clone();
         let candidate = slug.clone();
         let name = reference.clone();
@@ -201,7 +204,7 @@ async fn reserve_session(project: &Project, session: &Value, journal: &Journal) 
         }
         finish(journal, &operation, admitted).await?;
         journal
-            .bind_session(session_id.to_string(), slug.clone())
+            .bind_session(session_id.to_string(), project.id(), slug.clone())
             .await?;
         return Ok(slug);
     }
@@ -227,19 +230,24 @@ async fn prepare_one(
         .as_str()
         .ok_or_else(|| std::io::Error::other("Missing session ID."))?;
     Uuid::parse_str(session_id)?;
-    if session["bound"] != true {
-        status.send_replace(Status {
-            phase: "preparing".into(),
-            detail: None,
-        });
-        reserve_session(&project, session, journal).await?;
-        return Ok(true);
+    for folder in &project.folders {
+        if crate::folders::session_slug(&snapshot, &folder.id()).is_err() {
+            status.send_replace(Status {
+                phase: "preparing".into(),
+                detail: None,
+            });
+            reserve_session(folder, session, journal).await?;
+            return Ok(true);
+        }
     }
     for track in snapshot["tracks"].as_array().into_iter().flatten() {
         let id = track["id"]
             .as_str()
             .ok_or_else(|| std::io::Error::other("Missing track ID."))?;
         let track_id = Uuid::parse_str(id)?;
+        if snapshot["trackFolders"][id].is_null() {
+            continue;
+        }
         let previous = snapshot["workspaces"]
             .as_array()
             .into_iter()
@@ -252,16 +260,17 @@ async fn prepare_one(
             .as_array()
             .into_iter()
             .flatten()
-            .any(|w| {
+            .find(|w| {
                 w["state"] == "placed"
                     && w["decision"]["trackId"] == id
                     && ["fork", "extend", "schedule"]
                         .contains(&w["decision"]["kind"].as_str().unwrap_or(""))
             });
-        if !queued {
+        let Some(queued) = queued else {
             continue;
-        }
-        let slug = session["slug"].as_str().unwrap();
+        };
+        let project = crate::folders::from_snapshot(&snapshot, id)?;
+        let slug = crate::folders::session_slug(&snapshot, &project.id())?;
         let repository = project.root.clone();
         let bound_slug = slug.to_string();
         let identity = session_id.to_string();
@@ -295,8 +304,35 @@ async fn prepare_one(
             phase: "preparing".into(),
             detail: None,
         });
+        let mut inherited = None;
+        let mut inheritance_requested = false;
         let result = async {
-            let source = project.source().await?;
+            let mut source = project.source().await?;
+            if let Some(input) = queued["id"].as_str()
+                && let Some(dependencies) = journal.input_inheritance(input.to_owned()).await?
+            {
+                inheritance_requested = true;
+                let initial =
+                    crate::inheritance::initial(journal, &workspace, &project.root, dependencies)
+                        .await?;
+                source.head = initial.head.parse()?;
+                workspace.base = initial.head.clone();
+                if workspace.path.exists() {
+                    let path = workspace.path.clone();
+                    let expected = source.head;
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        let saved = Repository::clean_project(&path)?;
+                        if saved.head != expected {
+                            return Err(
+                                "The inherited workspace has another starting point.".into()
+                            );
+                        }
+                        Ok(())
+                    })
+                    .await??;
+                }
+                inherited = Some(initial);
+            }
             let operation = Uuid::new_v5(&track_id, b"worktree.prepare");
             worktree::prepare(
                 &source,
@@ -312,8 +348,36 @@ async fn prepare_one(
         }
         .await;
         workspace.state = if result.is_ok() { "ready" } else { "failed" }.into();
-        workspace.error = result.err().map(|error| error.to_string());
-        journal.workspace_result(workspace).await?;
+        workspace.error = result.as_ref().err().map(|error| error.to_string());
+        let blocker = if inheritance_requested {
+            result
+                .as_ref()
+                .err()
+                .map(|error| crate::inheritance_issue::Blocker::from_error(error.as_ref()))
+        } else {
+            None
+        };
+        if result.is_ok()
+            && let Some(initial) = inherited
+        {
+            crate::inheritance::finish(journal, &initial, workspace).await?;
+        } else {
+            journal.workspace_result(workspace).await?;
+        }
+        if let Some(blocker) = blocker {
+            journal
+                .change_inheritance(crate::inheritance_apply_store::Change::Failure {
+                    input: queued["id"]
+                        .as_str()
+                        .ok_or("Missing inherited input.")?
+                        .into(),
+                    revision: queued["revision"]
+                        .as_i64()
+                        .ok_or("Missing inherited revision.")?,
+                    blocker,
+                })
+                .await?;
+        }
         return Ok(true);
     }
     status.send_replace(Status {

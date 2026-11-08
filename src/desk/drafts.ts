@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useRef } from 'react';
-import type { ApprovalResponse, Attachment, EditAction, InputTarget, ReportQuestion, SecretOwner, Utterance, RephraseSubmission } from '../bridge';
+import type { ApprovalResponse, Attachment, EditAction, InputTarget, ReportQuestion, SecretOwner, Utterance, RephraseSubmission, PlanReplyRequest } from '../bridge';
+import type { PlanRewriteAction } from '../plans/types';
 import type { CommitContext } from '../commit/context';
 import type { RepairFollowUp, RepairRequest } from '../commit/repair';
 
@@ -9,9 +10,12 @@ export interface PasteDraft { id: string; role: 'request' | 'reference'; after: 
 export interface ApprovalDraftContext { kind: 'approval'; owner: SecretOwner; trackId: string; sessionId: string; approvalId: string; requirement: unknown; mode: 'feedback' | 'restart'; label: string }
 export interface ApprovalSubmission { opId: string; owner: SecretOwner; trackId: string; sessionId: string; approvalId: string; requirement: unknown; response: Extract<ApprovalResponse, { action: 'reply' }> }
 export interface RephraseContext { kind: 'rephrase'; inputId: string; revision: number; touched: boolean; seeded: boolean }
-export type DraftContext = RephraseContext | ApprovalDraftContext | EditContext | { kind: 'work' } | { kind: 'reply'; question: ReportQuestion } | { kind: 'repair'; id: string } | { kind: 'commit'; context: CommitContext };
-export interface WorkSubmission { opId: string; text: string; attachmentIds: string[]; target: InputTarget; selectedTrackId: string | null; sources?: { attachmentId: string; role: 'request' | 'reference'; after: string }[]; replyTo?: { id: string; revision: number } }
-export type DraftSubmission = { kind: 'rephrase'; request: RephraseSubmission } | { kind: 'approval'; request: ApprovalSubmission } | { kind: 'edit'; request: Extract<EditAction, { kind: 'end' }> } | { kind: 'work'; request: WorkSubmission } | { kind: 'repair'; request: RepairFollowUp } | { kind: 'commit'; method: 'start'; request: RepairRequest } | { kind: 'commit'; method: 'followup'; request: RepairFollowUp };
+export interface PlanItemContext { kind: 'plan-item'; planId: string; itemId: string; title: string; token: string; revision: number }
+export interface PlanReplyContext { kind: 'plan-reply'; planId: string; questionId: string; revision: number; question: string; label: string }
+export interface ContinuationContext { kind: 'continuation'; planId: string; itemId: string; title: string; revision: number; trackId: string }
+export type DraftContext = PlanReplyContext | ContinuationContext | PlanItemContext | RephraseContext | ApprovalDraftContext | EditContext | { kind: 'work' } | { kind: 'reply'; question: ReportQuestion } | { kind: 'repair'; id: string } | { kind: 'commit'; context: CommitContext };
+export interface WorkSubmission { opId: string; text: string; executeAllowed?: boolean; planItem?: { planId: string; itemId: string; revision: number }; attachmentIds: string[]; target: InputTarget; selectedTrackId: string | null; sources?: { attachmentId: string; role: 'request' | 'reference'; after: string }[]; replyTo?: { id: string; revision: number } }
+export type DraftSubmission = { kind: 'plan-reply'; request: PlanReplyRequest } | { kind: 'plan-item'; request: Extract<PlanRewriteAction, { kind: 'submit' }> } | { kind: 'rephrase'; request: RephraseSubmission } | { kind: 'approval'; request: ApprovalSubmission } | { kind: 'edit'; request: Extract<EditAction, { kind: 'end' }> } | { kind: 'work'; request: WorkSubmission } | { kind: 'repair'; request: RepairFollowUp } | { kind: 'commit'; method: 'start'; request: RepairRequest } | { kind: 'commit'; method: 'followup'; request: RepairFollowUp };
 export interface DraftEntry { text: string; sources?: PasteDraft[]; target: InputTarget; attachments: Attachment[]; context: DraftContext; pending: DraftSubmission | null }
 export interface DraftBook { active: string; stack: string[]; entries: Record<string, DraftEntry> }
 export interface SavedDrafts { revision: number; opId: string | null; parentOpId: string | null; book: DraftBook }
@@ -24,6 +28,9 @@ export function approvalDraftId(context: ApprovalDraftContext): string {
 }
 function key(context: DraftContext): string {
   switch (context.kind) {
+    case 'plan-reply': return `plan-reply:${context.questionId}`;
+    case 'continuation': return `continuation:${context.planId}:${context.itemId}`;
+    case 'plan-item': return `plan-item:${context.planId}:${context.itemId}`;
     case 'approval': return approvalDraftId(context);
     case 'rephrase': return `rephrase:${context.inputId}`;
     case 'work': return 'work';
@@ -123,7 +130,7 @@ class DraftSession {
       if (keepLocal) { this.change(() => {}); await this.flush(); }
     } finally { this.ready = true; this.notify(); }
   }
-  setText(text: string) { this.change((_book, entry) => { entry.text = text; if (!text && !entry.sources?.length) entry.target = { mode: 'none' }; }); }
+  setText(text: string) { this.change((_book, entry) => { entry.text = text; if (!text && !entry.sources?.length && entry.context.kind !== 'continuation') entry.target = { mode: 'none' }; }); }
   insertPaste(id: string, words: number, segment: string | null, before: string, start: number, end: number, draftId: string) {
     const entry = this.book.entries[draftId];
     const index = segment ? entry?.sources?.findIndex(source => source.id === segment) ?? -1 : -1;
@@ -156,7 +163,7 @@ class DraftSession {
       if (index === 0) entry.text += source.after;
       else entry.sources![index - 1].after += source.after;
       if (!entry.sources!.length) delete entry.sources;
-      if (!entry.text && !entry.sources?.length) entry.target = { mode: 'none' };
+      if (!entry.text && !entry.sources?.length && entry.context.kind !== 'continuation') entry.target = { mode: 'none' };
     });
   }
   setTarget(target: InputTarget) { this.change((_book, entry) => { entry.target = target; }); }
@@ -172,6 +179,12 @@ class DraftSession {
       book.stack = [...book.stack.filter(previous => previous !== id && previous !== book.active), book.active];
       book.active = id;
     });
+  }
+  openContinuation(context: ContinuationContext) {
+    const id = key(context);
+    if (this.book.entries[id]?.pending) { if (id !== this.book.active) this.resume(id); return; }
+    this.open(context);
+    this.setTarget({ mode: 'lock', trackId: context.trackId });
   }
   ensureRephrase(word: Utterance) {
     const id = `rephrase:${word.id}`;
@@ -233,7 +246,7 @@ class DraftSession {
   finish() {
     this.change((book, entry) => {
       const id = book.active;
-      if (entry.context.kind === 'edit') delete book.entries[id];
+      if (entry.context.kind === 'edit' || entry.context.kind === 'plan-item' || entry.context.kind === 'continuation' || entry.context.kind === 'plan-reply') delete book.entries[id];
       else book.entries[id] = emptyEntry(entry.context);
       book.stack = book.stack.filter(previous => previous !== id);
       book.active = book.stack.pop() ?? 'work';

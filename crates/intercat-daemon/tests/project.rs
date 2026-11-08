@@ -34,7 +34,10 @@ async fn project_and_initial_session_survive_replay_without_changing_the_startin
             .unwrap()
             .success()
     );
-    let project = intercat_daemon::project::inspect(path).await.unwrap();
+    let project =
+        intercat_daemon::project::inspect(uuid::Uuid::now_v7(), "Dummy project".into(), vec![path])
+            .await
+            .unwrap();
     journal
         .configure_project(op, project.clone())
         .await
@@ -44,7 +47,7 @@ async fn project_and_initial_session_survive_replay_without_changing_the_startin
         .await
         .unwrap();
     let mut other = project.clone();
-    other.base = "2".repeat(40);
+    other.folders[0].base = "2".repeat(40);
     assert!(journal.configure_project(op, other.clone()).await.is_err());
     assert!(
         journal
@@ -86,7 +89,10 @@ async fn project_and_initial_session_survive_replay_without_changing_the_startin
         .await
         .unwrap();
     assert_eq!(restored["session"], session);
-    assert_eq!(restored["project"]["base"], project.base);
+    assert_eq!(
+        restored["project"]["folders"][0]["base"],
+        project.folders[0].base
+    );
 }
 
 #[tokio::test]
@@ -100,8 +106,13 @@ async fn interrupted_project_selection_recovers_before_preparing_an_empty_worker
     let source = root.path().join("source");
     std::fs::create_dir(&source)?;
     git(&source, &["init", "-q", "-b", "main"]);
-    let project = intercat_daemon::project::inspect(source.clone()).await?;
-    assert!(project.base_branch.is_none());
+    let project = intercat_daemon::project::inspect(
+        uuid::Uuid::now_v7(),
+        "Dummy project".into(),
+        vec![source.clone()],
+    )
+    .await?;
+    assert!(project.folders[0].base_branch.is_none());
     let path = root.path().join("db");
     let id = uuid::Uuid::now_v7();
     let journal = Journal::open(&path, intercat_daemon::secrets::Key::new([7; 32])).await?;
@@ -118,13 +129,13 @@ async fn interrupted_project_selection_recovers_before_preparing_an_empty_worker
     git(&source, &["gc", "--prune=now"]);
     assert!(
         intercat_git::Repository::open(&source)?
-            .commit_details(project.base.parse()?)
+            .commit_details(project.folders[0].base.parse()?)
             .is_err()
     );
     project.pin().await?;
-    let reference = format!("refs/intercat/starting-points/{}", project.base);
+    let reference = format!("refs/intercat/starting-points/{}", project.folders[0].base);
     let repo = intercat_git::Repository::open(&source)?;
-    repo.delete_ref(&reference, project.base.parse()?)?;
+    repo.delete_ref(&reference, project.folders[0].base.parse()?)?;
     let wrong = repo.write_blob(b"foreign")?;
     repo.compare_and_swap(&reference, None, wrong)?;
     assert!(
@@ -182,19 +193,25 @@ async fn interrupted_project_selection_recovers_before_preparing_an_empty_worker
     })
     .await??;
     preparation.shutdown().await;
-    assert_eq!(state["project"]["base"], project.base);
+    assert_eq!(
+        state["project"]["folders"][0]["base"],
+        project.folders[0].base
+    );
     assert_eq!(journal.operation(id).await?.unwrap()["state"], "complete");
     assert_eq!(repo.reference_target("refs/heads/main")?, None);
     assert_eq!(
         repo.reference_target(&reference)?.unwrap().to_string(),
-        project.base
+        project.folders[0].base
     );
     git(&source, &["gc", "--prune=now"]);
-    assert!(repo.commit_details(project.base.parse()?).is_ok());
+    assert!(
+        repo.commit_details(project.folders[0].base.parse()?)
+            .is_ok()
+    );
     let workspace = state["workspaces"][0]["path"].as_str().unwrap();
     assert_eq!(
         git(std::path::Path::new(workspace), &["rev-parse", "HEAD"]),
-        project.base
+        project.folders[0].base
     );
     assert!(git(std::path::Path::new(workspace), &["status", "--porcelain"]).is_empty());
     assert!(!source.join(".git/index").exists());

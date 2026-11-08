@@ -58,7 +58,7 @@ async fn command(journal: &Journal) -> Result<Value> {
 }
 
 fn choice(word: &Value) -> WaitingRequest {
-    WaitingRequest {
+    WaitingRequest::Input {
         input_id: word["id"].as_str().unwrap().parse().unwrap(),
         revision: word["revision"].as_i64().unwrap(),
     }
@@ -136,7 +136,7 @@ async fn multiple_candidates_persist_and_selection_replay_starts_exactly_one() -
             .len(),
         2
     );
-    let foreign = WaitingRequest {
+    let foreign = WaitingRequest::Input {
         input_id: Uuid::now_v7(),
         revision: 1,
     };

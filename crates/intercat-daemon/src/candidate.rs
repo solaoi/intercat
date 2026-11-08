@@ -626,7 +626,10 @@ async fn build_inner(
             private.merge_trees(base, current_tree, tree)?
         } else {
             repository.merge_trees(
-                repository.tree_id(row.base.parse()?)?,
+                row.delta_base
+                    .as_ref()
+                    .ok_or("Missing frozen integration baseline.")?
+                    .parse()?,
                 current_tree,
                 repository.tree_id(checkpoint.sha.parse()?)?,
             )?

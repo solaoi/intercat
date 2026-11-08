@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import type { Effect, OutputFlow } from '../bridge';
+import type { Effect, OutputFlow, HostMemoryStatus } from '../bridge';
 import { Effects } from '../desk/Effects';
 import type { Diff, IntegrationAction, IntegrationJob, IntegrationRequest } from './types';
 import { Assumptions } from './Assumptions';
@@ -11,7 +11,8 @@ import './commit.css';
 
 const DiffView = lazy(() => import('./DiffView'));
 type Draft = { text: string; revision: number };
-export default function CommitSheet({ initialRequest, job, effects, repairs, flows, secretInputs, update, close, selectContext }: { initialRequest?: IntegrationRequest; secretInputs: import('../bridge').SecretInputState[]; job: IntegrationJob | null; effects: Effect[]; repairs: RepairRun[]; flows: OutputFlow[]; update: (job: IntegrationJob) => Promise<void>; close: () => void; selectContext: (context: CommitContext) => void }) {
+export default function CommitSheet({ hostMemory, initialRequest, job, effects, repairs, flows, secretInputs, update, close, selectContext, folders = [] }: { hostMemory?: HostMemoryStatus; initialRequest?: IntegrationRequest; folders?: { id: string; name: string; tracks: string[] }[]; secretInputs: import('../bridge').SecretInputState[]; job: IntegrationJob | null; effects: Effect[]; repairs: RepairRun[]; flows: OutputFlow[]; update: (job: IntegrationJob) => Promise<void>; close: () => void; selectContext: (context: CommitContext) => void }) {
+  const [choosingFolder, setChoosingFolder] = useState(!initialRequest && (!job || ['done', 'discarded'].includes(job.status)) && folders.length > 1);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState('');
   const [trackId, setTrackId] = useState('');
@@ -76,7 +77,7 @@ export default function CommitSheet({ initialRequest, job, effects, repairs, flo
     finally { setBusy(false); }
   }
   useEffect(() => {
-    if (!opening.current) { opening.current = true; void execute({ action: 'open', tracks: null }, initialRequest); }
+    if (!opening.current) { opening.current = true; if (choosingFolder) setBusy(false); else void execute({ action: 'open', tracks: !job && folders.length === 1 ? folders[0].tracks : null }, initialRequest); }
   }, []);
   useEffect(() => {
     if (job && !job.tracks.some(track => track.id === trackId)) setTrackId(job.candidate?.failedTrack ?? job.tracks.find(track => track.included)?.id ?? job.tracks[0]?.id ?? '');
@@ -129,13 +130,24 @@ export default function CommitSheet({ initialRequest, job, effects, repairs, flo
   const canCommit = !job?.assumptionsPending && !job?.assumptionsFailed && !job?.assumptionsChanged && !busy && !repair && !pending.current && !dirty && job?.status === 'checked' && candidate && job.tracks.some(track => track.included && track.checkpoint);
   const effectsForJob = effects.filter(effect => job?.tracks.some(track => track.id === effect.trackId));
 
+  if (choosingFolder) return <aside className="commit-sheet" aria-label="Commit review" data-focus-region tabIndex={-1} onKeyDown={event => { if (event.key === 'Escape' && !event.nativeEvent.isComposing) { event.stopPropagation(); close(); } }}>
+    <header className="commit-heading"><div><h2>Commit</h2><p>Choose a folder to review</p></div><button aria-label="Hide commit review" onClick={close}>×</button></header>
+    {error && <p role="alert">{error}</p>}
+    <div className="commit-folder-choices" role="group" aria-label="Folders to review">{folders.map(folder => <button key={folder.id} disabled={busy} onClick={() => {
+      const action: IntegrationAction = { action: 'open', tracks: folder.tracks };
+      const retry = pending.current && JSON.stringify(pending.current.action) === JSON.stringify(action) ? pending.current : undefined;
+      if (!retry) pending.current = null;
+      void execute(action, retry).then(result => { if (result) setChoosingFolder(false); });
+    }}>Review {folder.name}</button>)}</div>
+  </aside>;
+
   if (job?.status === 'ordering' && job.orderReview) return <CommitOrder key={`${job.id}:${job.revision}`} job={job} review={job.orderReview}
     busy={busy} error={error} close={close} reload={() => { void reload(); }}
     retry={pending.current ? () => { if (pending.current) void execute(pending.current.action, pending.current); } : null}
     confirm={tracks => { void execute({ action: 'order', id: job.id, revision: job.revision, tracks }); }} />;
 
   return <aside className="commit-sheet" aria-label="Commit review" data-focus-region tabIndex={-1} onKeyDown={event => { if (event.key === 'Escape' && !event.nativeEvent.isComposing) { event.stopPropagation(); close(); } }}>
-    <header className="commit-heading"><div><h2>Commit</h2><p>{job?.project.name ?? 'Opening review…'}</p></div><button aria-label="Hide commit review" onClick={close}>×</button></header>
+    <header className="commit-heading"><div><h2>Commit</h2><p title={job?.project.name}>{job?.project.name ?? 'Opening review…'}</p></div><button aria-label="Hide commit review" onClick={close}>×</button></header>
     {job && <div className="commit-target"><span title={job.plan?.targetRef}>{job.plan?.targetRef.replace('refs/heads/', '') ?? 'Preparing…'}</span><button disabled={busy || refreshBusy || ['committing', 'commit-blocked', 'done', 'staging'].includes(job.status) || repair?.phase === 'needs-recovery' || !!repair?.restoring} onClick={requestRefresh}>Refresh</button></div>}
     {refreshChoice && <section className="commit-refresh" role="group" aria-label="Confirm Refresh"><strong>{refreshChoice.repairId ? `Refresh stops ${refreshChoice.label}’s repair` : 'Refresh discards the reviewed fixes'}</strong><p>Saved checkpoints will replace the edits made for this commit.</p><div><button disabled={busy} onClick={() => { void confirmRefresh(); }}>Refresh now</button><button disabled={busy} onClick={() => setRefreshChoice(null)}>Wait</button></div></section>}
     {!!job?.finishedSinceOpen && <p className="commit-notice">{job.finishedSinceOpen} newer checkpoint{job.finishedSinceOpen === 1 ? '' : 's'} · Refresh to include</p>}
@@ -143,16 +155,21 @@ export default function CommitSheet({ initialRequest, job, effects, repairs, flo
     {!job ? <p className="commit-empty">{busy ? 'Loading saved checkpoints…' : 'No saved work is available.'}</p> : <>
       <div className="commit-tracks" role="group" aria-label="Tracks to include">{job.tracks.map(item => {
         const state = job.plan?.rows.find(row => row.track === item.id)?.state;
-        return <div key={item.id} className={item.id === trackId ? 'commit-track selected' : 'commit-track'}>
-          <input type="checkbox" aria-label={`Include Worker ${item.label}`} checked={item.included} disabled={busy || locked || !item.checkpoint} onChange={event => { void execute({ action: 'select', id: job.id, revision: job.revision, track: item.id, included: event.target.checked }); }} />
+        const impact = job.exclusions.find(value => value.track === item.id);
+        const blockedBy = job.exclusions.filter(value => value.omitted && value.dependents.includes(item.id));
+        const label = (id: string) => job.tracks.find(value => value.id === id)?.label ?? '?';
+        const notice = impact?.dependents.length ? `Leaving ${item.label} out also leaves ${impact.dependents.map(label).join(', ')} out (inherits ${item.label})`
+          : blockedBy.length ? `Left out · inherits ${blockedBy.map(value => label(value.track)).join(', ')}. Include the source first to select this track.` : '';
+        return <div key={item.id} className="commit-track-group"><div className={item.id === trackId ? 'commit-track selected' : 'commit-track'}>
+          <input type="checkbox" aria-label={`Include Worker ${item.label}`} aria-describedby={notice ? `commit-exclusion-${item.id}` : undefined} checked={item.included} disabled={busy || locked || !item.checkpoint || blockedBy.length > 0} onChange={event => { void execute({ action: 'select', id: job.id, revision: job.revision, track: item.id, included: event.target.checked }); }} />
           <button aria-pressed={item.id === trackId} onClick={() => setTrackId(item.id)}><b>{item.label}</b><span>{item.title}<small>{!item.checkpoint ? 'No saved checkpoint' : state === 'no-changes' ? 'No changes' : state === 'conflict' ? 'Conflict' : `Saved ${item.label}@${item.checkpointCount}`}</small></span></button>
-        </div>;
+        </div>{notice && <p className="commit-exclusion" id={`commit-exclusion-${item.id}`}>{notice}</p>}</div>;
       })}</div>
       {job.error && <p className="commit-notice" role="status">{job.error}</p>}
       {(job.settingsChanged || job.status === 'failed' || tab === 'check' && candidate?.check) && <div className="commit-notice check-settings" role="status"><span>{job.settingsChanged ? 'Checked with previous settings' : 'Check settings are fixed for this review'}</span><button disabled={busy || locked || dirty || !job.plan?.tree} onClick={() => { void execute({ action: 'recheck', id: job.id, revision: job.revision }); }}>Re-check</button></div>}
       {!!findings.length && <div className="commit-secrets" aria-label="Secret findings"><strong>Secret found in the diff · Worker {job.tracks.find(track => track.id === candidate?.blockedCommit?.track)?.label ?? '?'}</strong><p>Keep includes this finding in commit history.</p>{findings.map(finding => <div key={finding.id}><button onClick={() => { setTrackId(candidate?.blockedCommit?.track ?? trackId); setFile(finding.path); setTab(finding.path === 'commit-message.txt' ? 'message' : 'changes'); }}>{finding.path === 'commit-message.txt' ? 'Commit message' : finding.path}:{finding.line}<small>{finding.rule === 'github-pat' ? 'GitHub token' : finding.rule.replaceAll('-', ' ')}</small></button><button disabled={busy || locked || !candidate?.blockedCommit} onClick={() => { if (candidate?.blockedCommit) void askRepair(candidate.blockedCommit.track, { kind: 'removeSecret', finding: finding.id }); }}>Ask to remove</button><button disabled={busy || locked} onClick={() => { void execute({ action: 'keepSecret', id: job.id, revision: job.revision, finding: finding.id }); }}>Keep this finding</button></div>)}</div>}
       {!!job.keptSecrets.length && <p className="commit-notice">{job.keptSecrets.length} secret finding{job.keptSecrets.length === 1 ? '' : 's'} kept in this commit.</p>}
-      {latestRepair && <RepairPanel secretInputs={secretInputs} preview={flows.find(flow => flow.repairRunId === latestRepair.id)?.preview} key={latestRepair.id} run={latestRepair} label={job.tracks.find(item => item.id === latestRepair.track)?.label ?? '?'} changed={reload} />}
+      {latestRepair && <RepairPanel waitingForMemory={!!hostMemory?.waiting.some(entry => entry.owner === latestRepair.id)} secretInputs={secretInputs} preview={flows.find(flow => flow.repairRunId === latestRepair.id)?.preview} key={latestRepair.id} run={latestRepair} label={job.tracks.find(item => item.id === latestRepair.track)?.label ?? '?'} changed={reload} />}
       <div className="commit-tabs" role="tablist" aria-label="Review details">{(['changes', 'message', 'check'] as const).map(value => <button key={value} role="tab" aria-selected={tab === value} onClick={() => setTab(value)}>{value === 'check' ? 'Check' : value === 'message' ? 'Message' : 'Changes'}</button>)}</div>
       <div className="commit-details">
       {job.assumptionsPending > 0 && <p className="commit-notice" role="status">Waiting for assumption reading · {job.assumptionsPending} message{job.assumptionsPending === 1 ? '' : 's'}</p>}
@@ -162,6 +179,7 @@ export default function CommitSheet({ initialRequest, job, effects, repairs, flo
         change={(assumption, text) => { void askRepair(assumption.trackId, { kind: 'assumption', id: assumption.id, revision: assumption.revision, text }); }} />
         {tab === 'changes' && <><div className="commit-files" aria-label="Changed files">{changes.map(change => <button key={change.path} aria-pressed={change.path === file} onClick={() => setFile(change.path)}><span>{change.before ? change.after ? 'M' : 'D' : 'A'}</span>{change.path}</button>)}</div>
           {row?.conflicts.map(conflict => <p className="commit-notice" key={conflict.path}>Conflict · {conflict.path}</p>)}
+          {row?.state === 'conflict' && track && <div className="commit-conflict-actions"><button disabled={busy || locked} onClick={() => { void execute({ action: 'select', id: job.id, revision: job.revision, track: track.id, included: false }); }}>Leave {track.label} out of this commit</button></div>}
           {!changes.length ? <p className="commit-empty">{row?.state === 'conflict' ? 'Exclude this track or resolve its conflict before continuing.' : 'No file changes in this row.'}</p> : diffError ? <p className="commit-error" role="alert">{diffError}</p> : diff ? <>{diff.redacted && <p className="commit-notice">Sensitive text is hidden in this preview.</p>}<Suspense fallback={<p className="commit-empty">Loading diff…</p>}><DiffView value={diff} select={selectedLines} /></Suspense></> : <p className="commit-empty">Loading diff…</p>}
         </>}
         {tab === 'message' && track && <div className="commit-message"><label htmlFor="commit-message-body">Message for Worker {track.label}</label><textarea id="commit-message-body" value={draft?.text ?? job.messages[track.id] ?? track.title} disabled={busy || locked || !track.included} onChange={event => setDrafts(current => ({ ...current, [track.id]: { text: event.target.value, revision: draft?.revision ?? job.revision } }))} />

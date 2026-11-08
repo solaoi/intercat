@@ -14,10 +14,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-use tokio::{
-    sync::{Semaphore, watch},
-    task::JoinSet,
-};
+use tokio::{sync::watch, task::JoinSet};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -456,11 +453,12 @@ impl Runtime {
     // Repair workers share these already-owned daemon services and execution limits.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
+        host_memory: Arc<crate::host_memory::Pool>,
         journal: Journal,
         root: PathBuf,
         data: PathBuf,
         rpc: PathBuf,
-        capacity: Arc<Semaphore>,
+        capacity: Arc<crate::scheduler::Capacity>,
         integration: crate::integration::Service,
         project_secrets: crate::project_secrets::Store,
         paused: Arc<crate::dispatch_control::Gate>,
@@ -553,6 +551,7 @@ impl Runtime {
                     };
                     active.insert(run.id);
                     let task = Task {
+                        host_memory: host_memory.clone(),
                         journal: journal.clone(),
                         root: root.clone(),
                         data: data.clone(),
@@ -640,11 +639,12 @@ async fn stop_preparing(journal: &Journal, op: Uuid, id: Uuid) -> Result<()> {
 }
 
 struct Task {
+    host_memory: Arc<crate::host_memory::Pool>,
     journal: Journal,
     root: PathBuf,
     data: PathBuf,
     rpc: PathBuf,
-    capacity: Arc<Semaphore>,
+    capacity: Arc<crate::scheduler::Capacity>,
     ports: Arc<Mutex<HashMap<Uuid, Port>>>,
     config: crate::runtime::Config,
     shutdown: watch::Receiver<bool>,
@@ -897,6 +897,7 @@ impl Task {
             &mut current,
             &workspace,
             crate::repair_host::Launch {
+                memory: self.host_memory.clone(),
                 worker: &self.config,
                 directory: &self.data.join("repair-hosts").join(run.id.to_string()),
                 rpc: &self.rpc,

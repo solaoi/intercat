@@ -51,3 +51,14 @@ test('assumption observation times convert from stored milliseconds with the res
   expect(track.clips[0].assumptionTimes).toEqual([7]);
   expect(track.clips[0].end).toBe(3);
 });
+
+test('a waiting word names its exact source and its failure in the timeline', async () => {
+  const { liveTimeline } = await import('../src/timeline/state');
+  const status: import('../src/bridge').DaemonStatus = { connected: true, tracks: [{ id: 'B', label: 'B', title: 'Dummy consumer', status: 'done' }],
+    utterances: [{ id: 'wait', text: 'Dummy request', createdAt: 1, state: 'placed', revision: 1, target: { mode: 'lock', trackId: 'B' }, attachments: [], reason: null,
+      decision: { kind: 'schedule', trackId: 'B', boundary: 'after-turn', command: null, confidence: 1, inferenceMs: 0, timedOut: false },
+      startCondition: { source: { kind: 'clip', value: { id: 'clip', ordinal: 14, turn: { trackId: 'A', label: 'A', sessionId: 'source', turnId: 'turn' } } }, candidates: [], ready: false } }] };
+  expect(liveTimeline(status, [])[0].planned[0].after).toBe('after the turn containing A:14');
+  status.utterances![0].startCondition!.detail = 'Dependency did not finish';
+  expect(liveTimeline(status, [])[0].planned[0].after).toBe('held · Dependency did not finish');
+});

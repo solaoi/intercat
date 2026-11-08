@@ -213,13 +213,13 @@ test('heartbeat and a lost acknowledgement preserve the same immediate change', 
   const page = await app.firstWindow(); await page.clock.install();
   await page.locator('.request-select').click();
   const popup = page.getByRole('dialog', { name: 'Request', exact: true });
-  await expect(popup.getByRole('combobox')).toBeEnabled(); await page.clock.runFor(10_100);
+  await expect(popup.getByRole('combobox', { name: 'Edited request destination', exact: true })).toBeEnabled(); await page.clock.runFor(10_100);
   expect((await calls()).some(call => call.kind === 'renew')).toBe(true);
   await page.clock.resume();
   await app.evaluate(() => { (globalThis as typeof globalThis & { editFixture: { loseNext: boolean } }).editFixture.loseNext = true; });
-  await popup.getByRole('combobox').selectOption('B');
+  await popup.getByRole('combobox', { name: 'Edited request destination', exact: true }).selectOption('B');
   await popup.getByRole('button', { name: 'Retry change' }).click();
-  await expect(popup.getByRole('combobox')).toBeEnabled();
+  await expect(popup.getByRole('combobox', { name: 'Edited request destination', exact: true })).toBeEnabled();
   expect(await popup.evaluate(element => element.contains(document.activeElement))).toBe(true);
   const attempts = (await calls()).filter(call => call.kind === 'apply');
   expect(attempts).toHaveLength(2); expect(attempts[0]).toEqual(attempts[1]);
@@ -229,9 +229,9 @@ test('heartbeat and a lost acknowledgement preserve the same immediate change', 
 test('a replaced lease cannot save and its popover can still close with Escape', async () => {
   const page = await app.firstWindow(); await page.locator('.request-select').click();
   const popup = page.getByRole('dialog', { name: 'Request', exact: true });
-  await expect(popup.getByRole('combobox')).toBeEnabled();
+  await expect(popup.getByRole('combobox', { name: 'Edited request destination', exact: true })).toBeEnabled();
   await app.evaluate(() => { (globalThis as typeof globalThis & { editFixture: { reject: boolean } }).editFixture.reject = true; });
-  await popup.getByRole('combobox').selectOption('B');
+  await popup.getByRole('combobox', { name: 'Edited request destination', exact: true }).selectOption('B');
   await expect(popup.getByRole('status')).toContainText('A newer edit owns');
   await page.keyboard.press('Escape'); await expect(popup).not.toBeVisible();
 });
@@ -247,7 +247,7 @@ test('Take back closes the popover and removes the unsent request', async () => 
 test('the popover keeps ordinary region navigation and closes when another control is used', async () => {
   const page = await app.firstWindow(); await page.locator('.request-select').click();
   const popup = page.getByRole('dialog', { name: 'Request', exact: true });
-  await expect(popup.getByRole('combobox')).toBeEnabled();
+  await expect(popup.getByRole('combobox', { name: 'Edited request destination', exact: true })).toBeEnabled();
   await page.keyboard.press('Control+Tab');
   await expect(page.getByRole('complementary', { name: 'Sessions' })).toBeFocused();
   await expect(popup).toBeVisible();
@@ -418,14 +418,16 @@ test('a pasted request keeps its source when editing the one-line instruction an
   expect(finished[0]).toMatchObject({ edit: { kind: 'text', text: 'Explain the pasted material.', sources: [{ attachmentId: id, role: 'reference', after: 'Keep all files unchanged.' }] } });
 });
 
-test('completed go-ahead details show the application result without requesting a worker turn', async () => {
-  await app.evaluate(({ ipcMain }) => {
+for (const target of ['input', 'plan'] as const) test(`completed go-ahead details show the ${target} result without requesting a worker turn`, async () => {
+  await app.evaluate(({ ipcMain }, target) => {
     const fixture = (globalThis as typeof globalThis & { editFixture: { state: DaemonStatus } }).editFixture;
     const word = fixture.state.utterances![0];
     word.text = 'Start waiting work';
     word.state = 'landed';
     word.decision = { kind: 'command', command: 'start-waiting', trackId: 'A', boundary: null, confidence: 1, inferenceMs: 1, timedOut: false };
-    word.startWaiting = { candidates: [{ inputId: 'waiting', revision: 1, text: '待機していた依頼', label: 'A', available: false }], started: { inputId: 'waiting', revision: 2 } };
+    word.startWaiting = target === 'plan'
+      ? { candidates: [{ kind: 'plan', planId: 'waiting-plan', revision: 1, text: '待機していた計画', label: null, available: false, reason: 'Already started' }], started: { kind: 'plan', planId: 'waiting-plan', revision: 2 } }
+      : { candidates: [{ kind: 'input', inputId: 'waiting', revision: 1, text: '待機していた依頼', label: 'A', available: false, reason: 'Already started' }], started: { kind: 'input', inputId: 'waiting', revision: 2 } };
     fixture.state.sequence = (fixture.state.sequence ?? 0) + 1;
     const now = Date.now();
     fixture.state.timeline = { clock: { epochMs: now, monoMs: 0, timelineMs: now, bootId: 'fixture' }, summaries: [] };
@@ -436,14 +438,14 @@ test('completed go-ahead details show the application result without requesting 
     }], removed: [], removedMarks: [] }));
     ipcMain.removeHandler('intercat:utterance-read');
     ipcMain.handle('intercat:utterance-read', () => word);
-  });
+  }, target);
   const page = await app.firstWindow();
   await page.reload();
   await page.getByLabel('Timeline requests', { exact: true }).getByRole('button').click();
   const popup = page.getByRole('dialog', { name: 'Request', exact: true });
   await expect(popup).toContainText('Application command · start-waiting');
-  await expect(popup).toContainText('Start requested · Worker A');
-  await expect(popup).toContainText('待機していた依頼');
+  await expect(popup).toContainText(target === 'input' ? 'Start requested · Worker A' : 'Start requested');
+  await expect(popup).toContainText(target === 'input' ? '待機していた依頼' : '待機していた計画');
   await expect(popup.getByRole('status')).toHaveText('Application command completed.');
   await expect(popup.locator('.request-turn')).toHaveCount(0);
 });

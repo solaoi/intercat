@@ -1818,11 +1818,12 @@ server=ThreadingHTTPServer(('127.0.0.1',0),Handler);print(json.dumps({'host':'12
     let rpc = data.join("rpc");
     fs::create_dir(&rpc)?;
     let runtime = intercat_daemon::runtime::Runtime::start(
+        intercat_daemon::host_memory::Pool::new(),
         data.clone(),
         rpc,
         journal.clone(),
         editor.clone(),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(1)),
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
     );
     let result = tokio::time::timeout(std::time::Duration::from_secs(180), async {

@@ -19,7 +19,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
 enum Input {
@@ -186,8 +186,8 @@ pub struct Runner {
     receiver: mpsc::UnboundedReceiver<Input>,
     submitted: Option<Uuid>,
     quiesced: Option<Uuid>,
-    // Retain the model slot until session release and host cleanup complete.
-    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    // An uncertain start keeps its slot until host cleanup confirms the end.
+    permit: Option<crate::scheduler::Permit>,
     policies: tokio::task::JoinSet<Result<PreparedApproval>>,
 }
 struct PreparedApproval {
@@ -197,7 +197,7 @@ struct PreparedApproval {
 }
 pub struct Task {
     pub instruction: String,
-    pub capacity: Arc<Semaphore>,
+    pub capacity: Arc<crate::scheduler::Capacity>,
     pub shutdown: watch::Receiver<bool>,
     pub project_secrets: crate::project_secrets::Store,
 }
@@ -239,7 +239,7 @@ fn channel_on(run: &Run, client: Client) -> Result<(Port, Runner)> {
             receiver,
             submitted: None,
             quiesced: None,
-            _permit: None,
+            permit: None,
             policies: tokio::task::JoinSet::new(),
         },
     ))
@@ -555,7 +555,10 @@ impl Runner {
             session: &delivery_session,
             scanner: Some(scanner),
         });
-        let permit = task.capacity.acquire_owned();
+        let permit = task
+            .capacity
+            .request(run.id.to_string(), crate::scheduler::Priority::User)
+            .acquire();
         tokio::pin!(permit);
         let permit = loop {
             tokio::select! {
@@ -566,10 +569,10 @@ impl Runner {
                     Some(Input::Answer{reply,..})|Some(Input::Respond{reply,..})|Some(Input::Secret{reply,..})=>{let _=reply.send(Err("The repair turn has not started.".into()));},
                     None=>return Err("Repair controls closed.".into()),
                 },
-                permit=&mut permit=>break permit?,
+                permit=&mut permit=>break permit,
             }
         };
-        self._permit = Some(permit);
+        self.permit = Some(permit);
         if *task.shutdown.borrow() || self.port.stopped.load(Ordering::Acquire) {
             stop(journal, run, &self.port, Uuid::now_v7()).await?;
             return Ok(Outcome::Stopped);
@@ -615,6 +618,14 @@ impl Runner {
             let _ = started_tx.send(client.start(prepared, guard).await);
         });
         let mut starting = true;
+        let mut queued: Option<(
+            crate::start_queue::QueuedStart,
+            crate::msp::PendingRequest,
+            std::time::Instant,
+        )> = None;
+        let mut early_started = None;
+        let mut early_unqueued = None;
+        let mut admitted_turn = None;
         let mut terminals = HashMap::new();
         let mut messages = HashMap::new();
         let mut final_reports = HashSet::new();
@@ -659,6 +670,7 @@ impl Runner {
                     return Err("The repair ended without a final report.".into());
                 }
                 self.quiesced = quiescing.map(|(id,_)|id);
+                self.permit = None;
                 return Ok(
                     if self.port.stopped.load(Ordering::Acquire)
                         || terminal != "completed"
@@ -762,13 +774,38 @@ impl Runner {
                 },
                 started=&mut started_rx,if starting=>{
                     starting=false;
-                    let result=started??;
+                    let result=started?;
+                    if result.as_ref().is_err_and(|error|error.is::<crate::msp::StartCancelled>() || crate::msp::rejected_start_code(error.as_ref()).is_some()) {
+                        journal.finish(&command.to_string(),"superseded").await?;
+                        self.submitted=None;self.permit=None;
+                        run.output=Some("The repair request could not start. Review it and try again.".into());
+                        present(journal,run,&self.port,&prompts).await?;
+                        return Ok(Outcome::Stopped);
+                    }
+                    let result=result?;
                     let turn:Uuid=result["turnId"].as_str().ok_or("Missing repair turn ID.")?.parse()?;
-                    if result["disposition"]!="started" {let _=self.port.client.interrupt_now(&self.port.session,Some(turn));let _=self.port.client.request("turn/unqueue",json!({"commandId":Uuid::now_v7(),"sessionId":self.port.session,"turnId":turn})).await;return Err("The repair turn was queued; it was reclaimed without replay.".into());}
-                    update(journal,run,Event::Started{command,turn}).await?;
-                    if let Some(message)=messages.remove(&turn) {run.output=Some(message);present(journal,run,&self.port,&prompts).await?;}
-                    journal.finish(&command.to_string(),"dispatched").await?;
-                    if self.port.stopped.load(Ordering::Acquire){self.port.interrupt();if quiescing.is_none(){return Ok(Outcome::Stopped);}}
+                    if result["commandId"]!=command.to_string() {return Err("The repair start reply names another request.".into());}
+                    match result["disposition"].as_str() {
+                        Some("queued")=>{
+                            let cancel=Uuid::new_v5(&command,b"unqueue-before-launch");
+                            let params=json!({"commandId":cancel,"sessionId":self.port.session,"turnId":turn});
+                            let wire=self.port.client.query("turn/unqueue",params.clone()).await?;
+                            let mut facts=crate::start_queue::QueuedStart::new(self.port.session.clone(),command,turn,cancel);
+                            if let Some(event)=&early_started {facts.observe("turn/started",event)?;}
+                            if let Some(event)=&early_unqueued {facts.observe("turn/unqueued",event)?;}
+                            if terminals.contains_key(&turn) {facts.observe("turn/completed",&json!({"sessionId":self.port.session,"turnId":turn}))?;}
+                            journal.finish(&command.to_string(),"dispatched").await?;
+                            let mut intent=params;intent["reclaimedStart"]=json!(command);
+                            journal.intent(&cancel.to_string(),"turn.unqueue",intent).await?;
+                            facts.logged();
+                            queued=Some((facts,wire,std::time::Instant::now()));
+                        },
+                        Some("started"|"steered")=>{
+                            if result["disposition"]=="steered" {journal.append("repair.startSteered",json!({"runId":run.id,"commandId":command,"turnId":turn})).await?;}
+                            admitted_turn=Some(turn);
+                        },
+                        _=>return Err("The repair start outcome is unknown. Reconcile before continuing.".into()),
+                    }
                 },
                 prepared=self.policies.join_next(),if !self.policies.is_empty()=>{
                     let PreparedApproval {request,verdict,deletion}=prepared.ok_or("Missing repair policy task.")???;
@@ -795,6 +832,7 @@ impl Runner {
                     if current.phase==Phase::Stopping {self.port.interrupt();*run=current;return Ok(Outcome::Stopped);}
                 },
                 _=timer.tick()=>{
+                    if queued.as_ref().is_some_and(|(_,_,began)|began.elapsed()>Duration::from_secs(30)) {return Err("The repair reclaim outcome is unknown. Recovery is required.".into());}
                     if quiescing.is_some_and(|(_,began)|began.elapsed()>Duration::from_secs(30)) {return Err("The repair did not confirm its stop. Re-enter the secret after recovery.".into());}
                     let tracker=io.tracker.clone();tokio::task::spawn_blocking(move||tracker.lock().unwrap().refresh()).await??;
                 },
@@ -806,6 +844,17 @@ impl Runner {
                     let display=match received.recorded_display.as_deref() {Some(display)=>display.clone(),None=>crate::recording::redact(scanner,frame.clone()).await?};
                     self.port.client.scanned_progress(&display);
                     journal.try_msp(run.track.clone(),self.port.session.clone(),received.stamp,display,Some(received.lease), received.source)?.await??;
+                    if params["sessionId"]==self.port.session && params["commandId"]==command.to_string() {
+                        match frame["method"].as_str() {
+                            Some("turn/started")=>early_started=Some(params.clone()),
+                            Some("turn/unqueued")=>early_unqueued=Some(params.clone()),
+                            _=>{},
+                        }
+                    }
+                    if let Some((facts,wire,_))=queued.as_mut() {
+                        if frame.get("method").is_none() && frame["id"].as_u64()==Some(wire.id) {facts.reply(&frame)?;}
+                        else if let Some(method)=frame["method"].as_str() {facts.observe(method,params)?;}
+                    }
                     if params["sessionId"] == self.port.session && frame["method"] == "view/gap" {
                         let head=params["next"].as_str().ok_or("Repair delivery gap has no next cursor.")?;
                         inbox.flush(io.connection).await?;
@@ -821,7 +870,7 @@ impl Runner {
                             let turn:Uuid=params["turnId"].as_str().ok_or("Missing completed repair turn.")?.parse()?; terminals.insert(turn,params["terminal"].as_str().unwrap_or("unknown").to_owned());
                         },
                         Some("item/completed") if params["item"]["kind"]=="agentMessage"=>{
-                            if let (Some(turn),Some(text))=(params["item"]["turnId"].as_str(),params["item"]["text"].as_str()) {let turn:Uuid=turn.parse()?;if params["item"]["messagePhase"]=="finalAnswer" {final_reports.insert(turn);}let text=safe(scanner,text).await?;if run.turn==Some(turn){run.output=Some(text);present(journal,run,&self.port,&prompts).await?;}else if starting {messages.insert(turn,text);}}
+                            if let (Some(turn),Some(text))=(params["item"]["turnId"].as_str(),params["item"]["text"].as_str()) {let turn:Uuid=turn.parse()?;if params["item"]["messagePhase"]=="finalAnswer" {final_reports.insert(turn);}let text=safe(scanner,text).await?;if run.turn==Some(turn){run.output=Some(text);present(journal,run,&self.port,&prompts).await?;}else if starting || queued.is_some() {messages.insert(turn,text);}}
                         },
                         Some("approval/request"|"approval/requested"|"approval/updated"|"approval/resolved")=>{
                             if let Some(request)=approval_stages.observe(frame["method"].as_str().unwrap(),params)? {approval_queue.push_back(request);}
@@ -848,6 +897,31 @@ impl Runner {
                         _=>{},
                     }
                 },
+            }
+            if let Some(outcome)=queued.as_ref().map(|(facts,_,_)|facts.outcome()).transpose()?.flatten() {
+                let (facts,_,_)=queued.take().unwrap();
+                match outcome {
+                    crate::start_queue::Outcome::Reclaimed=>{
+                        journal.finish(&facts.command.to_string(),"dispatched").await?;
+                        journal.finish(&facts.command.to_string(),"complete").await?;
+                        journal.finish(&command.to_string(),"complete").await?;
+                        self.submitted=None;self.permit=None;
+                        run.output=Some("The repair request was held before it started.".into());
+                        present(journal,run,&self.port,&prompts).await?;
+                        return Ok(Outcome::Stopped);
+                    },
+                    crate::start_queue::Outcome::Running=>{
+                        journal.finish(&facts.command.to_string(),"superseded").await?;
+                        admitted_turn=Some(facts.turn);
+                    },
+                }
+            }
+            if let Some(turn)=admitted_turn.take() {
+                if let Some(permit)=self.permit.as_mut() {permit.bind_turn(&run.id.to_string(),turn)?;}
+                update(journal,run,Event::Started{command,turn}).await?;
+                if let Some(message)=messages.remove(&turn) {run.output=Some(message);present(journal,run,&self.port,&prompts).await?;}
+                journal.finish(&command.to_string(),"dispatched").await?;
+                if self.port.stopped.load(Ordering::Acquire){self.port.interrupt();if quiescing.is_none(){return Ok(Outcome::Stopped);}}
             }
         }
         }.await;

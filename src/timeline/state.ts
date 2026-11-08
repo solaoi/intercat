@@ -1,3 +1,7 @@
+import { waitingForMemory } from '../scheduling';
+import { waitSourceLabel } from '../waitSource';
+import { queuedTracks } from '../scheduling';
+import { addPlans } from '../plans/timeline';
 import type { DaemonStatus, TimelineClip } from '../bridge';
 import type { Track, Clip, RepairLane } from './model';
 
@@ -23,14 +27,16 @@ function groupClips(source: TimelineClip[]): Map<string, Clips> {
 }
 const EMPTY_CLIPS: Clip[] = [];
 export function liveTimeline(status: DaemonStatus, source: TimelineClip[]): Track[] {
+  const queued = queuedTracks(status);
   const colors = [0x819af5, 0x70b8ab, 0xb497cf, 0xd3ac72];
   const clips = groupClips(source);
   const workers = new Map(status.workers?.map(worker => [worker.trackId, worker]));
   const ready = new Set(status.workspaces?.filter(workspace => workspace.state === 'ready').map(workspace => workspace.trackId));
   const runs = Map.groupBy(status.repairRuns ?? [], run => run.track);
-  const words = Map.groupBy(status.utterances?.filter(word => word.state === 'placed') ?? [], word => word.decision?.trackId);
+  const words = Map.groupBy(status.utterances?.filter(word => (word.state === 'placed' || word.state === 'held' && word.reviewFix && word.reviewFixRunnable) && (!word.planItemId || word.planContinuation)) ?? [], word => word.decision?.trackId);
   const questions = Map.groupBy(status.reportQuestions ?? [], question => question.trackId);
-  return (status.tracks ?? []).map((track, index) => {
+  const plannedTracks = new Set(status.plans?.flatMap(plan => plan.items.filter(item => item.state === 'planned' || item.state === 'editing').map(item => item.trackRef)) ?? []);
+  const tracks = addPlans((status.tracks ?? []).filter(track => track.status !== 'planned' || plannedTracks.has(track.id) || workers.has(track.id) || clips.has(track.id) || words.has(track.id) || runs.has(track.id)).map((track, index) => {
     const group = clips.get(track.id);
     const repairRuns = runs.get(track.id) ?? [];
     const worker = workers.get(track.id);
@@ -46,11 +52,24 @@ export function liveTimeline(status: DaemonStatus, source: TimelineClip[]): Trac
     return {
       id: track.id, label: track.label, title: track.title,
       completion: track.completion,
-      folder: status.project ? `${status.project.name}${ready.has(track.id) ? '' : ' · preparing'}` : 'awaiting project',
-      status: working ? 'working' : waitingForAnswer.length ? 'stopped' : track.status === 'done' ? 'done' : track.status === 'stopped' ? 'stopped' : 'waiting', color: colors[index % colors.length],
+      waitingForMemory: waitingForMemory(status, track.id),
+      queuePosition: worker?.activeTurn ? undefined : queued.get(track.id),
+      folder: status.project ? `${status.project.folders.find(folder => folder.id === status.trackFolders?.[track.id])?.name ?? 'Choose a folder'}${ready.has(track.id) ? '' : ' · preparing'}` : 'awaiting project',
+      status: working ? 'working' : queued.has(track.id) ? 'waiting' : waitingForAnswer.length ? 'stopped' : track.status === 'done' ? 'done' : track.status === 'stopped' ? 'stopped' : 'waiting', color: colors[index % colors.length],
       nextWaitsForAnswer: working && !!worker?.activeTurn && waitingForAnswer.some(question => question.askedBeforeLastMessage),
       clips: group?.work ?? EMPTY_CLIPS, repairs,
-      planned: (words.get(track.id) ?? []).map(word => ({ id: word.id, label: word.text, after: word.decision?.boundary === 'when-told' ? 'when you say start' : word.decision?.boundary === 'after-turn' || workers.get(track.id)?.activeTurn ? 'after this turn' : 'ready · waiting for worker' })),
+      planned: (words.get(track.id) ?? []).toSorted((a,b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)).map(word => ({ id: word.id, reviewFix: !!word.reviewFix, label: word.reviewFix ? `fix: ${word.reviewFix.path}` : word.planContinuation ? `About ${word.planContinuation.title}` : word.text, after: word.state === 'held' ? 'held · Start' : word.startCondition?.source && !word.startCondition.ready ? word.startCondition.detail ? `held · ${word.startCondition.detail}` : `after ${waitSourceLabel(word.startCondition.source)}` : word.decision?.boundary === 'when-told' ? 'when you say start' : word.decision?.boundary === 'after-turn' || workers.get(track.id)?.activeTurn ? 'after this turn' : waitingForMemory(status, track.id) ? 'queued · waiting for memory' : 'ready · waiting for worker' })),
     };
-  });
+  }), status);
+  const reviewer=status.reviewerLane;
+  if(reviewer) {
+    const ends:number[]=[];
+    const reviews=(clips.get(reviewer.id)?.work ?? []).toSorted((a,b)=>a.start-b.start || a.id.localeCompare(b.id)).map(clip=>{
+      let row=ends.findIndex(end=>end<=clip.start);if(row<0)row=ends.length;
+      ends[row]=clip.running ? Infinity : clip.end;
+      return {...clip,reviewOffset:row*40};
+    });
+    tracks.push({id:reviewer.id,reviewer:true,reviewJobs:reviewer.jobs,reviewRows:Math.max(1,ends.length),label:reviewer.label,title:reviewer.title,folder:reviewer.queued ? `Read only · ${reviewer.queued} waiting` : 'Read only',status:reviewer.status,color:0xb497cf,clips:reviews,planned:[],repairs:[]});
+  }
+  return tracks;
 }

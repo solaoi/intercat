@@ -128,6 +128,38 @@ fn validate(book: &Book) -> Result<()> {
         }
         let valid_context = match entry.context["kind"].as_str() {
             Some("work") => true,
+            Some("plan-reply") => {
+                let context = &entry.context;
+                ["planId", "questionId"].iter().all(|key| {
+                    context[key]
+                        .as_str()
+                        .is_some_and(|value| Uuid::parse_str(value).is_ok())
+                }) && context["revision"]
+                    .as_u64()
+                    .is_some_and(|revision| revision > 0)
+                    && context["question"]
+                        .as_str()
+                        .is_some_and(|text| text.len() <= 8192)
+                    && context["label"].is_string()
+                    && entry.text.len() <= 32 * 1024
+                    && matches!(entry.target, Target::None)
+                    && entry.attachments.is_empty()
+                    && entry.sources.as_ref().is_none_or(Vec::is_empty)
+            }
+            Some("continuation") => {
+                let context = &entry.context;
+                ["planId", "itemId", "trackId"].iter().all(|key| {
+                    context[key]
+                        .as_str()
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                }) && context["revision"]
+                    .as_u64()
+                    .is_some_and(|revision| revision > 0)
+                    && context["title"].is_string()
+                    && serde_json::to_value(&entry.target).is_ok_and(|target| {
+                        target["mode"] == "lock" && target["trackId"] == context["trackId"]
+                    })
+            }
             Some("reply") => {
                 entry.context["question"]["id"].is_string()
                     && entry.context["question"]["trackId"].is_string()
@@ -166,6 +198,20 @@ fn validate(book: &Book) -> Result<()> {
                     && entry.attachments.is_empty()
                     && entry.sources.is_none()
             }
+            Some("plan-item") => {
+                let context = &entry.context;
+                ["planId", "itemId", "token"].iter().all(|key| {
+                    context[key]
+                        .as_str()
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                }) && context["title"].is_string()
+                    && context["revision"]
+                        .as_u64()
+                        .is_some_and(|revision| revision > 0)
+                    && entry.text.len() <= 32 * 1024
+                    && entry.attachments.is_empty()
+                    && entry.sources.is_none()
+            }
             Some("edit") => {
                 let context = &entry.context;
                 context["inputId"].is_string()
@@ -191,6 +237,47 @@ fn validate(book: &Book) -> Result<()> {
         };
         if !valid_context
             || entry.pending.as_ref().is_some_and(|pending| {
+                if entry.context["kind"] == "plan-reply" {
+                    let request = &pending["request"];
+                    if pending["kind"] != "plan-reply"
+                        || request["text"] != entry.text
+                        || ["planId", "questionId", "revision", "question"]
+                            .iter()
+                            .any(|key| request[key] != entry.context[key])
+                    {
+                        return true;
+                    }
+                } else if pending["kind"] == "plan-reply" {
+                    return true;
+                }
+                if entry.context["kind"] == "continuation" {
+                    let request = &pending["request"];
+                    if pending["kind"] != "work"
+                        || request["text"] != entry.text
+                        || ["planId", "itemId", "revision"]
+                            .iter()
+                            .any(|key| request["planItem"][key] != entry.context[key])
+                        || request["target"]["mode"] != "lock"
+                        || request["target"]["trackId"] != entry.context["trackId"]
+                        || request["executeAllowed"] == false
+                    {
+                        return true;
+                    }
+                } else if pending["request"]["planItem"].is_object() {
+                    return true;
+                }
+                if pending["kind"] == "plan-item" {
+                    let request = &pending["request"];
+                    if entry.context["kind"] != "plan-item"
+                        || request["kind"] != "submit"
+                        || request["text"] != entry.text
+                        || ["planId", "token", "revision"]
+                            .iter()
+                            .any(|key| request[key] != entry.context[key])
+                    {
+                        return true;
+                    }
+                }
                 if pending["kind"] == "rephrase" {
                     let request = &pending["request"];
                     if entry.context["kind"] != "rephrase"
@@ -222,7 +309,15 @@ fn validate(book: &Book) -> Result<()> {
                 } else {
                     if !matches!(
                         pending["kind"].as_str(),
-                        Some("work" | "repair" | "commit" | "approval" | "rephrase")
+                        Some(
+                            "work"
+                                | "repair"
+                                | "commit"
+                                | "approval"
+                                | "rephrase"
+                                | "plan-item"
+                                | "plan-reply"
+                        )
                     ) {
                         return true;
                     }

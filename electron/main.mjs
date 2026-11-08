@@ -14,6 +14,7 @@ import { quitController } from './quit.mjs';
 import { draftStore } from './drafts.mjs';
 import { pastedTextStore } from './pasted-text.mjs';
 import { editorPresentation } from './editor-presentation.mjs';
+import { commandPlan, observePlans, planWindowFocused, replyPlan } from './plans.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const assets = path.join(root, 'dist');
@@ -49,18 +50,23 @@ function authorize(event) {
 }
 const windowOwners = new Map();
 const viewRevisions = new Map();
+const planObservations = new Map();
 async function disconnectWindow(contents) {
   const owner = windowOwners.get(contents.id);
   if (!owner) return;
   windowOwners.delete(contents.id);
   const revision = (viewRevisions.get(owner) ?? 0) + 1;
   viewRevisions.delete(owner);
+  const planSequence = (planObservations.get(owner) ?? 0) + 1;
+  planObservations.delete(owner);
   try {
     const client = daemon ? await daemon : null;
     if (!client) return;
     await Promise.allSettled([
       client.request('utterance.edit', { owner, action: { kind: 'disconnect' } }),
+      client.request('plan.edit', { owner, action: { kind: 'disconnect' } }),
       client.request('timeline.observe', { owner, revision, view: null }),
+      client.request('plan.observe', { owner, sequence: planSequence, idle: false, plans: [] }),
     ]);
   }
   catch { /* Observations expire, and interrupted edits become held. */ }
@@ -266,6 +272,57 @@ ipcMain.handle('intercat:worker-secret', async (event, request) => {
 ipcMain.handle('intercat:operation-id', event => { authorize(event); return operationId(); });
 ipcMain.handle('intercat:project-secret-usage', async event => { authorize(event); return preview ? [] : (await connection()).request('secret.project.usage', {}); });
 ipcMain.handle('intercat:project-secret-settings', async event => { authorize(event); return projectSecretSettings(await connection()); });
+ipcMain.handle('intercat:execution-limits', async event => {
+  authorize(event);
+  if (preview) return { revision: 0, parallelWorkers: 4, plannerReviewerTurns: 2 };
+  return (await connection()).request('execution-limits.get', {});
+});
+ipcMain.handle('intercat:plan-reply', async (event, request) => {
+  authorize(event);
+  if (preview) throw new Error('Plan replies are unavailable in preview.');
+  return replyPlan(connection, request);
+});
+ipcMain.handle('intercat:plan-command', async (event, request) => {
+  authorize(event);
+  if (preview) throw new Error('Plans are unavailable in preview.');
+  return commandPlan(connection, request);
+});
+ipcMain.handle('intercat:review-stop', async (event, request) => { authorize(event); if (preview) throw new Error('Reviews are unavailable in preview.'); return (await connection()).request('review.stop', request); });
+ipcMain.handle('intercat:review-retry', async (event, request) => {
+  authorize(event);
+  if (preview) throw new Error('Reviews are unavailable in preview.');
+  return (await connection()).request('review.retry', request);
+});
+ipcMain.handle('intercat:review-fix', async (event, request) => {
+  authorize(event);
+  if (preview) throw new Error('Review fixes are unavailable in preview.');
+  return (await connection()).request('review.fix', request);
+});
+ipcMain.handle('intercat:plans-start-get', async event => {
+  authorize(event);
+  return preview ? { revision: 0, mode: 'manual' } : (await connection()).request('plans-start.get', {});
+});
+ipcMain.handle('intercat:plans-start-change', async (event, request) => {
+  authorize(event);
+  if (preview) throw new Error('Plans start is unavailable in preview.');
+  return (await connection()).request('plans-start.change', request);
+});
+ipcMain.handle('intercat:plan-observe', async (event, request) => {
+  authorize(event);
+  if (preview) return { countdowns: [], started: [] };
+  const owner = windowOwner(event.sender);
+  const sequence = (planObservations.get(owner) ?? 0) + 1;
+  planObservations.set(owner, sequence);
+  return observePlans(connection, request, { owner, sequence, focused: () => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return planWindowFocused(win, event.sender, windowOwners.get(event.sender.id), owner);
+  } });
+});
+ipcMain.handle('intercat:execution-limits-change', async (event, request) => {
+  authorize(event);
+  if (preview) return { revision: request.revision + 1, parallelWorkers: request.parallelWorkers, plannerReviewerTurns: request.plannerReviewerTurns };
+  return (await connection()).request('execution-limits.change', request);
+});
 ipcMain.handle('intercat:check-environment', async event => {
   authorize(event);
   if (preview) return { selection: { revision: 0, file: null }, candidates: [], available: false };
@@ -393,15 +450,16 @@ ipcMain.handle('intercat:editor-install', async event => {
 ipcMain.handle('intercat:editor-retry', async (event, opId) => { authorize(event); if (preview) throw new Error('Editor control is unavailable in preview.'); return (await connection()).request('editor.retry', { opId }); });
 ipcMain.handle('intercat:editor-download', async (event, opId) => { authorize(event); if (preview) throw new Error('Editor control is unavailable in preview.'); return (await connection()).request('editor.download', { opId }); });
 ipcMain.handle('intercat:editor-pause', async event => { authorize(event); if (preview) throw new Error('Editor control is unavailable in preview.'); return (await connection()).request('editor.pauseDownload', {}); });
+ipcMain.handle('intercat:folder-assign', async (event, request) => { authorize(event); if (preview) throw new Error('Folder selection is unavailable in preview.'); return (await connection()).request('folder.assign', request); });
 ipcMain.handle('intercat:project-setup', async event => {
   authorize(event);
   if (preview) return { project: null };
   const window = BrowserWindow.fromWebContents(event.sender);
-  const selected = await dialog.showOpenDialog(window, { title: 'Choose a clean project root folder', properties: ['openDirectory'] });
+  const selected = await dialog.showOpenDialog(window, { title: 'Choose project folders (up to 8)', properties: ['openDirectory', 'multiSelections'] });
   if (selected.canceled) return { project: null };
   try {
     const client = await connection();
-    const project = await client.request('project.configure', { opId: operationId(), path: selected.filePaths[0] });
+    const project = await client.request('project.configure', { opId: operationId(), name: path.basename(selected.filePaths[0]), paths: selected.filePaths });
     await synchronizeProjectSecrets(client, operationId());
     return { project };
   } catch (error) { return { project: null, error: error.message }; }
@@ -420,6 +478,16 @@ ipcMain.handle('intercat:worker-retry', async (event, request) => {
   authorize(event);
   if (preview || !request || Object.keys(request).sort().join(',') !== 'opId,trackId' || typeof request.trackId !== 'string' || typeof request.opId !== 'string') throw new Error('Invalid request');
   return (await connection()).request('worker.retry', request);
+});
+ipcMain.handle('intercat:inheritance-finish', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'applicationId,opId,trackId' || !['applicationId','opId','trackId'].every(key => typeof request[key] === 'string')) throw new Error('Invalid request');
+  return (await connection()).request('inheritance.finish', request);
+});
+ipcMain.handle('intercat:inheritance-issue', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'action,issueId,opId' || typeof request.issueId !== 'string' || typeof request.opId !== 'string' || !['keep','stop'].includes(request.action)) throw new Error('Invalid request');
+  return (await connection()).request('inheritance.issue', request);
 });
 for (const action of ['start', 'stop', 'hold', 'answer', 'respond']) {
   ipcMain.handle(`intercat:worker-${action}`, async (event, request) => {
@@ -489,7 +557,11 @@ ipcMain.handle('intercat:paste-list', async (event, request) => {
 });
 ipcMain.handle('intercat:stage', async (event, request) => {
   authorize(event);
-  const keys = request && Object.keys(request).filter(key => key !== 'sources').sort().join(',');
+  const keys = request && Object.keys(request).filter(key => !['sources', 'executeAllowed', 'planItem'].includes(key)).sort().join(',');
+  if (request?.executeAllowed !== undefined && typeof request.executeAllowed !== 'boolean') throw new Error('Invalid execution permission');
+  if (request?.planItem !== undefined && (!request.planItem || Object.keys(request.planItem).sort().join(',') !== 'itemId,planId,revision'
+    || ![request.planItem.planId, request.planItem.itemId].every(id => typeof id === 'string' && /^[a-f0-9-]{36}$/.test(id))
+    || !Number.isSafeInteger(request.planItem.revision) || request.planItem.revision < 1)) throw new Error('Invalid plan item context');
   if (preview || !request || keys !== 'attachmentIds,opId,selectedTrackId,target,text' || (request.sources !== undefined && (!Array.isArray(request.sources) || request.sources.length > 128)) || !Array.isArray(request.attachmentIds) || request.attachmentIds.length > 128 || request.attachmentIds.some(id => typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) || typeof request.text !== 'string' || (!request.text.trim() && !request.sources?.length) || Buffer.byteLength(request.text) > 32 * 1024 || typeof request.opId !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(request.opId)) throw new Error('Invalid request');
   return (await connection()).request('utterance.create', request);
 });
@@ -523,6 +595,15 @@ ipcMain.handle('intercat:resolve', async (event, request) => {
   authorize(event);
   if (preview || !request || Object.keys(request).sort().join(',') !== 'opId,resolution,revision,utteranceId' || typeof request.utteranceId !== 'string' || request.utteranceId.length > 64 || !Number.isSafeInteger(request.revision) || request.revision < 1) throw new Error('Invalid request');
   return (await connection()).request('utterance.resolve', request);
+});
+ipcMain.handle('intercat:plan-edit', async (event, action) => {
+  authorize(event);
+  if (preview || !action || !['begin', 'renew', 'cancel', 'submit', 'apply', 'retry', 'dependencies'].includes(action.kind)) throw new Error('Invalid plan edit');
+  const contents = event.sender;
+  const owner = windowOwner(contents);
+  const client = await connection();
+  if (contents.isDestroyed() || windowOwners.get(contents.id) !== owner) throw new Error('The editing window closed.');
+  return client.request('plan.edit', { owner, action });
 });
 ipcMain.handle('intercat:edit-request', async (event, action) => {
   authorize(event);

@@ -1,3 +1,11 @@
+import { folderChoiceCards } from './desk/FolderChoice';
+import { reviewFixCards } from './desk/ReviewConflict';
+import { queuedTracks } from './scheduling';
+import { Plans } from './plans/Plans';
+import { ContinuationContext } from './plans/ContinuationContext';
+import type { Plan, PlanRequest } from './plans/types';
+import { usePlanStart } from './plans/usePlanStart';
+import { PlanOnlyButton } from './plans/PlanOnlyButton';
 import { PrivacyEnabled, PrivacySummary, PrivacyText, PrivacyRevision, privacyLabel, usePrivacyLabels, usePrivacyText } from './desk/PrivacyText';
 import { ApprovalDraftStore, ApprovalReplyRecovery } from './desk/ApprovalDrafts';
 import { StageDivider, type DeskLayout } from './desk/StageDivider';
@@ -15,7 +23,7 @@ import '@fontsource/jetbrains-mono/400.css';
 import './style.css';
 import { Timeline } from './timeline/Timeline';
 import { advanceView, cutPlannedTurn, initialView, sampleTracks, type Clip, type Track } from './timeline/model';
-import type { Approval, WorkerState, DaemonStatus, InputResolution, Utterance, ReportQuestion, ReportAnswer, Attachment } from './bridge';
+import type { Approval, WorkerState, DaemonStatus, InputResolution, Utterance, ReportQuestion, ReportAnswer, Attachment, PlanDependencyLocation } from './bridge';
 import { liveTimeline } from './timeline/state';
 import { useTimelineWindow, type TimelineBounds } from './timeline/useWindow';
 import { useTimelineObservation } from './timeline/useObservation';
@@ -26,13 +34,16 @@ import type { AttentionCard } from './desk/NeedsYou';
 import { useDrafts, type DraftEntry, type DraftSubmission, type EditLease } from './desk/drafts';
 import { RequestEditor } from './desk/RequestEditor';
 import { useDraftEditing } from './desk/useDraftEditing';
+import { usePlanEditing } from './plans/usePlanEditing';
 import { useTimelineHistory } from './desk/useTimelineHistory';
 import { HistoryControls } from './desk/HistoryControls';
 import { PastedSources } from './desk/PastedSources';
 import { Workers, workerCards } from './desk/Workers';
+import { inheritanceIssueCards } from './desk/InheritanceIssue';
 import { WorkerModel } from './desk/WorkerModel';
 import { DispatchControls } from './desk/DispatchControls';
 import { assumptionCards } from './desk/AssumptionCard';
+import { planAssumptionCards } from './plans/PlanAssumptions';
 import { proposalCards } from './desk/ProposalCard';
 import { ReportProgress, reportCards } from './desk/ReportQuestions';
 import { EditorLine } from './desk/EditorLine';
@@ -47,6 +58,7 @@ const Diagnostics = lazy(() => import('./preview/Diagnostics'));
 const DocumentPreview = lazy(() => import('./preview/DocumentPreview'));
 const StepInspector = lazy(() => import('./timeline/StepInspector'));
 const CommitSheet = lazy(() => import('./commit/CommitSheet'));
+const isPlanStatus = (text: string) => /^(starts in [1-5] s|held|editing|queued|waiting for your go)$/.test(text);
 
 function App() {
   const [previewTracks, setPreviewTracks] = useState(sampleTracks);
@@ -71,6 +83,10 @@ function App() {
   const [commitRequest, setCommitRequest] = useState<import('./commit/types').IntegrationRequest | undefined>();
   const [clip, setClip] = useState<{ track: Track; clip: Clip; repairRunId: string | null } | null>(null);
   const [status, setStatus] = useState<DaemonStatus>({ connected: false });
+  const updatePlan = useCallback((plan: Plan) => setStatus(current => ({ ...current, plans: current.plans?.map(old => old.id === plan.id && plan.rev >= old.rev ? plan : old) })), []);
+  const [planRequest, setPlanRequest] = useState<PlanRequest | null>(null);
+  const [selectedPlanItem, setSelectedPlanItem] = useState<string | null>(null);
+  const [focusPlanItem, setFocusPlanItem] = useState<{ id: string; nonce: number } | null>(null);
   const [timelineBounds, setTimelineBounds] = useState<TimelineBounds | null>(null);
   const { clips: timelineClips, marks: timelineMarks } = useTimelineWindow(timelineBounds, status);
   const showTimeline = useCallback((bounds: TimelineBounds) => setTimelineBounds(current => JSON.stringify(current) === JSON.stringify(bounds) ? current : bounds), []);
@@ -84,7 +100,32 @@ function App() {
   const hasDraft = !!draft.trim() || sources.length > 0;
   const sourcesPending = sources.some(source => !source.attachment);
   const editing = useDraftEditing(drafts, updated => setStatus(current => ({ ...current, utterances: current.utterances?.map(word => word.id === updated.id ? updated : word) })));
+  const planEditing = usePlanEditing(drafts, updatePlan, (plan, itemId) => setPlanRequest({ id: plan.id, itemId, nonce: performance.now() }));
   const context = drafts.entry.context;
+  const planReplyContext = context.kind === 'plan-reply' ? context : null;
+  const planEditContext = context.kind === 'plan-item' ? context : null;
+  const continuationContext = context.kind === 'continuation' ? context : null;
+  const continuationPlan = status.plans?.find(plan => plan.id === continuationContext?.planId);
+  const staleContinuation = !!continuationContext && (continuationPlan?.rev !== continuationContext.revision || !continuationPlan?.items.some(item => item.planItemId === continuationContext.itemId && ['running', 'succeeded', 'failed'].includes(item.state)));
+  function continuePlanItem(plan: Plan, id: string) {
+    const item = plan.items.find(item => item.planItemId === id);
+    if (!item || !drafts.ready || saving) return;
+    drafts.openContinuation({ kind: 'continuation', planId: plan.id, itemId: id, title: item.title, revision: plan.rev, trackId: item.trackRef });
+    requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('[aria-label="Request draft"]')?.focus());
+  }
+  async function openDependency(location: PlanDependencyLocation) {
+    if (!location.clipId || location.atMs === null) return;
+    const request = ++openingInput.current;
+    try {
+      const result = await window.intercat.getTimelineWindow({ tracks: [location.trackId], start: Math.max(0, location.atMs - 1), end: location.atMs + 1, since: null });
+      if (request !== openingInput.current) return;
+      const track = liveTimeline(status, result.clips).find(track => track.id === location.trackId);
+      const selected = track?.clips.find(clip => clip.id === location.clipId);
+      if (!track || !selected) throw new Error('The saved dependency step is unavailable.');
+      setSelectedPlanItem(null); setSelected(track.id); setSelectedRepair(null); setClip({ track, clip: selected, repairRunId: null });
+      setView(current => ({ ...current, start: Math.max(0, selected.start - current.duration * 0.2) }));
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'The dependency could not be opened.'); }
+  }
   const editContext = context.kind === 'edit' ? context : null;
   const replyTarget = context.kind === 'reply' ? context.question : null;
   const currentReplyQuestion = status.reportQuestions?.find(question => question.id === replyTarget?.id);
@@ -149,7 +190,7 @@ function App() {
       if (presentation.command === 'stage-mode') setStageMode(true);
       else if (presentation.command === 'settings') setSettingsOpen(true);
       else if (presentation.command === 'branch-from') {
-        const selectedStep = clip && !clip.repairRunId ? clip : null;
+        const selectedStep = clip && !clip.repairRunId && !clip.track.reviewer ? clip : null;
         const source = presentation.trackId ?? selectedStep?.track.id ?? null;
         setBranchSelection({ operationId: presentation.operationId, trackId: source,
           at: selectedStep?.track.id === source ? timelineClips.find(item => item.id === selectedStep.clip.id)?.end ?? null : null });
@@ -162,10 +203,18 @@ function App() {
     visible: presentation => presentation.command === 'stage-mode' ? stageMode : presentation.command === 'settings' ? settingsOpen : presentation.command === 'branch-from' ? branchSelection?.operationId === presentation.operationId : commitOpen && commitRequest?.opId === presentation.operationId,
     updated: word => setStatus(current => ({ ...current, utterances: current.utterances?.map(previous => previous.id === word.id ? word : previous) })),
   });
-  const tracks = useMemo(() => preview ? previewTracks : liveTimeline(status, timelineClips), [preview, previewTracks, status.tracks, status.workers, status.project, status.workspaces, timelineClips, status.repairRuns, status.utterances]);
-  const timelineTexts = useMemo(() => [...timelineMarks.map(mark => mark.text), ...tracks.flatMap(track => [track.title, ...track.clips.map(clip => clip.label), ...track.planned.flatMap(turn => [turn.label, turn.after]), ...track.repairs.flatMap(repair => repair.clips.map(clip => clip.label))])], [tracks, timelineMarks]);
+  const countdowns = usePlanStart(status, updatePlan);
+  const tracks = useMemo(() => {
+    const tracks = preview ? previewTracks : liveTimeline(status, timelineClips);
+    return tracks.map(track => ({ ...track, planned: track.planned.map(item => {
+      const countdown = item.planId ? countdowns[item.planId] : undefined;
+      const plan = status.plans?.find(plan => plan.id === item.planId);
+      return countdown && countdown.revision === plan?.rev && item.after === 'waiting for your go' ? { ...item, after: `starts in ${countdown.seconds} s` } : item;
+    }) }));
+  }, [preview, previewTracks, status.tracks, status.workers, status.project, status.trackFolders, status.workspaces, timelineClips, status.repairRuns, status.utterances, status.plans, status.planDependencies, countdowns]);
+  const timelineTexts = useMemo(() => [...timelineMarks.map(mark => mark.text), ...tracks.flatMap(track => [track.title, ...track.clips.map(clip => clip.label), ...track.planned.flatMap(turn => isPlanStatus(turn.after) ? [turn.label] : [turn.label, turn.after]), ...track.repairs.flatMap(repair => repair.clips.map(clip => clip.label))])], [tracks, timelineMarks]);
   const privateTimelineLabel = usePrivacyLabels(timelineTexts, privacyVersion, !preview);
-  const privateTracks = useMemo(() => tracks.map(track => ({ ...track, title: privateTimelineLabel(track.title), clips: track.clips.map(clip => ({ ...clip, label: privateTimelineLabel(clip.label) })), planned: track.planned.map(turn => ({ ...turn, label: privateTimelineLabel(turn.label), after: privateTimelineLabel(turn.after) })), repairs: track.repairs.map(repair => ({ ...repair, clips: repair.clips.map(clip => ({ ...clip, label: privateTimelineLabel(clip.label) })) })) })), [tracks, privateTimelineLabel]);
+  const privateTracks = useMemo(() => tracks.map(track => ({ ...track, title: privateTimelineLabel(track.title), clips: track.clips.map(clip => ({ ...clip, label: privateTimelineLabel(clip.label) })), planned: track.planned.map(turn => ({ ...turn, label: privateTimelineLabel(turn.label), after: isPlanStatus(turn.after) ? turn.after : privateTimelineLabel(turn.after) })), repairs: track.repairs.map(repair => ({ ...repair, clips: repair.clips.map(clip => ({ ...clip, label: privateTimelineLabel(clip.label) })) })) })), [tracks, privateTimelineLabel]);
   const privateMarks = useMemo(() => timelineMarks.map(mark => ({ ...mark, text: privateTimelineLabel(mark.text) })), [timelineMarks, privateTimelineLabel]);
   function branchCreated(branch: import('./bridge').BranchState) {
     setBranchSelection(null); setSelected(branch.trackId); setSelectedRepair(null); setClip(null);
@@ -176,7 +225,7 @@ function App() {
     requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('[aria-label="Request draft"]')?.focus());
   }
   const active = tracks.find(track => track.id === selected);
-  useTimelineObservation(status, active?.id ?? null, selectedRepair);
+  useTimelineObservation(status, active?.reviewer ? null : active?.id ?? null, selectedRepair);
   const activeRequest = status.utterances?.find(word => word.decision?.kind === 'fork' && word.decision.trackId === selected);
   const deskContextSource = activeRequest?.text ?? active?.title ?? 'Editor decides';
   const deskPrivacy = usePrivacyText(deskContextSource, !preview && !!(activeRequest || active), privacyVersion);
@@ -186,13 +235,13 @@ function App() {
   const commitContextState = commitContext ? contextState(commitContext, status.integration) : null;
   const contextRepair = commitContext ? status.repairRuns?.find(run => run.jobId === commitContext.jobId && !['done', 'discarded'].includes(run.phase)) : null;
   const modelTrackId = commitContext?.track ?? replyTarget?.trackId
-    ?? (repairTargetId ? activeRepair?.track : draftTarget.mode === 'lock' ? draftTarget.trackId : active?.id);
+    ?? (repairTargetId ? activeRepair?.track : draftTarget.mode === 'lock' ? draftTarget.trackId : active?.reviewer ? undefined : active?.id);
   const modelTrack = tracks.find(track => track.id === modelTrackId);
   const modelRepair = activeRepair ?? contextRepair;
-  const requestModel = modelRepair ? modelRepair.model : commitContext || repairTargetId ? null
+  const requestModel = planReplyContext ? null : modelRepair ? modelRepair.model : commitContext || repairTargetId ? null
     : status.workers?.find(worker => worker.trackId === modelTrackId)?.model;
   const modelPrefix = commitContext || repairTargetId ? `Worker ${modelTrack?.label ?? '?'} · for the commit`
-    : draftTarget.mode === 'lock' ? `Only ${modelTrack?.label ?? 'unavailable track'}` : `Worker ${modelTrack?.label ?? '?'}`;
+    : draftTarget.mode === 'lock' ? `Only ${modelTrack?.label ?? 'unavailable track'}` : active?.reviewer ? 'Editor decides' : `Worker ${modelTrack?.label ?? '?'}`;
   const canSendContext = commitContextState === 'current' && (!contextRepair || (contextRepair.track === commitContext?.track && contextRepair.phase === 'held' && !contextRepair.restoring && (!contextRepair.refresh || !!contextRepair.refresh.error)));
   const preparationError = status.preparation?.detail ?? status.workspaces?.find(workspace => workspace.state === 'failed')?.error;
   const sessionSource = status.session?.name || status.utterances?.[0]?.text || '';
@@ -359,6 +408,7 @@ function App() {
   function dropFiles(files: File[], trackId?: string) {
     setComposerDrop(false);
     if (!files.length || !canDropFiles || importingDrops.current) return;
+    if (trackId && continuationContext && trackId !== continuationContext.trackId) { setNotice('This instruction keeps its selected plan item. Attach the reference in the input area.'); return; }
     if (trackId && !status.tracks?.some(track => track.id === trackId)) { setNotice('That worker is no longer available.'); return; }
     const total = references.reduce((sum, file) => sum + file.byteLen, 0) + files.reduce((sum, file) => sum + file.size, 0);
     if (references.length + files.length > 128 || total > 100 * 1024 * 1024 || files.some(file => file.size > (file.type.startsWith('image/') ? 10 : 25) * 1024 * 1024)) {
@@ -369,7 +419,7 @@ function App() {
     pendingDrops.current = { files, store: drafts, draftId: drafts.book.active };
     void importDroppedFiles();
   }
-  const canDropFiles = drafts.ready && status.connected && !preview && !saving && !saveError && !attaching && !replyTarget && !repairTargetId && !commitContext && !editContext;
+  const canDropFiles = drafts.ready && status.connected && !preview && !saving && !saveError && !attaching && !replyTarget && !repairTargetId && !commitContext && !editContext && !planEditContext && !planReplyContext;
   function pasteDraft(event: React.ClipboardEvent<HTMLTextAreaElement>, segment: string | null = null) {
     const text = event.clipboardData.getData('text/plain');
     if (new TextEncoder().encode(text).byteLength > 2 * 1024 * 1024) {
@@ -379,7 +429,7 @@ function App() {
     }
     let characters = 0;
     for (const _ of text) { if (++characters > 600) break; }
-    if (characters <= 600 || context.kind !== 'work' || preview) return;
+    if (characters <= 600 || (context.kind !== 'work' && context.kind !== 'continuation') || preview) return;
     event.preventDefault();
     if (sources.length + references.length >= 128 || attaching || saving || saveError) {
       setNotice('Finish saving this request before adding another pasted block.'); return;
@@ -400,22 +450,41 @@ function App() {
     })();
   }
   function composerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === 'Escape' && planReplyContext && !event.nativeEvent.isComposing && !saving && !saveError) { event.preventDefault(); drafts.back(); return; }
+    if (event.key === 'Escape' && continuationContext && !event.nativeEvent.isComposing && !saving && !saveError) { event.preventDefault(); drafts.back(); return; }
+    if (event.key === 'Escape' && planEditContext && !event.nativeEvent.isComposing && !saving && !saveError) { event.preventDefault(); void planEditing.cancel(); return; }
     if (event.key === 'Escape' && editContext && !event.nativeEvent.isComposing && !saving && !saveError) { event.preventDefault(); void editing.cancel(); return; }
     if (event.key === 'Escape' && commitContext && !saving && !saveError) { event.preventDefault(); drafts.replaceContext({ kind: 'work' }); return; }
+    if (event.metaKey && event.shiftKey && event.code === 'KeyP' && !event.nativeEvent.isComposing) { event.preventDefault(); void saveDraft(false, false, true); return; }
     if (event.metaKey && event.key === 'Enter' && hasDraft && !saving && !attaching && !sourcesPending && status.connected) { event.preventDefault(); void saveDraft(event.shiftKey); }
   }
-  async function saveDraft(newTrack = false, asWork = false) {
+  async function saveDraft(newTrack = false, asWork = false, planOnly = false) {
     if (!drafts.ready) return;
+    if (planReplyContext && new TextEncoder().encode(draft).byteLength > 32 * 1024) { setNotice('Plan replies can contain up to 32 KiB. Shorten this reply before sending.'); return; }
+    if (planReplyContext && (newTrack || planOnly)) { setNotice('This reply belongs to the selected plan question.'); return; }
+    if (continuationContext && (newTrack || planOnly)) { setNotice('This instruction belongs to the selected plan item.'); return; }
+    if (continuationContext && !submission && staleContinuation) { setNotice('The plan changed. Review the item before sending.'); return; }
+    if (continuationContext && !submission && !draft.trim() && sources.every(source => source.role === 'reference' && !source.after.trim())) { setNotice('Write an instruction for this plan item.'); return; }
+    if (planOnly && (replyTarget || repairTargetId || commitContext || editContext || planEditContext || planReplyContext || !hasDraft || saving || saveError || attaching || !status.connected)) return;
     if (sourcesPending) { setNotice('The pasted text is still being saved.'); return; }
     const referenceBytes = references.reduce((sum, file) => sum + file.byteLen, 0) + sources.reduce((sum, source) => sum + (source.attachment?.byteLen ?? 0), 0);
     if (references.length + sources.length > 128 || referenceBytes > 100 * 1024 * 1024) {
       setNotice('Reference files and pasted blocks can total up to 100 MiB per request. Remove a reference before sending.'); return;
     }
-    if (!submission && !newTrack && !asWork && !replyTarget && !repairTargetId && !commitContext && !editContext && missingDraftTarget) { setNotice('Choose another track before sending.'); return; }
+    if (!submission && !newTrack && !asWork && !replyTarget && !repairTargetId && !commitContext && !editContext && !planEditContext && !planReplyContext && missingDraftTarget) { setNotice('Choose another track before sending.'); return; }
     if (attaching || (references.length > 0 && !asWork && (replyTarget || repairTargetId || commitContext))) { setNotice('Send these reference files with an ordinary request, or remove them before replying.'); return; }
     openingInput.current++;
     setSaving(true);
     try {
+      if (planReplyContext && !asWork) {
+        const pending = await drafts.prepare({ kind: 'plan-reply', request: { opId: await window.intercat.createOperationId(), planId: planReplyContext.planId, revision: planReplyContext.revision, questionId: planReplyContext.questionId, question: planReplyContext.question, text: draft } });
+        if (pending.kind !== 'plan-reply') throw new Error('A different draft operation is pending.');
+        const result = await window.intercat.replyToPlan(pending.request);
+        drafts.finish();
+        setNotice(result.state === 'orphaned' ? 'The plan changed. Your reply is kept for review.' : 'Reply saved · revising the plan.');
+        void window.intercat.getStatus().then(observeStatus).catch(() => {}); return;
+      }
+      if (planEditContext && !asWork && !submission) { await planEditing.submit(); return; }
       if (editContext && !asWork && !submission) {
         if (!await editing.submit()) setNotice('Already sent. Choose whether to send a new instruction.');
         return;
@@ -432,10 +501,11 @@ function App() {
         drafts.finish(); setNotice('Instruction sent to repair.');
         void window.intercat.getStatus().then(observeStatus).catch(() => {}); return;
       }
-      const pending = await drafts.prepare({ kind: 'work', request: submission ?? { opId: await window.intercat.createOperationId(), text: draft, attachmentIds: references.map(file => file.id),
+      const pending = await drafts.prepare({ kind: 'work', request: submission ?? { opId: await window.intercat.createOperationId(), text: draft, executeAllowed: !planOnly, attachmentIds: references.map(file => file.id),
         ...(sources.length ? { sources: sources.map(source => ({ attachmentId: source.id, role: source.role, after: source.after })) } : {}),
-        target: newTrack ? { mode: 'new' } : asWork && commitContext ? { mode: 'lock', trackId: commitContext.track } : draftTarget,
-        selectedTrackId: asWork && commitContext ? commitContext.track : active?.id ?? null, ...(replyTarget && !asWork ? { replyTo: { id: replyTarget.id, revision: replyTarget.revision } } : {}) } });
+        ...(continuationContext ? { planItem: { planId: continuationContext.planId, itemId: continuationContext.itemId, revision: continuationContext.revision } } : {}),
+        target: continuationContext ? { mode: 'lock', trackId: continuationContext.trackId } : newTrack ? { mode: 'new' } : asWork && commitContext ? { mode: 'lock', trackId: commitContext.track } : draftTarget,
+        selectedTrackId: continuationContext ? continuationContext.trackId : asWork && commitContext ? commitContext.track : active?.reviewer ? null : active?.id ?? null, ...(replyTarget && !asWork ? { replyTo: { id: replyTarget.id, revision: replyTarget.revision } } : {}) } });
       if (pending.kind !== 'work') throw new Error('A different draft operation is pending.');
       const request = pending.request;
       const saved = request.replyTo ? await window.intercat.respondToReport({ opId: request.opId, questionId: request.replyTo.id, revision: request.replyTo.revision, answer: { action: 'reply', text: request.text } }) : await window.intercat.stageUtterance(request);
@@ -448,6 +518,9 @@ function App() {
   function draftLabel(entry: DraftEntry) {
     const context = entry.context;
     const target = entry.target;
+    if (context.kind === 'plan-reply') return `reply to plan · ${context.label}`;
+    if (context.kind === 'continuation') return `instruction for ${context.title}`;
+    if (context.kind === 'plan-item') return `revision of ${context.title}`;
     if (context.kind === 'edit') return `edit of ${context.originalText.slice(0, 30)}`;
     if (context.kind === 'reply') return `Reply to Worker ${status.tracks?.find(track => track.id === context.question.trackId)?.label ?? '?'}`;
     if (entry.context.kind === 'commit') return `draft for this commit · ${entry.context.context.label}`;
@@ -465,9 +538,39 @@ function App() {
     try {
       const word = await window.intercat.getUtterance(id);
       if (openingInput.current !== reading) return;
+      if (word.reviewFix) {
+        const detail=await window.intercat.getClipDetail(word.reviewFix.clipId);
+        if (openingInput.current !== reading) return;
+        const track=liveTimeline(status,[detail.clip]).find(value=>value.id===detail.clip.trackId);
+        const chosen=track?.clips.find(value=>value.id===detail.clip.id);
+        if (track && chosen) {setSelected(track.id);setSelectedRepair(null);setClip({track,clip:chosen,repairRunId:null});}
+        return;
+      }
+      if (word.planId && !word.planContinuation) { setPlanRequest({ id: word.planId, itemId: word.planItemId, nonce: performance.now() }); return; }
       if (word.decision?.trackId) { setSelected(word.decision.trackId); setSelectedRepair(null); setClip(null); }
       openRequest(word, false);
     } catch { if (openingInput.current === reading) setNotice('This request could not be loaded. Try again.'); }
+  }
+  const reviewStops = useRef(new Map<string,{opId:string;reviewId:string;revision:number}>());
+  async function stopReviews(jobs: {id:string;revision:number}[]) {
+    for (const job of jobs) {
+      try {
+        const key=`${job.id}:${job.revision}`;
+        let request=reviewStops.current.get(key);
+        if(!request){request={opId:await window.intercat.createOperationId(),reviewId:job.id,revision:job.revision};reviewStops.current.set(key,request);}
+        await window.intercat.stopReview(request);reviewStops.current.delete(key);
+      } catch(error){setNotice(error instanceof Error?error.message:'The review could not be stopped.');}
+    }
+  }
+  async function openReviewedStep(id: string) {
+    const reading=++openingInput.current;
+    try {
+      const detail=await window.intercat.getClipDetail(id);
+      if(openingInput.current!==reading)return;
+      const track=liveTimeline(status,[detail.clip]).find(value=>value.id===detail.clip.trackId);
+      const chosen=track?.clips.find(value=>value.id===id);
+      if(track&&chosen){setSelected(track.id);setSelectedRepair(null);setClip({track,clip:chosen,repairRunId:null});}
+    } catch(error){setNotice(error instanceof Error?error.message:'The reviewed step is unavailable.');}
   }
   function openRequest(word: Utterance, editText: boolean) {
     openingInput.current++;
@@ -499,6 +602,11 @@ function App() {
     } catch { setNotice('The request changed or could not be saved. Refresh before answering.'); }
   }
   async function cutFuture(id: string) {
+    const plan = status.plans?.find(plan => plan.items.some(item => item.planItemId === id));
+    if (plan) {
+      setPlanRequest({ id: plan.id, itemId: id, mode: 'cut', nonce: performance.now() });
+      return;
+    }
     if (preview) { setPreviewTracks(current => cutPlannedTurn(current, id)); setNotice('Planned turn cut. The current turn is unchanged.'); }
     else { const word = status.utterances?.find(word => word.id === id); if (word) await cutWord(word); }
   }
@@ -528,16 +636,26 @@ function App() {
     window.addEventListener('keydown', toggleStage);
     return () => window.removeEventListener('keydown', toggleStage);
   }, [stageMode]);
+  useEffect(() => {
+    const planOnly = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || !event.metaKey || !event.shiftKey || event.altKey || event.code !== 'KeyP' || document.querySelector('dialog[open]')) return;
+      event.preventDefault(); void saveDraft(false, false, true);
+    };
+    window.addEventListener('keydown', planOnly);
+    return () => window.removeEventListener('keydown', planOnly);
+  });
   function cycleRegion(event: React.KeyboardEvent) {
     if (event.metaKey && (event.code === 'Period' || event.key === '.')) {
       event.preventDefault();
       if (event.altKey) {
         void pauseDispatch(true);
+      } else if (active?.reviewer) {
+        void stopReviews((status.reviewerLane?.jobs ?? []).filter(job=>!event.shiftKey || job.state==='queued'));
       } else if (event.shiftKey) {
-        const worker = (status.workers ?? []).find(worker => worker.trackId === active?.id) ?? status.workers?.[0];
+        const worker = active?.reviewer ? undefined : (status.workers ?? []).find(worker => worker.trackId === active?.id) ?? status.workers?.[0];
         if (worker) void holdWorker(worker.trackId);
       } else if (selectedRepair) void stopRepair(selectedRepair);
-      else { const worker = (status.workers ?? []).find(worker => worker.trackId === active?.id) ?? status.workers?.[0]; if (worker) void stopWorker(worker.trackId); }
+      else { const worker = active?.reviewer ? undefined : (status.workers ?? []).find(worker => worker.trackId === active?.id) ?? status.workers?.[0]; if (worker) void stopWorker(worker.trackId); }
       return;
     }
     if (!event.ctrlKey || event.key !== 'Tab') return;
@@ -548,11 +666,19 @@ function App() {
   }
   const editorNeedsAction = status.connected && status.editor && (status.editor.canRetry || ['not_configured', 'download_paused'].includes(status.editor.phase));
   const attention: AttentionCard[] = [
+    ...reviewFixCards(status.reviewFixes ?? [], status.tracks ?? [], !status.connected || saving || saveError || commitOpen, id=>{void openReviewedStep(id);}),
     ...proposalCards(status.proposal, !status.connected || saving || saveError || commitOpen, response => {
       setStatus(current => ({ ...current, proposal: current.proposal?.id === response.proposalId ? null : current.proposal }));
+    }, proposal => {
+      drafts.open({ kind: 'plan-reply', planId: proposal.planId, questionId: proposal.id, revision: proposal.planRevision, question: `${proposal.text}\n${proposal.detail}`, label: proposal.label });
+      requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('[aria-label="Request draft"]')?.focus());
+    }),
+    ...planAssumptionCards(status.planAssumptions ?? [], !status.connected || saving || saveError || commitOpen, value => {
+      drafts.open({ kind: 'plan-reply', planId: value.planId, questionId: value.id, revision: value.planRevision, question: `${value.text}\n${value.detail}`, label: value.label });
+      requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('[aria-label="Request draft"]')?.focus());
     }),
     ...assumptionCards(status.assumptions ?? [], active?.id ?? null, status.tracks ?? []),
-    ...requestCards({ drafts, onRephrased: observeRequest, words: status.utterances ?? [], tracks: status.tracks ?? [],
+    ...requestCards({ onReviewPlan: id => setPlanRequest({ id, nonce: performance.now() }), drafts, onRephrased: observeRequest, words: status.utterances ?? [], tracks: status.tracks ?? [],
       onResolve: (word, resolution) => { void resolveWord(word, resolution); },
       onEdit: word => { openRequest(word, true); }, onCut: word => { void cutWord(word); },
     }),
@@ -564,10 +690,18 @@ function App() {
       takeBack: word => { void cutWord(word); },
       retry: word => { void resolveWord(word, { action: 'retry', target: word.target }); },
     }),
+    ...folderChoiceCards(status),
     ...workerCards({ workers: status.workers ?? [], tracks: status.tracks ?? [],
+      pendingInheritance: (status.pendingInheritance ?? []).filter(pending => !status.inheritanceIssues?.some(issue => issue.applicationId === pending.operationId)),
+      finishInheritance: async pending => { await window.intercat.finishInheritance({ opId: await window.intercat.createOperationId(), trackId: pending.trackId, applicationId: pending.operationId }); },
       provideSecret: async (worker, prompt, entry) => { await window.intercat.provideWorkerSecret({ ...entry, owner: { kind: 'work' }, trackId: worker.trackId, sessionId: prompt.request.sessionId, turnId: prompt.request.turnId, question: { kind: 'msp', id: prompt.request.userInputId, revision: prompt.revision } }); },
       answer: answerWorker,
       respond: async (worker, prompt, response) => { await window.intercat.respondToWorker({ opId: await window.intercat.createOperationId(), trackId: worker.trackId, promptId: prompt.request.userInputId, revision: prompt.revision, response }); },
+    }),
+    ...inheritanceIssueCards({ issues: status.inheritanceIssues ?? [], workers: status.workers ?? [], tracks: status.tracks ?? [],
+      command: async (issue, action) => { await window.intercat.resolveInheritanceIssue({ opId: await window.intercat.createOperationId(), issueId: issue.id, action }); },
+      finish: async issue => { if (issue.applicationId) await window.intercat.finishInheritance({ opId: await window.intercat.createOperationId(), trackId: issue.trackId, applicationId: issue.applicationId }); },
+      review: issue => { if (issue.planId) setPlanRequest({ id: issue.planId, itemId: issue.itemId, nonce: performance.now() }); },
     }),
   ];
   if (editorNeedsAction && status.editor) {
@@ -688,10 +822,10 @@ function App() {
     </aside>
     <main className="main">
       <header className="session-header"><div><div className="eyebrow">{preview ? 'SAMPLE SESSION' : 'LOCAL SESSION'}</div><h1 title={sessionName}>{sessionName}</h1></div>{commitButton}</header>
-      <div className="session-subtitle">{preview ? <><span className="folder-chip">▱ sample-web</span><span className="folder-chip">▱ sample-api</span><span className="preview-label">Preview data</span></> : <><span className="folder-chip" title={status.project?.root}>{status.project ? `▱ ${status.project.name}` : 'No project folder'}</span>{!status.project && <button className="folder-chip" disabled={!status.connected || choosingProject} onClick={() => { void setupProject(); }}>{choosingProject ? 'Checking folder…' : 'Choose project folder'}</button>}</>}</div>
+      <div className="session-subtitle">{preview ? <><span className="folder-chip">▱ sample-web</span><span className="folder-chip">▱ sample-api</span><span className="preview-label">Preview data</span></> : <>{status.project ? status.project.folders.map(folder => <span key={folder.id} className="folder-chip" title={folder.root}>▱ {folder.name}</span>) : <span className="folder-chip">No project folder</span>}{!status.project && <button className="folder-chip" disabled={!status.connected || choosingProject} onClick={() => { void setupProject(); }}>{choosingProject ? 'Checking folder…' : 'Choose project folder'}</button>}</>}</div>
       {status.projectSecretIssue && <div className="project-secret-notice" role="status"><span>{status.projectSecretIssue}</span><button onClick={() => setSettingsOpen(true)}>Review saved secrets</button></div>}
       <section ref={stageElement} className="stage" style={deskLayout.height === null ? undefined : { flex: '0 0 auto', height: deskLayout.height }} tabIndex={-1} data-focus-region aria-label="Stage">
-        <Timeline onInput={id => { void openTimelineInput(id); }} onViewport={showTimeline} liveNow={timelineNow} advancing={preview ? playing : !!status.timeline} preview={preview} tracks={privateTracks} marks={privateMarks} selected={selected} selectedRepair={selectedRepair} view={view} onSelect={id => { if (saving || saveError) return; openingInput.current++; setSelected(id); setSelectedRepair(null); setClip(null); }} onRepairSelect={(track, id) => { if (saving || saveError) return; openingInput.current++; setSelected(track.id); if (!commitContext) { setSelectedRepair(id); drafts.open({ kind: 'repair', id }, true); } setClip(null); }} onRepairStop={id => { void stopRepair(id); }} onClip={(track, chosen, repairRunId) => setClip({ track, clip: chosen, repairRunId })}
+        <Timeline onReviewStop={jobs=>{void stopReviews(jobs);}} focusPlanItem={focusPlanItem} selectedPlanItem={selectedPlanItem} onPlanControl={(id, itemId, mode, point) => { setSelectedPlanItem(itemId); setPlanRequest({ id, itemId, mode, point, nonce: performance.now() }); }} onPlan={(id, itemId, point) => { setSelectedPlanItem(itemId ?? null); setPlanRequest({ id, itemId, point, nonce: performance.now() }); }} onInput={id => { void openTimelineInput(id); }} onViewport={showTimeline} liveNow={timelineNow} advancing={preview ? playing : !!status.timeline} preview={preview} tracks={privateTracks} marks={privateMarks} selected={selected} selectedRepair={selectedRepair} view={view} onSelect={id => { if (saving || saveError) return; setSelectedPlanItem(null); openingInput.current++; setSelected(id); setSelectedRepair(null); setClip(null); }} onRepairSelect={(track, id) => { if (saving || saveError) return; openingInput.current++; setSelected(track.id); if (!commitContext) { setSelectedRepair(id); drafts.open({ kind: 'repair', id }, true); } setClip(null); }} onRepairStop={id => { void stopRepair(id); }} onClip={(track, chosen, repairRunId) => { setSelectedPlanItem(null); setClip({ track, clip: chosen, repairRunId }); }}
           onOpenTrack={id => {
             if (saving || saveError) return;
             setDeskLayout(current => current.mode === 'normal' ? current : { mode: 'normal', height: null });
@@ -701,10 +835,10 @@ function App() {
               if (section && scroll) scroll.scrollTop += section.getBoundingClientRect().top - scroll.getBoundingClientRect().top;
             });
           }}
-          canDropFiles={canDropFiles} onDropFiles={dropFiles} targetDisabled={!drafts.ready || !status.connected || saving || saveError || attaching} onSayTo={id => { if (saving || saveError || attaching) return; drafts.replaceContext({ kind: 'work' }); drafts.setTarget({ mode: 'lock', trackId: id }); setSelectedRepair(null); document.querySelector<HTMLTextAreaElement>('[aria-label="Request draft"]')?.focus(); }} onCut={id => { void cutFuture(id); }} onInteraction={() => { interaction.current = Date.now(); }} />
+          canDropFiles={canDropFiles} onDropFiles={dropFiles} targetDisabled={!drafts.ready || !status.connected || saving || saveError || attaching} onSayTo={id => { if (saving || saveError || attaching) return; if (continuationContext) drafts.open({ kind: 'work' }); else drafts.replaceContext({ kind: 'work' }); drafts.setTarget({ mode: 'lock', trackId: id }); setSelectedRepair(null); document.querySelector<HTMLTextAreaElement>('[aria-label="Request draft"]')?.focus(); }} onCut={id => { void cutFuture(id); }} onInteraction={() => { interaction.current = Date.now(); }} />
         <div className="stage-footer"><div><span className="legend-mark">◇</span> waiting <span className="legend-mark">✓</span> done <span className="legend-edit" /> edit</div><div><span className="key-hint">↑ ↓ select · 1–9 jump</span>{preview && <button className="play-button" aria-pressed={playing} onClick={() => setPlaying(!playing)}>{playing ? 'Ⅱ Pause preview' : '▷ Play preview'}</button>}</div></div>
         {!preview && status.timeline?.summaries.some(summary => summary.trackId === selected && summary.repairRunId === selectedRepair) && <p className="history-summary" role="note">Earlier history was summarized by the worker.</p>}
-        {clip ? <section className="clip-inspector"><div className="inspector-heading"><span>{clip.track.label}:{clip.clip.ordinal ?? clip.clip.id}{clip.repairRunId ? ' · for the commit' : ''} / {clip.clip.label}</span><button onClick={() => setClip(null)} aria-label="Close step preview">×</button></div><Suspense fallback={<p>Loading step…</p>}>{preview ? <DocumentPreview /> : <StepInspector clipId={clip.clip.id} sequence={status.sequence} />}</Suspense></section> : null}
+        {clip ? <section className="clip-inspector"><div className="inspector-heading"><span>{clip.track.label}:{clip.clip.ordinal ?? clip.clip.id}{clip.repairRunId ? ' · for the commit' : ''} / {clip.clip.label}</span><button onClick={() => setClip(null)} aria-label="Close step preview">×</button></div><Suspense fallback={<p>Loading step…</p>}>{preview ? <DocumentPreview /> : <StepInspector clipId={clip.clip.id} sequence={status.sequence} openClip={id=>{void openReviewedStep(id);}} />}</Suspense></section> : null}
       </section>
       <StageDivider stage={stageElement} desk={deskElement} layout={deskLayout} change={setDeskLayout} />
       <section ref={deskElement} className="desk" tabIndex={-1} data-focus-region aria-label="Desk">
@@ -717,14 +851,15 @@ function App() {
           <ReportProgress status={status} />
         </div>
 
-        <StagePanels finish={commitButton} compact={stageMode} folded={deskLayout.mode !== 'normal'} workerLabel={active ? `Worker ${active.label}` : null} cards={attention} returnedAt={returnedAt} canDropFiles={canDropFiles} dropFiles={dropFiles} expandWorkers={() => {
+        <StagePanels finish={commitButton} compact={stageMode} folded={deskLayout.mode !== 'normal'} workerLabel={active && !active.reviewer ? `Worker ${active.label}` : null} cards={attention} returnedAt={returnedAt} canDropFiles={canDropFiles} dropFiles={dropFiles} expandWorkers={() => {
           setStageMode(false);
           requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('[aria-label="Request draft"]')?.focus());
-        }} workers={<Workers unloggedControls={status.unloggedControls} secretInputs={status.secretInputs ?? []} flows={status.outputFlows ?? []} effects={status.effects ?? []} workers={status.workers ?? []} tracks={status.tracks ?? []} start={id => { void startWorker(id); }} stop={id => { void stopWorker(id); }} canDropFiles={canDropFiles} dropFiles={dropFiles} />} />
-        {!stageMode && deskLayout.mode === 'normal' && !preview && active && !selectedRepair && <EditorLog key={active.id} trackId={active.id} label={active.label} sequence={status.sequence} />}
+        }} workers={<Workers pendingInheritance={status.pendingInheritance} queued={queuedTracks(status)} unloggedControls={status.unloggedControls} secretInputs={status.secretInputs ?? []} flows={status.outputFlows ?? []} effects={status.effects ?? []} workers={status.workers ?? []} tracks={status.tracks ?? []} start={id => { void startWorker(id); }} stop={id => { void stopWorker(id); }} canDropFiles={canDropFiles} dropFiles={dropFiles} />} />
+        {!stageMode && deskLayout.mode === 'normal' && !preview && active && !active.reviewer && !selectedRepair && <EditorLog key={active.id} trackId={active.id} label={active.label} sequence={status.sequence} />}
         <HistoryControls history={status.editHistory} controller={historyController} disabled={!status.connected || !drafts.ready || saving || saveError} />
-        <Requests confirmation={status.confirmation} onConfirmationChanged={confirmation => setStatus(current => ({ ...current, confirmation }))} onConfirmed={word => setStatus(current => ({ ...current, utterances: current.utterances?.map(item => item.id === word.id ? word : item) }))} editingTokens={editingTokens} onStart={word => { void startWord(word); }} redirects={status.redirects ?? []} words={status.utterances ?? []} tracks={status.tracks ?? []} onSelect={word => { openRequest(word, false); }} onCut={word => { void cutWord(word); }} />
+        <Requests scheduling={status.scheduling} hostMemory={status.hostMemory} confirmation={status.confirmation} onConfirmationChanged={confirmation => setStatus(current => ({ ...current, confirmation }))} onConfirmed={word => setStatus(current => ({ ...current, utterances: current.utterances?.map(item => item.id === word.id ? word : item) }))} editingTokens={editingTokens} onStart={word => { void startWord(word); }} redirects={status.redirects ?? []} words={status.utterances ?? []} tracks={status.tracks ?? []} onSelect={word => { openRequest(word, false); }} onCut={word => { void cutWord(word); }} />
         </div>
+        <Plans openDependency={location => { void openDependency(location); }} continueItem={continuePlanItem} countdowns={countdowns} edit={(plan, id) => { void planEditing.open(plan, id).catch(error => setNotice(error instanceof Error ? error.message : 'This item could not be opened for revision.')); }} status={status} moved={(plan, id, focus) => { setSelectedPlanItem(id); if (focus) setFocusPlanItem(previous => ({ id, nonce: (previous?.nonce ?? 0) + 1 })); const item = plan.items.find(item => item.planItemId === id); if (item) setSelected(item.trackRef.startsWith('new:') ? `${plan.id}/${item.trackRef}` : item.trackRef); }} request={planRequest} updated={updatePlan} />
         {presentation.error && <p role="status" className="presentation-error">{presentation.error}</p>}
         <EditorLine character={presentation.state?.character ?? null} hidden={presentation.state?.hidden ?? true} away={presentation.away} entries={status.editorEntries ?? []} waitingTracks={(status.utterances ?? []).filter(word => ['placed', 'redirecting', 'starting'].includes(word.state)).flatMap(word => word.decision?.trackId ? [word.decision.trackId] : [])} history={status.editHistory} undo={() => historyController.step('undo')} disabled={!status.connected || !drafts.ready || saving || saveError || historyController.busy || historyController.pending} />
         <div className={`composer${composerDrop ? ' file-drop-active' : ''}`} onDragOver={event => { if (canDropFiles && event.dataTransfer.types.includes('Files')) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; setComposerDrop(true); } }} onDragLeave={event => { if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setComposerDrop(false); }} onDrop={event => { event.preventDefault(); dropFiles(Array.from(event.dataTransfer.files)); }}>
@@ -738,13 +873,13 @@ function App() {
             const entry = drafts.book.entries[id];
             return entry && (entry.text || entry.sources?.length || entry.attachments.length || entry.pending) ? <button key={id} disabled={saving} onClick={() => drafts.resume(id)}>{draftLabel(entry)} · Resume</button> : null;
           })}</div>}
-          {composerDrop && <div className="file-drop-hint">Drop here to attach it to your next words</div>}{editContext && <div className="reply-target edit-context" aria-label="Request being edited"><span>about · <PrivacySummary text={editContext.originalText} limit={60} /></span><button disabled={saving} onClick={() => { void editing.cancel(); }}>Cancel edit</button>{editContext.state === 'sent' ? <div role="status">Already sent<button disabled={saving} onClick={() => { void saveDraft(false, true); }}>Send as a new instruction</button></div> : editing.error && <div role="status">{editing.error}<button disabled={saving} onClick={() => { void editing.ensure(drafts.book.active).catch(() => {}); }}>Retry editing</button></div>}</div>}{commitContext && <div className="reply-target commit-context" aria-label="Commit context"><span title={commitContext.selection.path}>{commitContext.selection.path}:{commitContext.selection.startLine}{commitContext.selection.endLine !== commitContext.selection.startLine ? `–${commitContext.selection.endLine}` : ''} @ {commitContext.selection.tree.slice(0, 7)}</span><span>fix for this commit · {commitContext.label}</span><button disabled={saving || saveError} onClick={() => drafts.replaceContext({ kind: 'work' })}>Clear commit context</button>{commitContextState !== 'current' && <div className="commit-context-changed" role="status"><span>{commitContextState === 'gone' ? 'the commit is gone' : 'the commit changed'}</span>{commitContextState === 'changed' ? <button disabled={saving || saveError || !draft.trim()} onClick={() => { void resendCommitInstruction(); }}>Resend on the new version</button> : <button disabled={saving || saveError || !draft.trim()} onClick={() => { void saveDraft(false, true); }}>Send to {commitContext.label}</button>}<button disabled={saving || saveError} onClick={() => drafts.replaceContext({ kind: 'work' })}>Take back</button></div>}</div>}{repairTargetId && <div className="reply-target">{active?.label} · for the commit · {activeRepair?.phase === 'held' ? 'Add an instruction' : activeRepair?.phase ?? 'Recorded repair'}<button disabled={saving || saveError} onClick={() => { setSelectedRepair(null); drafts.replaceContext({ kind: 'work' }); }}>Clear repair target</button></div>}{replyTarget && <div className="reply-target reply-context">Reply to Worker {status.tracks?.find(track => track.id === replyTarget.trackId)?.label}<button disabled={saving} onClick={() => { drafts.back(); }}>Cancel reply</button>{staleReply && <div role="status">This question is no longer current. Keeping this reply will ask you where to send it.</div>}<details><summary>Original question</summary><p><PrivacyText text={replyTarget.text} /></p></details></div>}{(references.length > 0 || attachmentError) && <div className="reference-files">{attachmentError && <button disabled={attaching || saving || saveError} onClick={() => { void attachReference(true); }}>Choose another file</button>}{references.map(file => <span className="reference-chip" key={file.id}><span title={file.name}>📎 {file.name}</span><button disabled={saving || saveError || !!editContext} aria-label={`Remove reference ${file.name}`} onClick={() => drafts.setAttachments(files => files.filter(item => item.id !== file.id))}>×</button></span>)}</div>}<textarea data-focus-region aria-label="Request draft" aria-busy={!drafts.ready && !drafts.issue} placeholder={!drafts.ready && !drafts.issue ? 'Loading saved draft…' : 'What would you like to work on?'} rows={stageMode ? 1 : 2} value={draft} disabled={!drafts.ready || saving || saveError || attaching} onChange={event => drafts.setText(event.target.value)} onPaste={pasteDraft} onKeyDown={composerKeyDown} /><PastedSources drafts={drafts} disabled={!drafts.ready || saving || saveError || attaching} readOnly={context.kind !== 'work' && context.kind !== 'edit'} paste={pasteDraft} submit={composerKeyDown} /><div className="composer-bottom"><div className="composer-tools"><button className="attach-reference" aria-label={attachmentError ? 'Retry reference save' : 'Attach reference file'} title={attaching ? 'Saving reference…' : attachmentError ? 'Retry reference save' : 'Attach reference file'} aria-busy={attaching} disabled={!drafts.ready || !status.connected || preview || saving || saveError || attaching || !!replyTarget || !!repairTargetId || !!commitContext || !!editContext} onClick={() => { void attachReference(); }}><svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M10 4v12M4 10h12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /></svg></button>{commitContext || repairTargetId || replyTarget || editContext ? <span>{commitContext ? `fix for this commit · ${commitContext.label}` : repairTargetId ? `${active?.label} · for the commit` : editContext ? 'Editing a previous request' : 'Reply to question'}</span> : <RequestTarget target={draftTarget} tracks={tracks} disabled={!drafts.ready || !status.connected || saving || saveError || attaching} onChange={target => drafts.setTarget(target)} />}</div><div className="composer-actions"><button disabled={!drafts.ready || !status.connected || !hasDraft || saving || sourcesPending || saveError || attaching || !!replyTarget || !!repairTargetId || !!commitContext || !!editContext} onClick={() => { void saveDraft(true); }} title="New track · ⇧⌘↵">New track</button><button disabled={!drafts.ready || !status.connected || !hasDraft || saving || sourcesPending || attaching || (missingDraftTarget && !saveError && !replyTarget && !repairTargetId && !commitContext && !editContext) || (editContext?.state === 'sent' && !saveError) || (!!commitContext && !canSendContext && !saveError) || (!!repairTargetId && (activeRepair?.phase !== 'held' || !!activeRepair.restoring || (!!activeRepair.refresh && !activeRepair.refresh.error)) && !saveError)} onClick={() => { void saveDraft(); }} title="Put request · ⌘↵">{saving ? 'Saving…' : saveError ? 'Retry save' : commitContext ? 'Send to repair' : repairTargetId ? 'Send to repair' : replyTarget ? staleReply ? 'Keep reply for review' : 'Send reply' : editContext ? 'Update request' : 'Put'} <span aria-hidden="true">↵</span></button></div></div></div>
-        <div className="model-status" aria-label="Request model">{modelTrackId ? <WorkerModel model={requestModel} prefix={modelPrefix} /> : <span>Editor picks per track</span>}</div>
+          {composerDrop && <div className="file-drop-hint">Drop here to attach it to your next words</div>}{continuationContext && <ContinuationContext context={continuationContext} label={status.tracks?.find(track => track.id === continuationContext.trackId)?.label ?? '?'} stale={staleContinuation} busy={saving} pending={saveError} close={() => drafts.back()} review={() => setPlanRequest({ id: continuationContext.planId, itemId: continuationContext.itemId, nonce: performance.now() })} />}{planEditContext && <div className="reply-target edit-context" aria-label="Plan item being revised"><span>about · <PrivacySummary text={planEditContext.title} limit={60} /></span><button disabled={saving} onClick={() => { void planEditing.cancel(); }}>Cancel revision</button>{planEditing.error && <div role="status">{planEditing.error}<button disabled={saving} onClick={() => { void planEditing.reopen(); }}>Reopen item for editing</button></div>}</div>}{editContext && <div className="reply-target edit-context" aria-label="Request being edited"><span>about · <PrivacySummary text={editContext.originalText} limit={60} /></span><button disabled={saving} onClick={() => { void editing.cancel(); }}>Cancel edit</button>{editContext.state === 'sent' ? <div role="status">Already sent<button disabled={saving} onClick={() => { void saveDraft(false, true); }}>Send as a new instruction</button></div> : editing.error && <div role="status">{editing.error}<button disabled={saving} onClick={() => { void editing.ensure(drafts.book.active).catch(() => {}); }}>Retry editing</button></div>}</div>}{commitContext && <div className="reply-target commit-context" aria-label="Commit context"><span title={commitContext.selection.path}>{commitContext.selection.path}:{commitContext.selection.startLine}{commitContext.selection.endLine !== commitContext.selection.startLine ? `–${commitContext.selection.endLine}` : ''} @ {commitContext.selection.tree.slice(0, 7)}</span><span>fix for this commit · {commitContext.label}</span><button disabled={saving || saveError} onClick={() => drafts.replaceContext({ kind: 'work' })}>Clear commit context</button>{commitContextState !== 'current' && <div className="commit-context-changed" role="status"><span>{commitContextState === 'gone' ? 'the commit is gone' : 'the commit changed'}</span>{commitContextState === 'changed' ? <button disabled={saving || saveError || !draft.trim()} onClick={() => { void resendCommitInstruction(); }}>Resend on the new version</button> : <button disabled={saving || saveError || !draft.trim()} onClick={() => { void saveDraft(false, true); }}>Send to {commitContext.label}</button>}<button disabled={saving || saveError} onClick={() => drafts.replaceContext({ kind: 'work' })}>Take back</button></div>}</div>}{repairTargetId && <div className="reply-target">{active?.label} · for the commit · {activeRepair?.phase === 'held' ? 'Add an instruction' : activeRepair?.phase ?? 'Recorded repair'}<button disabled={saving || saveError} onClick={() => { setSelectedRepair(null); drafts.replaceContext({ kind: 'work' }); }}>Clear repair target</button></div>}{planReplyContext && <div className="reply-target reply-context">Reply to plan · <PrivacyText text={planReplyContext.label} /><button disabled={saving || saveError} onClick={() => drafts.back()}>Cancel reply</button><details><summary>Original plan question</summary><p><PrivacyText text={planReplyContext.question} /></p></details><small>The current plan is checked again when you send.</small></div>}{replyTarget && <div className="reply-target reply-context">Reply to Worker {status.tracks?.find(track => track.id === replyTarget.trackId)?.label}<button disabled={saving} onClick={() => { drafts.back(); }}>Cancel reply</button>{staleReply && <div role="status">This question is no longer current. Keeping this reply will ask you where to send it.</div>}<details><summary>Original question</summary><p><PrivacyText text={replyTarget.text} /></p></details></div>}{(references.length > 0 || attachmentError) && <div className="reference-files">{attachmentError && <button disabled={attaching || saving || saveError} onClick={() => { void attachReference(true); }}>Choose another file</button>}{references.map(file => <span className="reference-chip" key={file.id}><span title={file.name}>📎 {file.name}</span><button disabled={saving || saveError || (!!editContext || !!planEditContext || !!planReplyContext)} aria-label={`Remove reference ${file.name}`} onClick={() => drafts.setAttachments(files => files.filter(item => item.id !== file.id))}>×</button></span>)}</div>}<textarea data-focus-region aria-label="Request draft" aria-busy={!drafts.ready && !drafts.issue} placeholder={!drafts.ready && !drafts.issue ? 'Loading saved draft…' : 'What would you like to work on?'} rows={stageMode ? 1 : 2} value={draft} disabled={!drafts.ready || saving || saveError || attaching} onChange={event => drafts.setText(event.target.value)} onPaste={pasteDraft} onKeyDown={composerKeyDown} /><PastedSources drafts={drafts} disabled={!drafts.ready || saving || saveError || attaching} readOnly={context.kind !== 'work' && context.kind !== 'edit' && context.kind !== 'continuation'} paste={pasteDraft} submit={composerKeyDown} /><div className="composer-bottom"><div className="composer-tools"><button className="attach-reference" aria-label={attachmentError ? 'Retry reference save' : 'Attach reference file'} title={attaching ? 'Saving reference…' : attachmentError ? 'Retry reference save' : 'Attach reference file'} aria-busy={attaching} disabled={!drafts.ready || !status.connected || preview || saving || saveError || attaching || !!replyTarget || !!repairTargetId || !!commitContext || (!!editContext || !!planEditContext || !!planReplyContext)} onClick={() => { void attachReference(); }}><svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M10 4v12M4 10h12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /></svg></button>{continuationContext || commitContext || repairTargetId || replyTarget || editContext || planEditContext || planReplyContext ? <span>{planReplyContext ? 'Reply to a plan question' : continuationContext ? 'Instruction for this plan item' : commitContext ? `fix for this commit · ${commitContext.label}` : repairTargetId ? `${active?.label} · for the commit` : planEditContext ? 'Revising a plan item' : editContext ? 'Editing a previous request' : 'Reply to question'}</span> : <RequestTarget target={draftTarget} tracks={tracks.filter(track=>!track.reviewer)} disabled={!drafts.ready || !status.connected || saving || saveError || attaching} onChange={target => drafts.setTarget(target)} />}</div><div className="composer-actions"><button disabled={!drafts.ready || !status.connected || !hasDraft || saving || sourcesPending || saveError || attaching || !!replyTarget || !!repairTargetId || !!commitContext || !!continuationContext || (!!editContext || !!planEditContext || !!planReplyContext)} onClick={() => { void saveDraft(true); }} title="New track · ⇧⌘↵">New track</button><button disabled={!drafts.ready || !status.connected || !hasDraft || saving || sourcesPending || attaching || (staleContinuation && !saveError) || (missingDraftTarget && !saveError && !replyTarget && !repairTargetId && !commitContext && !editContext && !planEditContext && !planReplyContext) || (editContext?.state === 'sent' && !saveError) || (!!commitContext && !canSendContext && !saveError) || (!!repairTargetId && (activeRepair?.phase !== 'held' || !!activeRepair.restoring || (!!activeRepair.refresh && !activeRepair.refresh.error)) && !saveError)} onClick={() => { void saveDraft(); }} title="Put request · ⌘↵">{saving ? 'Saving…' : saveError ? 'Retry save' : planReplyContext ? 'Send reply' : continuationContext ? 'Send to item' : commitContext ? 'Send to repair' : repairTargetId ? 'Send to repair' : replyTarget ? staleReply ? 'Keep reply for review' : 'Send reply' : planEditContext ? 'Revise item' : editContext ? 'Update request' : 'Put'} <span aria-hidden="true">↵</span></button>{!continuationContext && !replyTarget && !repairTargetId && !commitContext && !editContext && !planEditContext && !planReplyContext && <PlanOnlyButton disabled={!drafts.ready || !status.connected || !hasDraft || saving || sourcesPending || saveError || attaching || missingDraftTarget} submit={() => { void saveDraft(false, false, true); }} />}</div></div></div>
+        <div className="model-status" data-inferred={!modelTrackId} aria-label="Request model">{modelTrackId ? <WorkerModel model={requestModel} prefix={modelPrefix} /> : <span>Editor picks per track</span>}</div>
         <footer className="status-bar">{status.logUnavailable && <span role="status">Can’t save to the log · Stop still works</span>}<DispatchControls status={status} change={paused=>{void pauseDispatch(paused);}} /><span><i />{status.connected ? 'Daemon connected' : 'Daemon not connected'}</span><span>Local editor · {status.editor?.phase === 'ready' ? 'ready' : status.editor?.phase === 'starting' ? 'starting' : 'unavailable'}</span>{status.mode === 'unavailable' && <button onClick={() => { void window.intercat.retryConnection().then(setStatus); }}>Reconnect</button>}<span className="status-end">{status.workers?.length ? `Workers · ${status.workers.filter(worker => worker.phase === 'working' || worker.phase === 'approval').length} active / ${status.workers.filter(worker => worker.phase === 'ready').length} ready` : status.workerConfigured ? 'Workers connecting' : 'No work is being sent'}</span></footer>
       </section>
     </main>
-    {commitOpen && <Suspense fallback={<aside className="commit-sheet">Opening review…</aside>}><CommitSheet initialRequest={commitRequest} secretInputs={status.secretInputs ?? []} selectContext={context => { if (saving || saveError) return; drafts.open({ kind: 'commit', context }, true); setSelectedRepair(null); }} job={status.integration ?? null} effects={status.effects ?? []} flows={status.outputFlows ?? []} repairs={status.repairRuns ?? []} close={() => setCommitOpen(false)} update={async job => { setStatus(current => ({ ...current, integration: job })); const value = await window.intercat.getStatus(); observeStatus(value); }} /></Suspense>}
-    {editingRequest && <RequestEditor key={editingRequest.word.id} word={editingRequest.word} initialEditing={editingRequest.editText} initialLease={editingRequest.lease} compose={(word, lease) => { drafts.openEdit(word, lease); requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('[aria-label="Request draft"]')?.focus()); }} tracks={status.tracks ?? []} workers={status.workers ?? []} close={() => setEditingRequest(null)} update={observeRequest} />}
+    {commitOpen && <Suspense fallback={<aside className="commit-sheet">Opening review…</aside>}><CommitSheet hostMemory={status.hostMemory} folders={(status.project?.folders ?? []).map(folder => ({ id: folder.id, name: folder.name, tracks: (status.tracks ?? []).filter(track => status.trackFolders?.[track.id] === folder.id && status.workspaces?.some(workspace => workspace.trackId === track.id && workspace.state === 'ready')).map(track => track.id) })).filter(folder => folder.tracks.length)} initialRequest={commitRequest} secretInputs={status.secretInputs ?? []} selectContext={context => { if (saving || saveError) return; drafts.open({ kind: 'commit', context }, true); setSelectedRepair(null); }} job={status.integration ?? null} effects={status.effects ?? []} flows={status.outputFlows ?? []} repairs={status.repairRuns ?? []} close={() => setCommitOpen(false)} update={async job => { setStatus(current => ({ ...current, integration: job })); const value = await window.intercat.getStatus(); observeStatus(value); }} /></Suspense>}
+    {editingRequest && <RequestEditor key={editingRequest.word.id} word={editingRequest.word} clips={timelineClips} plans={status.plans ?? []} initialEditing={editingRequest.editText} initialLease={editingRequest.lease} compose={(word, lease) => { drafts.openEdit(word, lease); requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('[aria-label="Request draft"]')?.focus()); }} tracks={status.tracks ?? []} workers={status.workers ?? []} close={() => setEditingRequest(null)} update={observeRequest} />}
     {branchSelection && <BranchDialog key={branchSelection.operationId} selection={branchSelection} tracks={status.tracks ?? []} connected={status.connected} blockedReason={!status.workerConfigured ? 'Connect workers before creating a branch.' : !drafts.ready || saveError ? 'Finish saving the current request before creating a branch.' : null} close={() => setBranchSelection(null)} created={branchCreated} />}
     <div className="toast" role="status">{notice}</div>
     <PolicySettings presentation={presentation.state} characterChanged={presentation.setCharacter} privacy={status.privacy ?? { revision: 0, mode: 'basic' }} privacyEnabled={status.connected && !preview} localReady={!!status.editor?.modelLoaded && !!status.editor?.accepting} privacySaved={privacy => setStatus(current => privacy.revision < (current.privacy?.revision ?? 0) ? current : ({ ...current, privacy, privacyRevision: (current.privacyRevision ?? 0) + privacy.revision - (current.privacy?.revision ?? 0) }))} confirmation={status.confirmation} confirmationSaved={confirmation => setStatus(current => ({ ...current, confirmation }))} project={status.projectSecrets} tracks={status.tracks ?? []} open={settingsOpen} stops={status.stops ?? 'irreversible-only'} close={() => setSettingsOpen(false)} saved={stops => setStatus(current => ({ ...current, stops }))} />

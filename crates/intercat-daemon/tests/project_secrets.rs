@@ -4,7 +4,7 @@ use intercat_daemon::{
     project_secrets::{Descriptor, Entry, Load, Prepare},
     secrets::Key,
 };
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use uuid::Uuid;
 const VALUE: &str = "dummy-project-secret-猫-value";
 fn hex(value: &[u8]) -> String {
@@ -22,13 +22,15 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, String)> {
             .status()?
             .success()
     );
-    let project = intercat_daemon::project::inspect(path).await?;
-    let common = project.common_dir.clone();
+    let project =
+        intercat_daemon::project::inspect(uuid::Uuid::now_v7(), "Dummy project".into(), vec![path])
+            .await?;
+    let project_id = hex(&sha2::Sha256::digest(project.id.as_bytes()));
     journal.configure_project(Uuid::now_v7(), project).await?;
     journal
         .confirm_fingerprints(journal.fingerprint_catalog().await?.current)
         .await?;
-    let project = hex(&Sha256::digest(common.as_os_str().as_encoded_bytes()));
+    let project = project_id;
     assert_eq!(
         journal.snapshot().await?["projectSecrets"]["projectId"],
         project
