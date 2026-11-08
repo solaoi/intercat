@@ -111,15 +111,15 @@ Main・Planned・SmallWindow・SheetSmallWindow の四枚は、2026-11-03 に今
   - Contributor mode の Off の適用：設定の行「requested (Off) · active (On) · 2 hosts to restart · Apply now」と、帯の一行（マイルストーン 11 の前に描く）
   - メニューバーの Agents の Stop all turns（⌥⌘.）と、帯の一行「Turns stopped · 2 processes still running · Resume · 3 held」、10f の ⌥⌘. の行（マイルストーン 1 の前に描く）
   - held の一覧のポップオーバー（Start all と項目ごとの Start。マイルストーン 1 の前に描く）
-  - 依存元の差分を当てる前のカード「C’s dev server is still running · Stop it / Keep (A’s changes wait)」（マイルストーン 3 の前に描く）
+  - 依存元の差分を当てる前のカード「Worker C still has running processes · Keep (A’s changes wait) / Stop it」（画面はM3で作成済み。板は未作成）
   - Editor の行の「Placed in Login hardening · Open」（マイルストーン 6 の前に描く）
   - 文書のトラックの点線「use cover v3」、台本の見出しの「manuscript uses v2 · v3 available」、Export のシートの「cover: v2 · v3 available」の行（マイルストーン 8 の前に描く）
   - Move to project の断り「Q3 report doesn’t have lycoris-next · can’t move this session」と、移動中の帯の一行、カード「Moved, but B’s host couldn’t start · Retry」（マイルストーン 6 の前に描く）
   - Muse Code の写しのカード「Muse Code 1.4.15 is not verified · Download 1.4.14 (424 MB)」（マイルストーン 1 の前に描く）
   - Planner の時間切れのチップ「planning · timed out · Retry / Run as one job」（マイルストーン 3 の前に描く）
-  - 合わせ直しのカード「A’s dev server is still running · Stop it / Keep (realign waits)」（マイルストーン 4 の前に描く）
-  - Archived の Delete の前のカード「A’s dev server is still running · Stop it / Keep (Delete waits)」（マイルストーン 11 の前に描く）
-  - 貸し出しのカード「A’s dev server is still running · Stop it / Keep (B waits)」と、チップの「waiting for A’s dev server」。Export のシートの同じカード（マイルストーン 8 の前に描く）
+  - 合わせ直しのカード「Worker A still has running processes · Keep (realign waits) / Stop it」（マイルストーン 4 の前に描く）
+  - Archived の Delete の前のカード「Worker A still has running processes · Keep (Delete waits) / Stop it」（マイルストーン 11 の前に描く）
+  - 貸し出しのカード「Worker A still has running processes · Keep (B waits) / Stop it」と、チップの「waiting for A’s processes」。Export のシートの同じカード（マイルストーン 8 の前に描く）
   - レーンの頭の「next waits for your answer」と、質問のカードの副文「asked before your last message」（マイルストーン 2 の前に描く）
   - hook のカード「Hooks need files outside the repo · Commit without hooks / Discard」と、Check の行の「hooks skipped」、行「Hook rejected A’s commit · pre-commit → Worker A / open log」（マイルストーン 1 の前に描く）
   - 言葉のチップの「queued · 2nd」（マイルストーン 3 の前に描く）。計画の失敗・結果不明の札はDependencyFailedとDependencyUnclearに描いた。
@@ -168,7 +168,7 @@ Main・Planned・SmallWindow・SheetSmallWindow の四枚は、2026-11-03 に今
   - 差分が空のトラックの行「already in the commit · no changes」（提出の前に描く）
   - Branch from here のポップオーバーの「Instructions: current / as of the checkpoint」（マイルストーン 4 の前に描く）
   - シートの行「includes instruction files · AGENTS.md」（マイルストーン 4 の前に描く）
-  - fix が残したプロセスのカード「A’s fix left a process running · Stop it / Keep」（マイルストーン 4 の前に描く）
+  - fix が残したプロセスのカード「Worker A still has running processes · Keep / Stop it」。副文は「Left by A’s fix run」（マイルストーン 4 の前に描く）
   - 外から録音している間の小さな窓（宛先・状態・Send・Cancel）（マイルストーン 9 の前に描く）
   - 操作中に強調するターンの範囲（マイルストーン 2 の前に描く）
   - 統合の差分のチップと、状態の行の「fix for this commit · A」、帯の「the commit changed」（マイルストーン 4 の前に描く）

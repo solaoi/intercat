@@ -189,7 +189,12 @@ Meta Hackathon 向けの設計、実機検証、macOSアプリの実装をこの
 
 ### worktree（19 節）
 
-- worktree を持つのは、ファイルを書くワーカーだけだ。Reviewer は、レビューごとに対象のチェックポイントから一時の読み取り専用の worktree を作って読む。code はワーカーごとに持ち、document / page / image はセッションで共有する。共有 worktree の書き込みは、貸し出し（lease）一つで直列にする。
+- Reviewerは、対象のチェックポイントと親の木を、Gitの情報を持たない一時ディレクトリへ書き出す。
+  読み取り専用のReaderプロファイルで読み、指摘を対象のSHAに結び付ける（19節）。
+- 別フォルダの依存参照も保存した木を書き出す。
+  書き込みのできるワーカーへ渡すので、HFSXの読み取り専用イメージとしてマウントする（10.1節・V58）。
+- codeのworktreeはワーカーごとに持ち、document / page / imageはセッションで共有する。
+  共有worktreeの書き込みは、貸し出し（lease）一つで直列にする（19節）。
 - 共有 worktree の貸し出しは、前の持ち主の記録した組に生きたプロセスが無いときだけ移す。残っていれば、止めるか待つかを聞く。Export のシートも同じだ（19 節）。
 - 依存は worktree ごとに、デーモンが sandbox-exec の中で入れる。プロファイルは Check とは別だ。
 
@@ -377,20 +382,20 @@ Meta Hackathon 向けの設計、実機検証、macOSアプリの実装をこの
 | ㊽ | プロジェクトの Muse hook を、設定の鍵か trust を外すことで止められるか | 通常設定と専用 policy では止まらず、trust を外すと停止。専用スキルは利用可能 | [実装の進捗](implementation.md) |
 | ㊾ | 大きな出力で、Muse の一つのフレームがどこまで大きくなるか | 未着手 | M1 の前に行う |
 | ㊿ | Local の Glimmer を読み込んだ後の常駐のメモリ | 128 GiB 機で測定済み。active 14.60 GiB、処理後 RSS 15.05 GiB。24/32 GiB は未確認 | [実装の進捗](implementation.md) |
-| V51 | fork の後に書き換えた指示ファイルが、A′ で使われるか | 未着手 | M4 の前に行う |
+| V51 | fork の後に書き換えた指示ファイルが、A′ で使われるか | 未着手 | M4の分岐の開始方法を決める前に行う |
 | V52 | 承認要求と質問の期限。engagedで期限が外れるか、承認のtimedOutの後にどう終わるか | M3で確認。未回答・engaged・承認・一部回答は180秒の観測で自動終了せず、期限の値も提供されなかった。無期限とは断定せず、待機中は実行枠を保持する方式を採用 | [M3受入の照合](m3-acceptance.md) |
 | V53 | gix と git の CLI が、オブジェクト・パック・ref の書き込みで F_FULLFSYNC を呼ぶか | 未着手 | M1 の作る順の 1 の前に行う |
-| V54 | 隔離した場所で作ったチェックポイントの木が、元で作る木と同じになるか。統合の clone の LFS の置き場所で clean が通るか | 未着手 | M1 の作る順の 6 の前に行う |
+| V54 | 隔離した場所で作ったチェックポイントの木が、元で作る木と同じになるか。統合の clone の LFS の置き場所で clean が通るか | 未着手 | M4のfilter・LFS対応を作る前に行う |
 | V55 | ワーカーのシェルから、デーモンのソケットと token に届かないか（Muse のサンドボックスと sandbox-exec の中） | 未着手 | M1 の作る順の 3 の前に行う |
 | V56 | view/page と item/readOutput で、記録した viewCursor の続き・古い cursor・大きな出力を読めるか | 未着手 | M5 の前に行う |
 | V57 | web_fetch のリダイレクトで、別のホストへの通信先の要求が接続ごとに来るか | 未着手 | M5 の前に行う |
-| V58 | 読み取り専用の一時 worktree を workspaceRoots に足したとき、ワーカーから書けないか | 実機確認済み。通常の追加ルートは書込可。読取専用ボリュームは書込不可 | [M3の検証記録](m3-acceptance.md#v58追加ルートの読み取り専用境界2026-11-08) |
+| V58 | 保存した依存元の参照をworkspaceRootsに足したとき、ワーカーから書けないか | 実機確認済み。通常の追加ルートは書込可。HFSXの読み取り専用マウントを採用 | [M3の検証記録](m3-acceptance.md#v58追加ルートの読み取り専用境界2026-11-08) |
 | V59 | 読むだけの共有のキャッシュから、`--offline` の導入が通るか（npm・pnpm・pip・cargo）。取得の段でコードが動く形も | 未着手 | M1 で依存の導入を作る前に行う |
-| V60 | Push のプロファイルで、SSH agent・HTTPS の認証・先に走らせる pre-push が通るか | 未着手 | M4 の前に行う |
+| V60 | Push のプロファイルで、SSH agent・HTTPS の認証・先に走らせる pre-push が通るか | 未着手 | M4のPushを作る前に行う |
 | V61 | blob を持たない clone で `git describe --tags` が通り、Check から古い blob が取れないか | 未着手 | M4 の前に行う |
-| V62 | 新しい LFS のファイルを含む Push が、別の clone でそろうか。`.lfsconfig` の送り先がシートに出るか | 未着手 | M4 の前に行う |
+| V62 | 新しい LFS のファイルを含む Push が、別の clone でそろうか。`.lfsconfig` の送り先がシートに出るか | 未着手 | M4のLFSのPushを作る前に行う |
 | V63 | Export の PDF から文字を抜く道具（日本語・表・脚注）と、その文字の秘密の検査 | 未着手 | M8 の前に行う |
-| V64 | Check の世代を clonefile で写した後に、写した依存（venv・node_modules・cargo）が動くか | 未着手 | M4 の前に行う |
+| V64 | Check の世代を clonefile で写した後に、写した依存（venv・node_modules・cargo）が動くか | 未着手 | M4のCheckの世代の複製を作る前に行う |
 | V65 | 約 18 GB の Glimmer のダウンロードの進捗・再開・失敗からの戻し | 未着手 | M6 の前に行う |
 | 未決 1 | 名前の確認（USPTO class 9/42、ドメインの WHOIS、InterCat Ltd との区分） | 未着手 | 設計書の付録 B に沿って調べる |
 | 未決 2 | GitHub の org 名（`intercat` は休眠ユーザー） | 未着手 | intercat-app / getintercat などから選ぶ |
