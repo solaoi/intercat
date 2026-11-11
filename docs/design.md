@@ -3747,7 +3747,7 @@ Commit を押すと、残りの仮定は Keep になる。ボタンの文は「C
 
 ## 15. アーキテクチャ
 
-この節は、Intercat の 3 つの層と 6 つのプロセス、データの流れる向きを決める。データは一方向に流れ、UI はイベントログの投影になる。
+この節は、Intercat の 3 つの層と 6 つのプロセス、データの流れる向きを決める。データは一方向に流れ、UI はデーモンが保存した状態を受け取る。
 
 ### 3 つの層
 
@@ -4043,7 +4043,7 @@ page の HTML のライブプレビュー（「6. 成果物の種類」で将来
 4. デーモンにターン投入
 5. Muse Code
 6. イベントをデーモンが追記
-7. Editor が投影してクリップ化
+7. Editor がクリップとトラックの状態を更新
 8. UI
 
 UIはデーモンから状態を受け取る。現行版は再起動時にSQLiteに保存した状態を読み込む。
@@ -4122,9 +4122,9 @@ UI は相対に描くだけだ。
 | Folder | id, path, git, commonDir?, subpath?, defaultBranch | アプリ |
 | Session | id, name, slug, summary, projectId?, folderIds\[\], deliverable, startedAt, tracks\[\], museSessionIds{}, outputLanguage?, applyPending? | アプリ |
 | Run | id, trackId, purpose (work / fix / merge), integrationOwner? (kind / id / rev), hostId, museSessionId, worktree, status, viewCursor? | デーモン |
-| Track | id, kind, engine, folderId?, label, title?, museSessionId?, modelOverride?, parentTrackId?, branchedFrom?, groupId?, status, queuePosition?, stopReason?, endReason?, clips\[\] | ログから導出 |
+| Track | id, kind, engine, folderId?, label, title?, museSessionId?, modelOverride?, parentTrackId?, branchedFrom?, groupId?, status, queuePosition?, stopReason?, endReason?, clips\[\] | デーモン（状態を SQLite に保存） |
 | TrackGroup | id, sessionId, title, trackIds\[\], createdBy (planner) | Editor（Planner の分解から） |
-| Clip | id, trackId, runId, seq, kind, status, start, end?, title, summary, items\[\], planItemId?, diff?, assumptionIds\[\], sourceUtteranceId?, museTaskId?, imageRef?, setAside?, shell?, skillMarks\[\]? | ログから導出 |
+| Clip | id, trackId, runId, seq, kind, status, start, end?, title, summary, items\[\], planItemId?, diff?, assumptionIds\[\], sourceUtteranceId?, museTaskId?, imageRef?, setAside?, shell?, skillMarks\[\]? | デーモン（状態を SQLite に保存） |
 | Utterance | id, text, at, source, state, version, planItemId?, executeAllowed (bool), readings\[\]（Decision の id の配列）, targetTrackId?, targetRef?, commandId?, attachment?, lineRef?, twoWays?, fromHome?, newTrack?, editHold? | Editor |
 | Decision | id, utteranceId, utteranceVersion, readingIndex, placedBy, decision, sessionId?, trackId?, folderId?, clipId?, command?, boundary?, title, detail?, line?, confidence, backend, logprobs{}, logprobsCached{}?, temperature, promptVersion, tailHash, ts | Editor |
 | Plan | id, rev, state, basedOn, lockedTrack?, attachments\[\]? | Editor |
@@ -6617,7 +6617,7 @@ Editor（Glimmer）の呼び出しは、小さくて数が多い。そこで、�
 | 状態 | Editor 層（デーモン）が正。メインプロセスとレンダラーは投影を型付き RPC で購読し、Zustand の選択購読で反映 | Orca と同じ型付き RPC。小さな更新で全体が再描画されない |
 | 実行 | セッションデーモン（Rust。Electron に依存しない）。MSP は自前のクライアントで直接話す（下に説明） | Superset と Orca のリレーと同じ考え。アプリを閉じてもエージェントは止まらない（Mac が眠れば止まる） |
 | Muse Code | Intercat が持つ検証済みの写し（1.4.14-R7309.1）を直接走らせる。三つの照合が合わなければ走らせない | 利用者のランチャーは毎時に更新し、古い本体を消す。スキーマの fingerprint も変わる |
-| 永続化 | SQLite（WAL）。デーモンがイベントを追記して畳み、投影を作る | ローカル完結。ログから画面を復元できる |
+| 永続化 | SQLite（WAL）。デーモンがイベントを追記し、状態を更新する | 再起動時は保存した状態を読む。イベントからの再生は M11 で作る |
 | git | 管理の操作は gix、git の CLI は sandbox-exec の中だけ（2026-11-03 のレビュー。17 節） | 前は「git CLI を直接」としていた。リポジトリの設定が外部の処理を起こすので、分けた |
 | 差分表示 | Monaco の diff エディタ | 台本の領域の中と、シートの中で展開する。衝突の解決は、Monaco のふつうのエディタに、自前の衝突の一覧と Take A / Take B を足す。Monaco に 3-way の merge editor は無い（「13.3 Commit の手順」の手順 7） |
 | Editor 推論 | Muse Glimmer をロジットで使う（判定は生成しない）。置き場所は Local（MLX）が正で、Hosted（Modal）は人が選ぶ。判定は `/decide` の契約で呼ぶ（9.3）。Model API には無い（㉘） | 判定は prefill 一回で済む。台詞と要約だけを、置いた後に生成する（「17. Editor ハーネスの内部」の反射のモデル） |
