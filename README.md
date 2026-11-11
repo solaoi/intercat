@@ -32,6 +32,8 @@ npm run preview
 
 The local Editor requires an Apple silicon Mac with Metal and at least 32 GiB of unified memory. Its Glimmer download is about 19.4 GB. Install the Xcode Command Line Tools, Rust 1.97 or later, and Python 3.12 or later. For the workers, install Muse Code build `1.4.14-R7309.1` and sign in.
 
+This version always requests `muse-spark-1.3-contributor` when starting a new worker session, regardless of the model saved in your Muse Code settings. On Meta Model API, this Contributor variant allows Meta to train its models on the prompts, code, files, and context you send, as well as the responses you receive. Muse Code subscriptions use a separate Contributor mode setting, which Intercat writes as off in the worker configuration. [Meta’s explanation of Contributor mode](https://dev.meta.ai/docs/pricing-rate-limits#contributor-mode)
+
 After installing the npm dependencies above, prepare the Editor environment and start the app. Fetch the Rust dependencies once so the startup script can build the daemon offline.
 
 ```sh
