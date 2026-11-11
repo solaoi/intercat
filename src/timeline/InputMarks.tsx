@@ -40,7 +40,7 @@ export function InputMarks({ groups, tracks, open }: Props) {
         style={{ left: group.x - 12 }} data-utterance-id={group.marks.length === 1 ? group.marks[0].inputId ?? undefined : undefined}
         title={group.marks.length === 1 ? describe(group.marks[0]) : `${group.marks.length} requests at this time`}
         aria-label={group.marks.length === 1 ? describe(group.marks[0]) : `${group.marks.length} requests at this time`}
-        aria-haspopup={group.marks.length > 1 || group.marks[0].inputId ? 'dialog' : undefined} aria-controls={group.marks.length > 1 ? id : undefined}
+        aria-haspopup={group.marks.length > 1 || (group.marks[0].inputId||group.marks[0].commit) ? 'dialog' : undefined} aria-controls={group.marks.length > 1 ? id : undefined}
         onClick={() => group.marks.length === 1 ? open(group.marks[0]) : setExpandedId(group.id)}
         onKeyDown={event => {
           const next = event.key === 'ArrowRight' ? Math.min(index + 1, groups.length - 1)

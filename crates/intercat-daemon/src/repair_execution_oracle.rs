@@ -27,11 +27,12 @@ fn git(path: &Path, args: &[&str]) -> Result<String> {
 }
 
 struct Prepared {
+    _host: crate::test_host::IdleTestHost,
     root: tempfile::TempDir,
     journal: Journal,
     service: integration::Service,
     secrets: crate::project_secrets::Store,
-    workspace: crate::repair::Workspace,
+    workspace: crate::run_workspace::Workspace,
     run: Run,
     identity: crate::process::Identity,
     source_head: String,
@@ -49,7 +50,7 @@ async fn repair_start_outcomes_release_only_confirmed_slots() -> Result<()> {
         "running",
         "steered",
     ] {
-        let mut prepared = prepare(Some("repair-start")).await?;
+        let mut prepared = prepare(Some("repair-start"), None).await?;
         let capacity = Arc::new(crate::scheduler::Capacity::new(1));
         let (client, server) = tokio::io::duplex(65536);
         let (read, write) = tokio::io::split(client);
@@ -156,7 +157,7 @@ async fn repair_start_outcomes_release_only_confirmed_slots() -> Result<()> {
     Ok(())
 }
 
-async fn prepare(session: Option<&str>) -> Result<Prepared> {
+async fn prepare(session: Option<&str>, secret: Option<&str>) -> Result<Prepared> {
     let root = tempfile::tempdir()?;
     let source = root.path().join("source");
     fs::create_dir(&source)?;
@@ -196,7 +197,19 @@ async fn prepare(session: Option<&str>) -> Result<Prepared> {
             op_id: Uuid::now_v7(),
             project_id: project_id.clone(),
             revision: 0,
-            fingerprints: vec![],
+            fingerprints: secret
+                .map(|value| {
+                    vec![crate::project_secrets::Descriptor {
+                        name: "DEMO_TOKEN".into(),
+                        byte_len: value.len(),
+                        tag: crate::secrets::Key::new([7; 32])
+                            .tag(value.as_bytes())
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect(),
+                    }]
+                })
+                .unwrap_or_default(),
             key_check: crate::secrets::Key::new([7; 32])
                 .check()
                 .iter()
@@ -211,7 +224,14 @@ async fn prepare(session: Option<&str>) -> Result<Prepared> {
             .activate_project_secrets(crate::project_secrets::Load {
                 project_id,
                 revision: 0,
-                entries: vec![],
+                entries: secret
+                    .map(|value| {
+                        vec![crate::project_secrets::Entry {
+                            name: "DEMO_TOKEN".into(),
+                            value: value.into(),
+                        }]
+                    })
+                    .unwrap_or_default(),
             })
             .await?,
     );
@@ -295,7 +315,7 @@ async fn prepare(session: Option<&str>) -> Result<Prepared> {
         loop {
             changes.borrow_and_update();
             let job: integration::Job =
-                serde_json::from_value(journal.snapshot().await?["integration"].clone())?;
+                serde_json::from_value(journal.snapshot().await?["integrations"][0].clone())?;
             if !matches!(
                 job.status,
                 integration::Status::Building
@@ -321,8 +341,10 @@ async fn prepare(session: Option<&str>) -> Result<Prepared> {
     let mut run = journal
         .repair_start(crate::repair_run::Request {
             op_id: Uuid::now_v7(),
-            job_id: job.id,
-            revision: job.revision,
+            owner: crate::repair_run::Owner::Commit {
+                id: job.id,
+                revision: job.revision,
+            },
             track: workspace.track_id,
             purpose: crate::repair_run::Purpose::Edit {
                 text: "Offline protocol verification".into(),
@@ -342,7 +364,7 @@ async fn prepare(session: Option<&str>) -> Result<Prepared> {
         .await?;
     let (_, job, settings) = journal.repair_input(run.id).await?;
     let parent = root.path().join("integration").join(job.id.to_string());
-    let candidate_root = parent.join(job.candidate.as_ref().unwrap().generation.to_string());
+    let candidate_root = job.candidate.as_ref().unwrap().workspace.clone();
     let workspace = crate::repair::Workspace::prepare(
         &job,
         &candidate_root,
@@ -355,7 +377,8 @@ async fn prepare(session: Option<&str>) -> Result<Prepared> {
     run = journal
         .repair_transition(Uuid::now_v7(), run.id, run.revision, Event::WorkspaceReady)
         .await?;
-    let identity = crate::process::identity(std::process::id())?;
+    let idle_host = crate::test_host::IdleTestHost::new()?;
+    let identity = idle_host.identity()?;
     if let Some(session) = session {
         run = journal
             .repair_transition(
@@ -381,11 +404,12 @@ async fn prepare(session: Option<&str>) -> Result<Prepared> {
             .await?;
     }
     Ok(Prepared {
+        _host: idle_host,
         root,
         journal,
         service,
         secrets,
-        workspace,
+        workspace: crate::run_workspace::Workspace::Fix(workspace),
         run,
         identity,
         source_head,
@@ -393,10 +417,228 @@ async fn prepare(session: Option<&str>) -> Result<Prepared> {
     })
 }
 
-async fn reply_through_repair_loop(mode: crate::approval::ReplyMode) -> Result<()> {
+async fn prepare_merge(secret: Option<&str>) -> Result<Prepared> {
+    let mut prepared = prepare(None, secret).await?;
+    let journal = &prepared.journal;
+    let mut old = journal
+        .repair_control(crate::repair_run::Command {
+            op_id: Uuid::now_v7(),
+            id: prepared.run.id,
+            revision: prepared.run.revision,
+            action: Control::Stop,
+        })
+        .await?;
+    old = journal
+        .repair_transition(
+            Uuid::now_v7(),
+            old.id,
+            old.revision,
+            Event::HostClosed {
+                outcome: Outcome::Stopped,
+            },
+        )
+        .await?;
+    journal
+        .repair_control(crate::repair_run::Command {
+            op_id: Uuid::now_v7(),
+            id: old.id,
+            revision: old.revision,
+            action: Control::Discard,
+        })
+        .await?;
+    let (_, job, _) = journal.repair_input(old.id).await?;
+    prepared
+        .service
+        .command(integration::Command {
+            op_id: Uuid::now_v7(),
+            action: integration::Action::Discard {
+                id: job.id,
+                revision: job.revision,
+            },
+        })
+        .await?;
+    journal
+        .stage_utterance(
+            Uuid::now_v7(),
+            "Dummy second merge track".into(),
+            Target::New,
+            None,
+            vec![],
+        )
+        .await?;
+    let input = journal
+        .claim_input()
+        .await?
+        .ok_or("Missing dummy merge input")?;
+    journal
+        .apply_input(
+            input.id,
+            input.revision,
+            DecisionOutcome::Classified(Decision {
+                kind: Kind::Fork,
+                track_id: None,
+                boundary: Some("when-told".into()),
+                command: None,
+                confidence: 1.0,
+                inference_ms: 0.0,
+                timed_out: false,
+                scores: json!({}),
+            }),
+        )
+        .await?;
+    let preparation = crate::preparation::Preparation::start(
+        &prepared.root.path().join("workspaces"),
+        journal.clone(),
+    )?;
+    let workspace =
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let snapshot = journal.snapshot().await?;
+                let tracks = snapshot["tracks"]
+                    .as_array()
+                    .ok_or("Missing dummy tracks")?;
+                let id = tracks.last().ok_or("Missing second dummy track")?["id"]
+                    .as_str()
+                    .ok_or("Missing second track ID")?;
+                if let Some(value) = snapshot["workspaces"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|value| value["trackId"] == id && value["state"] == "ready")
+                {
+                    return Ok::<
+                        crate::preparation::Workspace,
+                        Box<dyn std::error::Error + Send + Sync>,
+                    >(serde_json::from_value(value.clone())?);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+    preparation.shutdown().await;
+    fs::write(
+        workspace.path.join("file.txt"),
+        "dummy conflicting B change\n",
+    )?;
+    crate::checkpoint::save(
+        workspace.clone(),
+        Uuid::now_v7(),
+        None,
+        false,
+        journal.clone(),
+    )
+    .await?;
+    let mut job = prepared
+        .service
+        .command(integration::Command {
+            op_id: Uuid::now_v7(),
+            action: integration::Action::Open { tracks: None },
+        })
+        .await?;
+    if job.status == integration::Status::Ordering {
+        job = prepared
+            .service
+            .command(integration::Command {
+                op_id: Uuid::now_v7(),
+                action: integration::Action::Order {
+                    id: job.id,
+                    revision: job.revision,
+                    tracks: job.tracks.iter().map(|track| track.id.clone()).collect(),
+                },
+            })
+            .await?;
+    }
+    prepared
+        .service
+        .command(integration::Command {
+            op_id: Uuid::now_v7(),
+            action: integration::Action::Prepare {
+                id: job.id,
+                revision: job.revision,
+            },
+        })
+        .await?;
+    let job = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let job: integration::Job =
+                serde_json::from_value(journal.snapshot().await?["integrations"][0].clone())?;
+            if !matches!(
+                job.status,
+                integration::Status::Building | integration::Status::Staging
+            ) {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(job);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(job.status, integration::Status::Failed, "{:?}", job.error);
+    let request = crate::merge_resolution::automatic_request(&job)?
+        .ok_or("Missing automatic merge request")?;
+    prepared.run = journal.repair_start(request).await?;
+    prepared.run = journal
+        .repair_transition(
+            Uuid::now_v7(),
+            prepared.run.id,
+            prepared.run.revision,
+            Event::Prepare,
+        )
+        .await?;
+    let (_, job, settings) = journal.repair_input(prepared.run.id).await?;
+    prepared.workspace = crate::run_workspace::Workspace::prepare(
+        &job,
+        &job.candidate.as_ref().unwrap().workspace,
+        &prepared
+            .root
+            .path()
+            .join("integration")
+            .join(job.id.to_string())
+            .join(format!("repair-{}", prepared.run.id)),
+        &prepared.run,
+        &settings,
+        watch::channel(false).1,
+    )
+    .await?;
+    prepared.run = journal
+        .repair_transition(
+            Uuid::now_v7(),
+            prepared.run.id,
+            prepared.run.revision,
+            Event::WorkspaceReady,
+        )
+        .await?;
+    Ok(prepared)
+}
+
+async fn reply_through_repair_loop(mode: crate::approval::ReplyMode, merge: bool) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let mut prepared = prepare(Some("repair-reply")).await?;
+    let mut prepared = if merge {
+        let mut prepared = prepare_merge(None).await?;
+        for event in [
+            Event::HostStarted {
+                host: prepared.identity,
+                nonce: Uuid::now_v7(),
+                secret_revision: Some(0),
+            },
+            Event::SessionReady {
+                session: "repair-reply".into(),
+            },
+        ] {
+            prepared.run = prepared
+                .journal
+                .repair_transition(
+                    Uuid::now_v7(),
+                    prepared.run.id,
+                    prepared.run.revision,
+                    event,
+                )
+                .await?;
+        }
+        prepared
+    } else {
+        prepare(Some("repair-reply"), None).await?
+    };
     let op = Uuid::now_v7();
     let turn = Uuid::now_v7();
     let text = "Yes, run it, but keep the original folder.";
@@ -406,7 +648,7 @@ async fn reply_through_repair_loop(mode: crate::approval::ReplyMode) -> Result<(
     };
     let requirement = json!({"approvalId":"reply-approval","sourceIndex":0});
     let request = json!({"sessionId":"repair-reply","turnId":turn,"approvalId":"reply-approval","itemId":"reply-item","rawArgs":"{}",
-        "subject":{"kind":"shell","workspaceRoot":prepared.workspace.checkout.workdir,"command":"git push origin main","stages":[{"argv":["git","push","origin","main"],"argvComplete":true}]},
+        "subject":{"kind":"shell","workspaceRoot":prepared.workspace.checkout().workdir,"command":"git push origin main","stages":[{"argv":["git","push","origin","main"],"argvComplete":true}]},
         "currentRequirementId":requirement,"availableChoices":[{"scope":"once","decision":"approved","choiceId":"yes"},{"scope":"once","decision":"denied","choiceId":"no","acceptsFeedback":mode==crate::approval::ReplyMode::Feedback}]});
     let (client, server) = tokio::io::duplex(1024 * 1024);
     let (read, write) = tokio::io::split(client);
@@ -645,18 +887,27 @@ async fn reply_through_repair_loop(mode: crate::approval::ReplyMode) -> Result<(
 
 #[tokio::test]
 async fn repair_reply_sends_a_durable_denial_with_feedback() -> Result<()> {
-    reply_through_repair_loop(crate::approval::ReplyMode::Feedback).await
+    reply_through_repair_loop(crate::approval::ReplyMode::Feedback, false).await
 }
 
 #[tokio::test]
 async fn repair_reply_stops_before_the_writer_and_queues_only_after_host_closure() -> Result<()> {
-    reply_through_repair_loop(crate::approval::ReplyMode::Restart).await
+    reply_through_repair_loop(crate::approval::ReplyMode::Restart, false).await
+}
+
+#[tokio::test]
+async fn merge_reply_sends_a_durable_denial_with_feedback() -> Result<()> {
+    reply_through_repair_loop(crate::approval::ReplyMode::Feedback, true).await
+}
+#[tokio::test]
+async fn merge_reply_stops_before_the_writer_and_queues_only_after_host_closure() -> Result<()> {
+    reply_through_repair_loop(crate::approval::ReplyMode::Restart, true).await
 }
 
 #[tokio::test]
 #[ignore = "two paid dummy Muse turns; masks feedback only in the test transport"]
 async fn real_repair_reply_closes_its_host_before_starting_the_followup() -> Result<()> {
-    let prepared = prepare(None).await?;
+    let prepared = prepare(None, None).await?;
     let output = PathBuf::from(std::env::var("INTERCAT_REPAIR_OUTPUT")?)
         .join(format!("native-reply-{}", Uuid::now_v7()));
     fs::create_dir_all(&output)?;
@@ -775,14 +1026,14 @@ async fn real_repair_reply_closes_its_host_before_starting_the_followup() -> Res
         assert!(!crate::process::is_alive(next_host));
         assert_eq!(held.session, completed.session);
         crate::approval_reply::confirm(&prepared.journal, op).await?;
-        assert_eq!(fs::read_to_string(workspace.checkout.workdir.join("file.txt"))?, "fixed\n");
+        assert_eq!(fs::read_to_string(workspace.checkout().workdir.join("file.txt"))?, "fixed\n");
         assert!(git(&remote, &["for-each-ref", "--format=%(refname)"])?.is_empty());
         assert_eq!(git(&prepared.root.path().join("source"), &["rev-parse", "HEAD"])?, prepared.source_head);
         assert_eq!(fs::read(prepared.root.path().join("source/.git/index"))?, prepared.source_index);
         let db = rusqlite::Connection::open(prepared.root.path().join("db"))?;
         assert_eq!(db.query_row("SELECT count(*) FROM operations WHERE kind='turn.start'", [], |row| row.get::<_, i64>(0))?, 2);
         let checked = prepared.journal.snapshot().await?;
-        assert_eq!(checked["integration"]["status"], "checked");
+        assert_eq!(checked["integrations"][0]["status"], "checked");
         fs::write(output.join("result.json"), serde_json::to_vec_pretty(&json!({"runs":[held,completed],"hosts":[first_host,next_host],"sameSession":true,"sourceUnchanged":true,"remoteUnchanged":true,"paidTurns":2,"automaticFollowup":true,"candidateStatus":"checked","capabilityFixture":"acceptsFeedback hidden in test transport"}))?)?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     }.await;
@@ -814,7 +1065,7 @@ async fn approvals_match_the_pinned_sdk() -> Result<()> {
         fixture.request["subject"]["workspaceRoot"],
         fixture.workspace.to_string_lossy().as_ref()
     );
-    let mut prepared = prepare(Some(&fixture.session)).await?;
+    let mut prepared = prepare(Some(&fixture.session), None).await?;
     let (client, server) = tokio::io::duplex(1024 * 1024);
     let (read, write) = tokio::io::split(client);
     let mut connection = crate::msp::Connection::new(read, write);
@@ -916,5 +1167,322 @@ async fn approvals_match_the_pinned_sdk() -> Result<()> {
         output["complete"] == true,
         "Repair did not send the expected decisions"
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "native offline echo: completed fix saves its result while retaining scoped process controls; fake authentication only"]
+async fn native_completed_repair_retires_transport_and_keeps_process_controls() -> Result<()> {
+    native_retired_repair(
+        true,
+        false,
+        PathBuf::from(std::env::var("INTERCAT_M4_PROCESS_OUTPUT")?),
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "native offline echo: no-child completed fix releases its resources after saving; fake authentication only"]
+async fn native_completed_repair_without_children_releases_its_resources() -> Result<()> {
+    native_retired_repair(
+        false,
+        false,
+        PathBuf::from(std::env::var("INTERCAT_M4_PROCESS_OUTPUT")?),
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "native offline echo: a separate merge Run saves its frozen result and retains child process controls; fake authentication only"]
+async fn native_completed_merge_retires_transport_and_publishes_its_frozen_result() -> Result<()> {
+    native_retired_repair(
+        true,
+        true,
+        PathBuf::from(std::env::var("INTERCAT_M4_PROCESS_OUTPUT")?),
+    )
+    .await
+}
+
+async fn native_retired_repair(leave_child: bool, merge: bool, output: PathBuf) -> Result<()> {
+    let secret = Some("dummy local process value 20261108");
+    let prepared = if merge {
+        prepare_merge(secret).await?
+    } else {
+        prepare(None, secret).await?
+    };
+    fs::create_dir_all(&output)?;
+    let binary = crate::host::prepare_binary(
+        &PathBuf::from(std::env::var("INTERCAT_TEST_MUSE_BINARY")?),
+        &prepared.root.path().join("muse"),
+    )?;
+    let credentials = prepared.root.path().join("dummy-auth.json");
+    fs::write(&credentials, r#"{"schema_version":1}"#)?;
+    let config = crate::runtime::Config {
+        source: binary.clone(),
+        binary,
+        credentials,
+        path: std::env::var("PATH")?,
+    };
+    let rpc = prepared.root.path().join("rpc");
+    fs::create_dir(&rpc)?;
+    let workspace = Arc::new(prepared.workspace);
+    fs::write(workspace.checkout().workdir.join("file.txt"), "fixed\n")?;
+    if merge {
+        workspace
+            .checkout()
+            .git(
+                &["add".into(), "--".into(), "file.txt".into()],
+                true,
+                watch::channel(false).1,
+            )
+            .await?
+            .require_success("Stage dummy merge resolution")?;
+    }
+    let private_root = workspace.checkout().root.clone();
+    let memory = crate::host_memory::Pool::fixed(crate::host_memory::Sample {
+        free_bytes: 8 * 1024 * 1024 * 1024,
+        pressured: false,
+    });
+    let mut run = prepared.run;
+    let journal = prepared.journal.clone();
+    let host_directory = prepared
+        .root
+        .path()
+        .join("repair-hosts")
+        .join(run.id.to_string());
+    let opened = crate::host::OFFLINE_ECHO
+        .scope(
+            (),
+            crate::repair_host::open(
+                &journal,
+                &mut run,
+                &workspace,
+                crate::repair_host::Launch {
+                    memory: memory.clone(),
+                    worker: &config,
+                    directory: &host_directory,
+                    rpc: &rpc,
+                    project_secrets: prepared.secrets.clone(),
+                    one_time: None,
+                },
+            ),
+        )
+        .await?;
+    let mut hosted = opened;
+    let host = hosted.identity();
+    let nonce: Uuid = hosted.nonce().parse()?;
+    let tracker = hosted.host_mut().tracker.clone();
+    struct Guard(Arc<Mutex<crate::process::Tracker>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut tracker) = self.0.lock() {
+                let _ = tracker.stop_confirmed();
+            }
+        }
+    }
+    let _guard = Guard(tracker.clone());
+    let db = rusqlite::Connection::open(prepared.root.path().join("db"))?;
+    let echo: i64 = db.query_row(
+        "SELECT count(*) FROM events WHERE kind='worker.session' AND json_extract(payload,'$.result.session.providerId')='echo'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(echo > 0, "Never submit this dummy turn to a paid provider");
+    let mut child = tokio::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "repair_process_service::tests::owned_scope_sleeper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("INTERCAT_HOST", nonce.to_string())
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let child_identity = crate::process::identity(child.id().unwrap())?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if tracker
+                .lock()
+                .unwrap()
+                .refresh()?
+                .processes
+                .iter()
+                .any(|process| process.identity == child_identity)
+            {
+                break Ok::<_, std::io::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    if !leave_child {
+        child.kill().await?;
+    }
+    let (_, runner) = channel(&mut hosted, &run)?;
+    let captured = crate::host::OFFLINE_ECHO
+        .scope(
+            (),
+            runner.execute(
+                hosted,
+                journal.clone(),
+                &workspace,
+                Task {
+                    instruction: "INTERCAT_M4_DUMMY_RETIRED_RUN".into(),
+                    capacity: Arc::new(crate::scheduler::Capacity::new(1)),
+                    shutdown: watch::channel(false).1,
+                    project_secrets: prepared.secrets.clone(),
+                },
+            ),
+        )
+        .await?;
+    assert_eq!(captured.phase, Phase::Captured);
+    if merge {
+        let view = journal
+            .timeline_window(crate::timeline::Window {
+                tracks: vec![run.track.clone()],
+                start: 0,
+                end: i64::MAX,
+                since: None,
+            })
+            .await?;
+        let clips = view["clips"]
+            .as_array()
+            .ok_or("Missing merge timeline.")?
+            .iter()
+            .filter(|clip| clip["repairRunId"] == run.id.to_string())
+            .collect::<Vec<_>>();
+        assert!(!clips.is_empty());
+        assert!(clips.iter().all(|clip| {
+            clip["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("merge · "))
+        }));
+    }
+    assert!(!crate::process::is_alive(host));
+    assert_eq!(crate::process::is_alive(child_identity), leave_child);
+    assert_eq!(memory.snapshot().hosts, 0);
+    assert_eq!(
+        captured.remaining.as_ref().unwrap().state,
+        if leave_child {
+            crate::run_processes::State::Waiting
+        } else {
+            crate::run_processes::State::Cleaning
+        }
+    );
+    let (_, job, _) = journal.repair_input(run.id).await?;
+    let done = crate::repair_application::apply(
+        &journal,
+        &captured,
+        workspace.clone(),
+        job.candidate.as_ref().unwrap().workspace.clone(),
+        prepared
+            .root
+            .path()
+            .join("integration")
+            .join(job.id.to_string())
+            .join(job.revision.to_string()),
+        prepared.root.path().join("integration/downloads"),
+        watch::channel(false).1,
+    )
+    .await?;
+    assert_eq!(done.phase, Phase::Done);
+    assert_eq!(crate::process::is_alive(child_identity), leave_child);
+    let before = journal.snapshot().await?;
+    assert_eq!(before["integrations"][0]["status"], "checked");
+    let open_usage: i64 = db.query_row(
+        "SELECT count(*) FROM project_secret_hosts WHERE nonce=?1 AND closed=0",
+        [nonce.to_string()],
+        |row| row.get(0),
+    )?;
+    assert_eq!(open_usage, i64::from(leave_child));
+    if leave_child {
+        let keep = crate::run_processes::Command {
+            op_id: Uuid::now_v7(),
+            id: done.id,
+            nonce,
+            revision: 0,
+            action: crate::run_processes::Action::Keep,
+        };
+        let kept = journal.decide_repair_processes(keep).await?;
+        assert_eq!(kept.revision, done.revision);
+        assert_eq!(crate::process::is_alive(child_identity), leave_child);
+    }
+    let monitor = crate::repair_process_service::Monitor::start(
+        journal.clone(),
+        prepared.root.path().join("integration"),
+        prepared.root.path().to_path_buf(),
+    );
+    if leave_child {
+        journal
+            .decide_repair_processes(crate::run_processes::Command {
+                op_id: Uuid::now_v7(),
+                id: done.id,
+                nonce,
+                revision: 1,
+                action: crate::run_processes::Action::Stop,
+            })
+            .await?;
+    }
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let snapshot = journal.snapshot().await?;
+            if snapshot["repairRuns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|run| run["id"] == done.id.to_string() && run["remaining"].is_null())
+            {
+                break Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    monitor.shutdown().await;
+    child.wait().await?;
+    assert!(!crate::process::is_alive(child_identity));
+    assert!(!private_root.exists());
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM project_secret_hosts WHERE nonce=?1 AND closed=0",
+            [nonce.to_string()],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0
+    );
+    let after = journal.snapshot().await?;
+    assert_eq!(after["integrations"][0]["status"], "checked");
+    assert_eq!(
+        before["integrations"][0]["candidate"]["head"],
+        after["integrations"][0]["candidate"]["head"]
+    );
+    assert_eq!(
+        git(&prepared.root.path().join("source"), &["rev-parse", "HEAD"])?,
+        prepared.source_head
+    );
+    assert_eq!(
+        fs::read(prepared.root.path().join("source/.git/index"))?,
+        prepared.source_index
+    );
+    db.execute(
+        "VACUUM INTO ?1",
+        [output.join("events.sqlite").to_str().unwrap()],
+    )?;
+    fs::write(
+        output.join("verification.json"),
+        serde_json::to_vec_pretty(&json!({
+            "verified":true,"runPurpose":if merge {"merge"} else {"fix"},"schema":crate::journal::SCHEMA_VERSION,"provider":"echo","paidTurns":0,"echoSessionReplies":echo,
+            "retiredHost":host,"remainingProcess":child_identity,"transportClosed":true,"leaseReleased":true,
+            "childLeftRunning":leave_child,"candidateCheckedWithChildAlive":leave_child,"keepPreservedProcess":leave_child,"stopConfirmedBeforeCleanup":true,
+            "privateWorkspaceRemoved":true,"secretUsageRetainedUntilProcessExit":true,"sourceUnchanged":true,
+            "candidateHead":after["integrations"][0]["candidate"]["head"],"runId":done.id,"mergeClipNamed":merge,
+        }))?,
+    )?;
+    prepared.service.shutdown().await;
     Ok(())
 }

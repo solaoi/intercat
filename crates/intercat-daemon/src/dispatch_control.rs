@@ -118,25 +118,7 @@ pub(crate) fn set(
 /// A new user request can release a local hold. Requests that existed before
 /// the hold, including a classification that finishes late, cannot release it.
 pub(crate) fn local_resumes(connection: &Connection) -> Result<serde_json::Value> {
-    let mut statement = connection.prepare(
-        "SELECT json_extract(h.payload,'$.trackId'),h.id FROM operations h
-         WHERE h.kind='worker.hold'
-         AND NOT EXISTS(SELECT 1 FROM operations later WHERE later.kind='worker.hold'
-             AND later.rowid>h.rowid AND json_extract(later.payload,'$.trackId')=json_extract(h.payload,'$.trackId'))
-         AND EXISTS(SELECT 1 FROM utterances u JOIN operations request ON request.id=u.id
-             WHERE request.kind='utterance.create' AND request.rowid>h.rowid
-             AND NOT EXISTS(SELECT 1 FROM review_fix_inputs fi WHERE fi.input=u.id)
-             AND u.state='placed' AND json_extract(u.decision,'$.trackId')=json_extract(h.payload,'$.trackId'))",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut resumes = serde_json::Map::new();
-    for row in rows {
-        let (track, hold) = row?;
-        resumes.insert(track, hold.into());
-    }
-    Ok(resumes.into())
+    crate::worker_hold::resumes(connection)
 }
 
 pub(crate) fn mark_uncertain(connection: &Connection, track: Option<&str>) -> Result<()> {

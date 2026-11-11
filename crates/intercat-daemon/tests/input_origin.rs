@@ -65,6 +65,7 @@ impl Fixture {
                 1,
                 track.clone(),
                 json!({"sessionId":"source-session","commandId":command}),
+                None,
             )
             .await?;
         journal.try_msp(track.clone(),"source-session".into(),Stamp::now(),json!({"method":"item/updated","params":{"sessionId":"source-session","item":{"kind":"userMessage","itemId":"source-input","commandId":command,"turnId":turn,"text":"The original request","revision":1,"status":"completed"}}}),None,None)?.await??;
@@ -133,6 +134,7 @@ impl Fixture {
         let sha = repo.checkpoint_commit(after, base, "original turn")?;
         self.journal
             .workspace_result(intercat_daemon::preparation::Workspace {
+                denied_roots: Vec::new(),
                 track_id: self.track.clone(),
                 path,
                 reference: "refs/intercat/test/tracks/A".into(),

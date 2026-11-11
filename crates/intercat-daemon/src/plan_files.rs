@@ -201,7 +201,7 @@ fn merge(
         repo.tree_id(after.parse()?)?,
     )? {
         Merge::Clean(tree) => Ok(tree),
-        Merge::Conflicts(paths) => Err(crate::inheritance_issue::Blocker::Conflict {
+        Merge::Conflicts { paths, .. } => Err(crate::inheritance_issue::Blocker::Conflict {
             paths: paths.iter().map(ToString::to_string).collect(),
             base,
         }
@@ -226,23 +226,36 @@ pub(crate) fn recompose(
     let (before, old_basis) = compose(repo, origin, &previous)?;
     let (desired, new_basis) = compose(repo, origin, source)?;
     let tree = merge(repo, &before, current, &desired, false)?;
-    let base = if old_basis.base == new_basis.base {
+    // Synthesized base commits can have different timestamps while identifying
+    // the same files. Coverage is validated separately; compare trees here.
+    let old_base = repo.tree_id(old_basis.base.parse()?)?;
+    let new_base = repo.tree_id(new_basis.base.parse()?)?;
+    let current_base = repo.tree_id(basis.base.parse()?)?;
+    let base = if old_base == new_base {
         basis.base.clone()
-    } else if basis.base == old_basis.base {
+    } else if current_base == old_base {
         new_basis.base.clone()
     } else {
         let tree = merge(repo, &old_basis.base, &basis.base, &new_basis.base, true)?;
         repo.checkpoint_commit(tree, basis.base.parse()?, "Recompose dependency base")?
             .to_string()
     };
+    let parents = transition(&old_basis.parents, &basis.parents, &new_basis.parents)?;
+    let views = crate::lineage::view::merge([basis.views.clone(), new_basis.views.clone()])?;
+    let inherits = source.graph.inherited_from(&parents, &views)?;
+    if inherits != transition(&old_basis.inherits, &basis.inherits, &new_basis.inherits)? {
+        return Err("Another dependency was added to this track. Include it in this plan’s dependencies, then try again.".into());
+    }
     let next = Basis {
+        views,
+        parents,
         base,
         base_inherits: transition(
             &old_basis.base_inherits,
             &basis.base_inherits,
             &new_basis.base_inherits,
         )?,
-        inherits: transition(&old_basis.inherits, &basis.inherits, &new_basis.inherits)?,
+        inherits,
     };
     let head = repo.checkpoint_commit(tree, current.parse()?, "Recompose prepared plan item")?;
     repo.sync_objects(&[head, next.base.parse()?])?;
@@ -294,6 +307,8 @@ mod tests {
             input: input.clone(),
             track: "child".into(),
             points: vec![Point {
+                views: Vec::new(),
+                parents: Default::default(),
                 track: "parent".into(),
                 number: 1,
                 sha: "dummy-parent".into(),
@@ -348,6 +363,96 @@ mod tests {
     }
 
     #[test]
+    fn an_independent_direct_parent_must_remain_explicit_when_its_covering_parent_is_removed()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        Repository::init_isolated(root.path())?;
+        let repo = Repository::open(root.path())?;
+        let empty = repo.empty_starting_point()?;
+        let make =
+            |track: &str, number, files: &[(&str, &str)], parents: &[&Point]| -> Result<Point> {
+                let blobs = files
+                    .iter()
+                    .map(|(path, text)| Ok((*path, repo.write_blob(text.as_bytes())?)))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut inherits = Ancestors::new();
+                for parent in parents {
+                    for (track, mark) in &parent.inherits {
+                        crate::lineage::include(&mut inherits, track, mark)?;
+                    }
+                    crate::lineage::include(&mut inherits, &parent.track, &parent.inherited())?;
+                }
+                Ok(Point {
+                    views: Vec::new(),
+                    parents: parents
+                        .iter()
+                        .map(|point| (point.track.clone(), point.inherited()))
+                        .collect(),
+                    track: track.into(),
+                    number,
+                    sha: repo
+                        .checkpoint_commit(
+                            repo.write_tree(&blobs)?,
+                            empty,
+                            &format!("Own {track}@{number}"),
+                        )?
+                        .to_string(),
+                    base_at: empty.to_string(),
+                    base_inherits_at: Ancestors::new(),
+                    inherits,
+                })
+            };
+        let x1 = make("X", 1, &[("x", "one")], &[])?;
+        let x3 = make("X", 3, &[("x", "three")], &[])?;
+        let old = make("A", 3, &[("x", "three"), ("retired", "A later")], &[&x3])?;
+        let new = make("A2", 1, &[("replacement", "A branch")], &[])?;
+        let graph = crate::lineage::Frozen {
+            points: vec![x1.clone(), x3, old.clone(), new.clone()],
+            integrated: Ancestors::new(),
+        };
+        let origin = Origin {
+            item: Uuid::now_v7(),
+            track: "B".into(),
+            head: empty.to_string(),
+            basis: Basis::root(empty.to_string()),
+            initial: true,
+            first_points: vec![old.clone()],
+            points: vec![old.clone()],
+        };
+        let mut source = Source {
+            graph,
+            dependencies: crate::inheritance::Dependencies {
+                input: Uuid::now_v7().to_string(),
+                track: "B".into(),
+                points: vec![old],
+            },
+        };
+        let (_, mut basis) = compose(&repo, &origin, &source)?;
+        basis.parents.insert("X".into(), x1.inherited());
+        assert_eq!(basis.inherits["X"].number, 3);
+        let current = make(
+            "B",
+            1,
+            &[("x", "three"), ("retired", "A later"), ("own", "B")],
+            &[&source.dependencies.points[0], &x1],
+        )?
+        .sha;
+        source.dependencies.points = vec![new.clone()];
+        assert!(recompose(&repo, &origin, &source, &current, &basis).is_err());
+        source.dependencies.points.push(x1.clone());
+        let (head, after) = recompose(&repo, &origin, &source, &current, &basis)?;
+        let files = repo.saved_files(head.parse()?)?;
+        assert_eq!(repo.saved_bytes(&files["x"])?, b"one");
+        assert!(files.contains_key("own") && files.contains_key("replacement"));
+        assert!(!files.contains_key("retired"));
+        assert_eq!(after.parents["X"], x1.inherited());
+        assert_eq!(after.parents["A2"], new.inherited());
+        assert_eq!(after.inherits["X"], x1.inherited());
+        assert!(!after.inherits.contains_key("A"));
+        Ok(())
+    }
+
+    #[test]
     fn recomposition_keeps_parent_base_updates_and_existing_worker_edits() -> Result<()> {
         let root = tempfile::tempdir_in("/private/tmp")?;
         gix::init(root.path())?;
@@ -362,6 +467,8 @@ mod tests {
         };
         let parent = commit(empty, &[("parent.txt", "first\n")])?;
         let first = Point {
+            views: Vec::new(),
+            parents: Default::default(),
             track: "parent".into(),
             number: 1,
             sha: parent.to_string(),
@@ -432,7 +539,16 @@ mod tests {
         assert_eq!(basis.inherits["parent"], second.inherited());
         origin.points = vec![second];
         source.dependencies.points.clear();
-        let (removed, removed_basis) = recompose(&repo, &origin, &source, &head, &basis)?;
+        let mut same_files = basis.clone();
+        same_files.base = repo
+            .checkpoint_commit(
+                repo.tree_id(basis.base.parse()?)?,
+                basis.base.parse()?,
+                "Own same-tree base identity",
+            )?
+            .to_string();
+        assert_ne!(same_files.base, basis.base);
+        let (removed, removed_basis) = recompose(&repo, &origin, &source, &head, &same_files)?;
         let files = repo.saved_files(removed.parse()?)?;
         assert!(!files.contains_key("parent.txt") && !files.contains_key("base-update.txt"));
         assert!(files.contains_key("own.txt") && files.contains_key("extra.txt"));

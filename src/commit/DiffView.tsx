@@ -3,7 +3,7 @@ import { monaco } from '../preview/editor';
 import type { Diff } from './types';
 import type { DiffSelection } from './context';
 
-export default function DiffView({ value, select }: { value: Diff; select?: (range: DiffSelection) => void }) {
+export default function DiffView({ value, select, split=false }: { value: Diff; select?: (range: DiffSelection) => void; split?:boolean }) {
   const host = useRef<HTMLDivElement>(null);
   const selectRef = useRef(select);
   selectRef.current = select;
@@ -13,7 +13,7 @@ export default function DiffView({ value, select }: { value: Diff; select?: (ran
     const language = ({ ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript', json: 'json', py: 'python', rs: 'rust', md: 'markdown', css: 'css', html: 'html' } as Record<string, string>)[extension] ?? 'plaintext';
     const before = monaco.editor.createModel(value.before, language);
     const after = monaco.editor.createModel(value.after, language);
-    const editor = monaco.editor.createDiffEditor(host.current, { readOnly: true, renderSideBySide: false, automaticLayout: true, theme: 'intercat', fontSize: 12, minimap: { enabled: false }, scrollBeyondLastLine: false, renderOverviewRuler: false });
+    const editor = monaco.editor.createDiffEditor(host.current, { readOnly: true, renderSideBySide: split, automaticLayout: true, theme: 'intercat', fontSize: 12, minimap: { enabled: false }, scrollBeyondLastLine: false, renderOverviewRuler: false });
     editor.setModel({ original: before, modified: after });
     const listeners = ([['before', editor.getOriginalEditor(), before], ['after', editor.getModifiedEditor(), after]] as const).flatMap(([side, pane, model]) => {
       const publish = (range: import('monaco-editor').Selection) => {
@@ -30,7 +30,7 @@ export default function DiffView({ value, select }: { value: Diff; select?: (ran
       })];
     });
     return () => { listeners.forEach(listener => listener.dispose()); editor.dispose(); before.dispose(); after.dispose(); };
-  }, [value]);
+  }, [value,split]);
   if (value.binary || value.tooLarge) return <p className="commit-empty">{value.binary ? 'Binary file — text preview unavailable.' : 'This file exceeds the 1 MiB preview limit.'}</p>;
   return <div className="commit-diff" ref={host} role="region" aria-label={`Diff for ${value.path}`} />;
 }

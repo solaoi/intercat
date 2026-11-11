@@ -7,6 +7,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[path = "commit_group_service.rs"]
+mod groups;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(
     tag = "action",
@@ -28,6 +31,11 @@ pub enum Action {
         track: String,
         included: bool,
     },
+    ChoosePath {
+        id: Uuid,
+        revision: u64,
+        track: String,
+    },
     Order {
         id: Uuid,
         revision: u64,
@@ -42,6 +50,10 @@ pub enum Action {
         revision: u64,
     },
     Recheck {
+        id: Uuid,
+        revision: u64,
+    },
+    TreatCheckAsFailure {
         id: Uuid,
         revision: u64,
     },
@@ -82,6 +94,29 @@ pub enum Action {
     },
 }
 
+impl Action {
+    fn job_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Open { .. } => None,
+            Self::Refresh { id, .. }
+            | Self::Select { id, .. }
+            | Self::ChoosePath { id, .. }
+            | Self::Order { id, .. }
+            | Self::Discard { id, .. }
+            | Self::Prepare { id, .. }
+            | Self::Recheck { id, .. }
+            | Self::TreatCheckAsFailure { id, .. }
+            | Self::SkipHooks { id, .. }
+            | Self::EditMessage { id, .. }
+            | Self::Commit { id, .. }
+            | Self::RetryCommit { id, .. }
+            | Self::RetryAssumptions { id, .. }
+            | Self::KeepAssumption { id, .. }
+            | Self::KeepSecret { id, .. } => Some(*id),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Command {
@@ -94,8 +129,14 @@ pub struct Command {
 pub struct DiffRequest {
     pub id: Uuid,
     pub revision: u64,
-    pub track: String,
+    pub owner: DiffOwner,
     pub path: String,
+}
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum DiffOwner {
+    Worker { track: String },
+    Undo,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,6 +153,7 @@ pub struct Diff {
 #[serde(rename_all = "kebab-case")]
 pub enum Status {
     Preparing,
+    Choosing,
     Ordering,
     Open,
     MergeConflict,
@@ -154,12 +196,15 @@ pub struct Job {
     pub lineage: crate::lineage::Frozen,
     pub omitted_conflicts: std::collections::BTreeSet<String>,
     pub plan: Option<Plan>,
+    pub undo: Option<crate::replacement_undo::Plan>,
+    pub path_review: crate::replacement_review::Review,
     pub error: Option<String>,
     pub candidate: Option<crate::candidate::Candidate>,
     pub messages: BTreeMap<String, String>,
     pub publication: Option<crate::publication::Publication>,
     pub kept_secrets: std::collections::BTreeSet<String>,
     pub contributions: BTreeMap<String, crate::candidate::Contribution>,
+    pub fixes: BTreeMap<String, std::collections::BTreeSet<String>>,
     // These relations are hydrated by the journal and projected explicitly for the UI.
     #[serde(skip)]
     pub assumptions: Vec<crate::integration_assumptions::Review>,
@@ -171,18 +216,43 @@ pub struct Job {
     pub assumptions_failed: usize,
     #[serde(skip)]
     pub order_review: Option<crate::integration_order::Review>,
+    #[serde(skip)]
+    pub path_state: Option<crate::replacement_review::Evaluation>,
+    #[serde(skip)]
+    pub retirements: Vec<crate::path_retirement::Entry>,
 }
 
 pub(crate) fn project(job: &Job) -> Result<serde_json::Value> {
     let mut value = crate::integration_assumptions::project(job)?;
+    value["pathReview"]["families"] = serde_json::to_value(
+        job.path_review
+            .families
+            .iter()
+            .filter(|family| family.has_alternatives())
+            .collect::<Vec<_>>(),
+    )?;
     value["orderReview"] = serde_json::to_value(&job.order_review)?;
     value["exclusions"] = serde_json::to_value(crate::integration_exclusions::project(job)?)?;
+    value["pathState"] = job
+        .path_state
+        .as_ref()
+        .map(|state| {
+            serde_json::json!({
+                "pending":state.pending,"retired":state.retired,"undoRecords":state.records.len(),
+                "mixed":state.mixed,"descendants":state.descendants,"ready":state.ready(),
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
+    value["retirements"] = serde_json::to_value(&job.retirements)?;
     Ok(value)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Plan {
+    /// The journal binds this to target_head before any merge is planned.
+    pub coverage: Option<crate::lineage::Ancestors>,
+    pub undo_conflict: Option<crate::replacement_undo::Conflict>,
     pub target_ref: String,
     /// None means the session branch has not been created yet. The first
     /// publication must use a create-only CAS, even though target_head exists.
@@ -363,6 +433,8 @@ pub fn freeze(job: &Job) -> Result<Plan> {
     roots.extend(job.lineage.roots()?);
     repo.sync_objects(&roots)?;
     Ok(Plan {
+        coverage: None,
+        undo_conflict: None,
         target_ref,
         expected_target: expected_target.map(|id| id.to_string()),
         expected_staging: repo
@@ -375,6 +447,11 @@ pub fn freeze(job: &Job) -> Result<Plan> {
 }
 
 pub fn plan(job: &Job) -> Result<Plan> {
+    if job.path_state.as_ref().is_some_and(|state| !state.ready()) {
+        return Err(
+            "Choose a path and review its affected dependencies before preparing Commit.".into(),
+        );
+    }
     crate::integration_exclusions::validate(job)?;
     let repo = repository(job)?;
     let frozen = job
@@ -384,9 +461,54 @@ pub fn plan(job: &Job) -> Result<Plan> {
     let mut tree = repo.tree_id(frozen.target_head.parse()?)?;
     let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut blocked = false;
+    let mut undo_conflict = None;
     let mut rows = Vec::new();
     let mut roots = vec![tree];
-    let mut integrated = job.lineage.integrated.clone();
+    let mut integrated = frozen
+        .coverage
+        .clone()
+        .ok_or("Freeze the published checkpoint coverage before comparing changes.")?;
+    if let Some(undo) = &job.undo {
+        undo.validate(job)?;
+        undo.verify_records(&repo)?;
+        crate::replacement_delta::rewind(&undo.records, &mut integrated);
+        let mut merges = crate::merge_choices::Merges::new(&repo, &undo.resolutions)?;
+        let reversed = crate::replacement_delta::reverse(&mut merges, tree, &undo.records)?;
+        merges.finish()?;
+        match reversed.result {
+            Merge::Clean(next) => {
+                tree = next;
+                roots.push(tree);
+            }
+            Merge::Conflicts {
+                base,
+                target,
+                incoming,
+                paths,
+            } => {
+                blocked = true;
+                let applied = reversed.applied;
+                let remaining = undo
+                    .records
+                    .iter()
+                    .filter(|record| !applied.contains(&record.id))
+                    .map(|record| record.id)
+                    .collect();
+                undo_conflict = Some(crate::replacement_undo::Conflict {
+                    track: undo.records[applied.len()].track_id.clone(),
+                    applied,
+                    remaining,
+                    base: base.to_string(),
+                    target: target.to_string(),
+                    incoming: incoming.to_string(),
+                    paths: paths
+                        .into_iter()
+                        .map(|path| String::from_utf8(path.into()))
+                        .collect::<std::result::Result<Vec<_>, _>>()?,
+                });
+            }
+        }
+    }
     for track in &job.tracks {
         let mut row = frozen
             .rows
@@ -422,27 +544,28 @@ pub fn plan(job: &Job) -> Result<Plan> {
             } else if track.included && blocked {
                 row.state = RowState::Waiting;
             } else if track.included {
-                let point = job.lineage.by_sha(&track.id, &checkpoint.sha)?;
-                let base_tree =
-                    match job
-                        .lineage
-                        .track_baseline(&repo, point, &track.basis, &integrated)?
-                    {
-                        Merge::Clean(tree) => tree,
-                        Merge::Conflicts(paths) => {
-                            row.state = RowState::Conflict;
-                            row.conflicts = paths
-                                .into_iter()
-                                .map(|path| Conflict {
-                                    path: path.to_string(),
-                                    with_tracks: vec![],
-                                })
-                                .collect();
-                            blocked = true;
-                            rows.push(row);
-                            continue;
-                        }
-                    };
+                let base_tree = match crate::integration_baseline::calculate(
+                    job,
+                    track,
+                    &integrated,
+                    &mut crate::merge_choices::Merges::new(&repo, &[])?,
+                )? {
+                    Merge::Clean(tree) => tree,
+                    Merge::Conflicts { paths, .. } => {
+                        row.state = RowState::Conflict;
+                        row.conflicts = paths
+                            .into_iter()
+                            .map(|path| Conflict {
+                                path: path.to_string(),
+                                with_tracks: vec![],
+                            })
+                            .collect();
+                        blocked = true;
+                        rows.push(row);
+                        continue;
+                    }
+                };
+                roots.push(base_tree);
                 row.delta_base = Some(base_tree.to_string());
                 let checkpoint_tree = repo.tree_id(checkpoint_id)?;
                 match repo.merge_trees(base_tree, tree, checkpoint_tree)? {
@@ -467,7 +590,7 @@ pub fn plan(job: &Job) -> Result<Plan> {
                             job.lineage.by_sha(&track.id, &checkpoint.sha)?,
                         )?;
                     }
-                    Merge::Conflicts(paths) => {
+                    Merge::Conflicts { paths, .. } => {
                         blocked = true;
                         row.state = RowState::Conflict;
                         for path in paths {
@@ -489,6 +612,8 @@ pub fn plan(job: &Job) -> Result<Plan> {
     // (including the user's HEAD or index) is changed by this stage.
     repo.sync_objects(&roots)?;
     Ok(Plan {
+        coverage: frozen.coverage.clone(),
+        undo_conflict,
         target_ref: frozen.target_ref.clone(),
         expected_target: frozen.expected_target.clone(),
         expected_staging: frozen.expected_staging.clone(),
@@ -509,11 +634,10 @@ pub struct Service {
 }
 #[derive(Default)]
 struct ServiceState {
-    running: Option<Running>,
+    running: BTreeMap<Uuid, Running>,
 }
 struct Running {
     publishing: bool,
-    id: Uuid,
     revision: u64,
     cancel: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
@@ -535,8 +659,7 @@ impl Service {
         }
     }
     pub async fn diff(&self, request: DiffRequest) -> Result<Diff> {
-        let job: Job =
-            serde_json::from_value(self.journal.snapshot().await?["integration"].clone())?;
+        let job = self.journal.integration_job(request.id).await?;
         if job.id != request.id || job.revision != request.revision {
             return Err("The sheet changed · review again".into());
         }
@@ -546,34 +669,48 @@ impl Service {
             .await?
             .ok_or("Missing Check settings.")?;
         let mut root = job.project.root.clone();
-        let changes = if let Some(commit) = job
-            .candidate
-            .as_ref()
-            .and_then(|candidate| candidate.blocked_commit.as_ref())
-            .filter(|commit| commit.track == request.track)
-        {
-            root = self
-                .root
-                .join(job.id.to_string())
-                .join(job.candidate.as_ref().unwrap().generation.to_string())
-                .join("repo");
-            &commit.changes
-        } else if let Some(commit) = job.candidate.as_ref().and_then(|candidate| {
-            candidate
-                .commits
-                .iter()
-                .find(|commit| commit.track == request.track)
-        }) {
-            &commit.changes
-        } else {
-            &job.plan
-                .as_ref()
-                .ok_or("Missing plan.")?
-                .rows
-                .iter()
-                .find(|row| row.track == request.track)
-                .ok_or("Unknown track.")?
-                .changes
+        let changes = match &request.owner {
+            DiffOwner::Undo => {
+                let candidate = job
+                    .candidate
+                    .as_ref()
+                    .ok_or("This review has no candidate.")?;
+                if candidate.pending_undo() {
+                    root = candidate.workspace.join("repo");
+                }
+                &candidate
+                    .undo
+                    .as_ref()
+                    .ok_or("This review has no undo commit.")?
+                    .changes
+            }
+            DiffOwner::Worker { track } => {
+                if let Some(commit) = job
+                    .candidate
+                    .as_ref()
+                    .and_then(|candidate| candidate.blocked_commit.as_ref())
+                    .filter(|commit| &commit.track == track)
+                {
+                    root = job.candidate.as_ref().unwrap().workspace.join("repo");
+                    &commit.changes
+                } else if let Some(commit) = job.candidate.as_ref().and_then(|candidate| {
+                    candidate
+                        .commits
+                        .iter()
+                        .find(|commit| &commit.track == track)
+                }) {
+                    &commit.changes
+                } else {
+                    &job.plan
+                        .as_ref()
+                        .ok_or("Missing plan.")?
+                        .rows
+                        .iter()
+                        .find(|row| &row.track == track)
+                        .ok_or("Unknown track.")?
+                        .changes
+                }
+            }
         };
         let change = changes
             .iter()
@@ -591,37 +728,40 @@ impl Service {
         diff.redacted = safe[0] != diff.before || safe[1] != diff.after;
         diff.before = safe[0].clone();
         diff.after = safe[1].clone();
-        let current = self.journal.snapshot().await?;
-        if current["integration"]["id"] != job.id.to_string()
-            || current["integration"]["revision"] != job.revision
-        {
+        let current = self.journal.integration_job(job.id).await?;
+        if current.revision != job.revision || current.status == Status::Discarded {
             return Err("The sheet changed · review again".into());
         }
         Ok(diff)
     }
+    async fn reap_finished(&self, state: &mut ServiceState) -> Result<()> {
+        let completed = state
+            .running
+            .iter()
+            .filter(|(_, run)| run.task.is_finished())
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in completed {
+            state.running.remove(&id).unwrap().task.await?;
+        }
+        Ok(())
+    }
     pub async fn command(&self, command: Command) -> Result<Job> {
         let mut state = self.state.lock().await;
-        if state
-            .running
-            .as_ref()
-            .is_some_and(|run| run.task.is_finished())
-        {
-            let run = state.running.take().unwrap();
-            run.task.await?;
-        }
+        self.reap_finished(&mut state).await?;
         if let Action::Recheck { id, revision } = &command.action {
             if self.journal.operation(command.op_id).await?.is_some() {
                 let job = self.journal.integration_command(command).await?;
                 return self.advance(&mut state, job).await;
             }
-            let job: Job =
-                serde_json::from_value(self.journal.snapshot().await?["integration"].clone())?;
+            let job = self.journal.integration_job(*id).await?;
             if job.id != *id || job.revision != *revision {
                 return Err("The sheet changed · review again".into());
             }
             let environment = self.journal.check_environment().await?;
+            let checks = self.journal.check_settings().await?;
             let settings = tokio::task::spawn_blocking(move || {
-                crate::candidate::Settings::capture(&job, environment)
+                crate::candidate::Settings::capture(&job.project, environment, checks)
             })
             .await??;
             let job = self.journal.recheck_integration(command, settings).await?;
@@ -657,7 +797,9 @@ impl Service {
         // A stale window or a repeated operation must not cancel a newer Check.
         let job = match self.journal.integration_command(command.clone()).await {
             Err(error) if error.is::<StagingBusy>() => {
-                if let Some(run) = state.running.take() {
+                if let Some(id) = command.action.job_id()
+                    && let Some(run) = state.running.remove(&id)
+                {
                     run.task.await?;
                 }
                 self.journal.integration_command(command).await?
@@ -689,11 +831,54 @@ impl Service {
         }
         Ok(())
     }
+    pub(crate) async fn finish_undo_merge_result(&self, operation: Uuid) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if let Some(job) = self
+            .journal
+            .change_undo_merge(crate::undo_merge_store::Change::Dispatch(operation))
+            .await?
+        {
+            let job = self.advance(&mut state, job).await?;
+            if job.status == Status::Open && job.plan.as_ref().is_some_and(|p| p.tree.is_some())
+                || job.status == Status::MergeConflict
+                    && job.plan.as_ref().is_some_and(|p| {
+                        p.undo_conflict.is_some()
+                            || p.rows.iter().any(|r| r.state == RowState::Conflict)
+                    })
+            {
+                let building = self
+                    .journal
+                    .integration_command(Command {
+                        op_id: Uuid::new_v5(&operation, b"build-undo-resolution"),
+                        action: Action::Prepare {
+                            id: job.id,
+                            revision: job.revision,
+                        },
+                    })
+                    .await?;
+                self.advance(&mut state, building).await?;
+            }
+        }
+        self.journal
+            .change_undo_merge(crate::undo_merge_store::Change::Complete(operation))
+            .await?;
+        Ok(())
+    }
     async fn advance(&self, state: &mut ServiceState, mut job: Job) -> Result<Job> {
-        if state.running.as_ref().is_some_and(|run| {
-            run.id == job.id && (run.revision != job.revision || job.status == Status::Discarded)
-        }) {
-            let run = state.running.take().unwrap();
+        self.watch_groups(state).await?;
+        if state
+            .running
+            .get(&job.id)
+            .is_some_and(|run| run.task.is_finished())
+        {
+            state.running.remove(&job.id).unwrap().task.await?;
+        }
+        if state
+            .running
+            .get(&job.id)
+            .is_some_and(|run| run.revision != job.revision || job.status == Status::Discarded)
+        {
+            let run = state.running.remove(&job.id).unwrap();
             let _ = run.cancel.send(true);
             run.task.await?;
         }
@@ -701,28 +886,29 @@ impl Service {
             crate::integration_refs::discard(&job, &self.journal).await?;
         }
         // A persisted candidate/result can be observed before its producing
-        // task returns. Join that task before handing the slot to publication
-        // or to the next integration job; never strand the accepted operation.
-        if state.running.as_ref().is_some_and(|run| {
-            run.id != job.id || (job.status == Status::Committing && !run.publishing)
-        }) {
-            let run = state.running.take().unwrap();
+        // task returns. Join that folder's task before publication. Other
+        // folders keep their own Check and publication tasks.
+        if state
+            .running
+            .get(&job.id)
+            .is_some_and(|run| job.status == Status::Committing && !run.publishing)
+        {
+            let run = state.running.remove(&job.id).unwrap();
             if !run.publishing {
                 let _ = run.cancel.send(true);
             }
             run.task.await?;
         }
         if job.status == Status::Committing {
-            if state.running.is_none() {
+            if let std::collections::btree_map::Entry::Vacant(slot) = state.running.entry(job.id) {
                 let input = job.clone();
                 let journal = self.journal.clone();
-                let (cancel, _) = tokio::sync::watch::channel(false);
+                let (cancel, cancelling) = tokio::sync::watch::channel(false);
                 let task = tokio::spawn(async move {
-                    let _ = crate::publication::publish(input, journal).await;
+                    let _ = crate::publication::publish(input, journal, cancelling).await;
                 });
-                state.running = Some(Running {
+                slot.insert(Running {
                     publishing: true,
-                    id: job.id,
                     revision: job.revision,
                     cancel,
                     task,
@@ -731,7 +917,7 @@ impl Service {
             return Ok(job);
         }
         if job.status == Status::Building {
-            if state.running.is_none() {
+            if let std::collections::btree_map::Entry::Vacant(slot) = state.running.entry(job.id) {
                 let settings = self
                     .journal
                     .integration_settings(job.id, job.revision)
@@ -752,16 +938,19 @@ impl Service {
                         tokio::runtime::Handle::current().block_on(async {
                             let parent = root.join(id.to_string());
                             std::fs::create_dir_all(&parent)?;
+                            let workspace = input
+                                .candidate
+                                .as_ref()
+                                .filter(|candidate| {
+                                    candidate.blocked_commit.is_some() || candidate.pending_undo()
+                                })
+                                .map_or_else(
+                                    || parent.join(revision.to_string()),
+                                    |candidate| candidate.workspace.clone(),
+                                );
                             crate::candidate::build(
                                 &input,
-                                &parent.join(
-                                    input
-                                        .candidate
-                                        .as_ref()
-                                        .filter(|candidate| candidate.blocked_commit.is_some())
-                                        .map_or(revision, |candidate| candidate.generation)
-                                        .to_string(),
-                                ),
+                                &workspace,
                                 &root.join("downloads"),
                                 &settings,
                                 &input.messages,
@@ -800,9 +989,8 @@ impl Service {
                         )
                         .await;
                 });
-                state.running = Some(Running {
+                slot.insert(Running {
                     publishing: false,
-                    id: job.id,
                     revision: job.revision,
                     cancel,
                     task,
@@ -821,8 +1009,9 @@ impl Service {
         {
             let input = job.clone();
             let environment = self.journal.check_environment().await?;
+            let checks = self.journal.check_settings().await?;
             let settings = tokio::task::spawn_blocking(move || {
-                crate::candidate::Settings::capture(&input, environment)
+                crate::candidate::Settings::capture(&input.project, environment, checks)
             })
             .await??;
             self.journal
@@ -846,6 +1035,9 @@ impl Service {
                         .await;
                 }
             }
+        }
+        if job.status == Status::Choosing {
+            return Ok(job);
         }
         if job.order_review.is_none() {
             let input = job.clone();
@@ -877,27 +1069,32 @@ impl Service {
             .await
     }
     pub async fn recover(&self) -> Result<()> {
-        let _state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         for job in self.journal.pending_publications().await? {
-            crate::publication::publish(job, self.journal.clone()).await?;
+            self.advance(&mut state, job).await?;
         }
-        Ok(())
+        self.watch_groups(&mut state).await
     }
     pub async fn shutdown(&self) {
         let mut state = self.state.lock().await;
-        if let Some(run) = state.running.take() {
+        let running = std::mem::take(&mut state.running);
+        for run in running.values() {
             let _ = run.cancel.send(true);
+        }
+        for (_, run) in running {
             let _ = run.task.await;
         }
+        let _ = self.reconcile_groups().await;
     }
 }
 impl Drop for Service {
     fn drop(&mut self) {
         if Arc::strong_count(&self.state) == 1
             && let Ok(state) = self.state.try_lock()
-            && let Some(run) = &state.running
         {
-            let _ = run.cancel.send(true);
+            for run in state.running.values() {
+                let _ = run.cancel.send(true);
+            }
         }
     }
 }

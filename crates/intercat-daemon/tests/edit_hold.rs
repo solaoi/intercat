@@ -150,7 +150,8 @@ async fn held_edit_blocks_reservation_and_other_window_mutations() -> Result<()>
                 input.clone(),
                 2,
                 worker.track_id,
-                json!({"sessionId":"session","commandId":Uuid::now_v7()})
+                json!({"sessionId":"session","commandId":Uuid::now_v7()}),
+                None,
             )
             .await
             .is_err()
@@ -542,6 +543,7 @@ async fn a_reserved_start_cannot_be_edited_and_explicit_text_keeps_the_input_ide
             3,
             worker.track_id,
             json!({"sessionId":"session","commandId":Uuid::now_v7()}),
+            None,
         )
         .await?;
     assert!(
@@ -743,7 +745,8 @@ async fn immediate_changes_keep_the_lease_and_replays_do_not_repeat_them() -> Re
                 input.clone(),
                 4,
                 worker.track_id.clone(),
-                json!({"sessionId":"session","commandId":Uuid::now_v7()})
+                json!({"sessionId":"session","commandId":Uuid::now_v7()}),
+                None,
             )
             .await
             .is_err()
@@ -759,6 +762,7 @@ async fn immediate_changes_keep_the_lease_and_replays_do_not_repeat_them() -> Re
             4,
             worker.track_id,
             json!({"sessionId":"session","commandId":Uuid::now_v7()}),
+            None,
         )
         .await?;
     Ok(())

@@ -4,6 +4,7 @@ import { geometry, LABEL_WIDTH, type TimelineView } from './model';
 export interface MarkGroup { id: string; x: number; marks: TimelineMark[] }
 
 export function markLabel(mark: TimelineMark, tracks: { id: string; label: string }[]) {
+  if(mark.commit)return `Push to here · ${mark.commit.sha.slice(0,8)}`;
   const target = tracks.find(track => track.id === mark.trackId)?.label ?? '?';
   switch (mark.operation) {
     case 'fork': return 'new track';

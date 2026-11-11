@@ -680,6 +680,7 @@ pub(crate) async fn apply(
                 .clone();
             if !state.snapshots.contains_key(&choice.track_id) {
                 let source = crate::preparation::Workspace {
+                    denied_roots: Vec::new(),
                     track_id: workspace.track_id.clone(),
                     path: workspace.path.clone(),
                     reference: workspace.reference.clone(),
@@ -692,6 +693,7 @@ pub(crate) async fn apply(
                     &source,
                     &state.heads[&choice.track_id],
                     "Intercat backup recovery",
+                    journal,
                 )
                 .await?;
                 let snapshot = Checkpoint {

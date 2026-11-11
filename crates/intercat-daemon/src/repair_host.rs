@@ -41,8 +41,8 @@ impl Hosted {
 
     /// Closing uses the Run bound at creation, never an unrelated worker ID.
     pub async fn close(self, journal: &Journal, outcome: Outcome) -> Result<Run> {
-        let mut run = match journal.repair_input(self.run).await {
-            Ok((run, _, _)) => run,
+        let mut run = match journal.repair_source(self.run).await {
+            Ok((run, _)) => run,
             Err(error) => {
                 self.host.shutdown().await?;
                 return Err(error);
@@ -64,8 +64,8 @@ async fn stopping(journal: &Journal, id: Uuid) {
     let mut changes = journal.subscribe();
     loop {
         changes.borrow_and_update();
-        match journal.repair_input(id).await {
-            Ok((run, _, _)) if !matches!(run.phase, Phase::Preparing | Phase::Running) => return,
+        match journal.repair_source(id).await {
+            Ok((run, _)) if !matches!(run.phase, Phase::Preparing | Phase::Running) => return,
             Err(_) => return,
             _ => {}
         }
@@ -80,10 +80,11 @@ async fn stopping(journal: &Journal, id: Uuid) {
 pub async fn open(
     journal: &Journal,
     run: &mut Run,
-    workspace: &crate::repair::Workspace,
+    workspace: &crate::run_workspace::Workspace,
     launch: Launch<'_>,
 ) -> Result<Hosted> {
-    let (current, job, settings) = journal.repair_input(run.id).await?;
+    let (current, source) = journal.repair_source(run.id).await?;
+    let settings = source.settings();
     if current.phase == Phase::Stopping && current.host.is_none() {
         *run = current;
         transition(
@@ -102,23 +103,31 @@ pub async fn open(
     {
         return Err("The repair host preparation was superseded.".into());
     }
-    workspace.validate(&job, &run.track, &settings)?;
+    workspace.validate_source(&source, &run.track)?;
     if !run.workspace_ready {
         transition(journal, run, Event::WorkspaceReady).await?;
     }
-    let denied = vec![
-        job.project.root,
-        job.project.common_dir,
+    let mut denied = vec![
+        source.folder().root.clone(),
+        source.folder().common_dir.clone(),
         workspace
-            .original
+            .original()
             .parent()
             .ok_or("Missing original candidate directory.")?
             .to_path_buf(),
     ];
+    denied.extend(
+        workspace
+            .checkout()
+            .configuration
+            .denied_roots
+            .iter()
+            .cloned(),
+    );
     let binary = launch.worker.binary.clone();
     let verified = tokio::task::spawn_blocking(move || host::hash(&binary)).await;
     if !matches!(verified, Ok(Ok(ref hash)) if hash == host::BINARY_SHA256) {
-        *run = journal.repair_input(run.id).await?.0;
+        *run = journal.repair_source(run.id).await?.0;
         if run.host.is_some() {
             return Err("Another host already owns this repair Run.".into());
         }
@@ -132,7 +141,7 @@ pub async fn open(
         transition(journal, run, Event::HostClosed { outcome }).await?;
         return Err("The saved Muse binary changed. Configure workers again.".into());
     }
-    *run = journal.repair_input(run.id).await?.0;
+    *run = journal.repair_source(run.id).await?.0;
     if run.phase != Phase::Preparing || run.host.is_some() {
         if run.phase == Phase::Stopping && run.host.is_none() {
             transition(
@@ -156,12 +165,12 @@ pub async fn open(
     if let Some(value) = launch.one_time {
         secrets.push(value.clone());
     }
-    let workspace_path = workspace.checkout.workdir.canonicalize()?;
+    let workspace_path = workspace.checkout().workdir.canonicalize()?;
     let memory = tokio::select! {biased; _=stopping(journal,run.id)=>return Err("Repair preparation was stopped.".into()), result=launch.memory.request(run.id.to_string()).acquire(crate::msp::StartGuard::Stopped(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))))=>result?};
     let mut host = match Host::spawn(
         &launch.worker.binary,
         launch.directory,
-        &workspace.checkout.workdir,
+        &workspace.checkout().workdir,
         std::ffi::OsStr::new(&launch.worker.path),
         Some(&launch.worker.credentials),
         host::Boundary {
@@ -177,7 +186,7 @@ pub async fn open(
         Ok(host) => host,
         Err(_) => {
             // Do not put paths or host output into this durable failure code.
-            *run = journal.repair_input(run.id).await?.0;
+            *run = journal.repair_source(run.id).await?.0;
             if run.host.is_some() {
                 return Err("Another host already owns this repair Run.".into());
             }
@@ -196,7 +205,7 @@ pub async fn open(
     let prepared = async {
         // A Stop can race spawn. Register the host even in Stopping so cleanup
         // retains its exact identity instead of leaving an unowned process.
-        *run = journal.repair_input(run.id).await?.0;
+        *run = journal.repair_source(run.id).await?.0;
         transition(journal, run, Event::HostStarted { host: host.identity, nonce: host.nonce.parse()?, secret_revision }).await?;
         if let Some(project) = &project && !project.manifest.fingerprints.is_empty() {
             journal.project_host_use(crate::project_secret_usage::HostUse {
@@ -214,7 +223,7 @@ pub async fn open(
         let session = tokio::select! {
             biased;
             _ = stopping(journal, run.id) => return Err("Repair preparation was stopped.".into()),
-            session = crate::runtime::open_session(&mut host.connection, journal, &workspace.checkout.workdir, previous.as_deref(), &run.track, Some(&history_scanner),crate::reconcile::Expected::default()) => session?,
+            session = crate::runtime::open_session(&mut host.connection, journal, &workspace.checkout().workdir, previous.as_deref(), &run.track, Some(&history_scanner),crate::reconcile::Expected::default()) => session?,
         };
         if let Some(recovery)=session.recovery {
             if recovery.active_turn.is_some() || recovery.pending_approvals>0 || !recovery.prompts.is_empty() {
@@ -265,13 +274,14 @@ async fn close_host(
 ) -> Result<()> {
     let identity = host.identity;
     let nonce: Uuid = host.nonce.parse()?;
-    let (current, settings) = match journal.repair_input(run.id).await {
-        Ok((run, _, settings)) => (run, settings),
+    let (current, source) = match journal.repair_source(run.id).await {
+        Ok(input) => input,
         Err(error) => {
             host.shutdown().await?;
             return Err(error);
         }
     };
+    let settings = source.settings();
     let owns = current.host == Some(identity) && current.host_nonce == Some(nonce);
     let release = if owns && current.session_ready {
         let scanner = settings.scanner();
@@ -294,10 +304,66 @@ async fn close_host(
     } else {
         Ok(())
     };
+    if owns && release.is_ok() && matches!(outcome, Outcome::Completed) {
+        let directory = host.directory().to_path_buf();
+        let ledger = match crate::process_ledger::read(&directory.join(crate::process_ledger::NAME))
+        {
+            Ok(record)
+                if record.root == Some(identity) && record.nonces.contains(&nonce.to_string()) =>
+            {
+                record
+            }
+            _ => {
+                host.shutdown().await?;
+                return Err("The completed host's process records changed owner.".into());
+            }
+        };
+        let label = match source.label(&current.track) {
+            Ok(label) => label.to_owned(),
+            Err(error) => {
+                host.shutdown().await?;
+                return Err(error);
+            }
+        };
+        let tracker = host.tracker.clone();
+        host.retire().await?;
+        let scan = tokio::task::spawn_blocking(move || tracker.lock().unwrap().refresh()).await;
+        let empty = matches!(&scan, Ok(Ok(scan)) if scan.is_empty());
+        let failed = !matches!(&scan, Ok(Ok(_)));
+        if empty {
+            journal.project_use_closed(nonce.to_string()).await?;
+            journal.secret_expired(nonce.to_string()).await?;
+        }
+        *run = journal
+            .repair_retired(
+                run.id,
+                crate::run_processes::Remaining {
+                    nonce,
+                    host: Some(identity),
+                    directory,
+                    workspace: ledger.workspace,
+                    label,
+                    session_name: source.session_name().to_owned(),
+                    created_at: crate::journal::timestamp(),
+                    revision: 0,
+                    state: if empty {
+                        crate::run_processes::State::Cleaning
+                    } else {
+                        crate::run_processes::State::Waiting
+                    },
+                    error: None,
+                },
+            )
+            .await?;
+        if failed {
+            journal.repair_processes_failed(run.id, nonce).await?;
+        }
+        return Ok(());
+    }
     host.shutdown().await?;
     journal.project_use_closed(nonce.to_string()).await?;
     journal.secret_expired(nonce.to_string()).await?;
-    *run = journal.repair_input(run.id).await?.0;
+    *run = journal.repair_source(run.id).await?.0;
     if run.host != Some(identity) || run.host_nonce != Some(nonce) {
         return Err("The closed host does not own the current repair Run.".into());
     }

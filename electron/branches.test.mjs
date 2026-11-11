@@ -1,9 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { synchronizeFingerprints } from './secrets.mjs';
-import { branchFromCheckpoint } from './branches.mjs';
+import { branchFromCheckpoint, validateBranchRequest } from './branches.mjs';
 const proof = { sessions: [], projects: [] };
 const wrap = catalog => ({ catalog, proof });
+
+test('branch requests name a completed turn or an owned initial snapshot exclusively', () => {
+  const request = { opId: 'own-operation', parentTrackId: 'own-track', instructions: 'checkpoint' };
+  for (const point of [{kind:'turn',turnId:'own-turn'}, {kind:'initial',twoWaysId:'own-pair'}]) validateBranchRequest({...request, point});
+  for (const point of [{kind:'turn',twoWaysId:'own-pair'}, {kind:'initial',turnId:'own-turn'}, {kind:'initial',twoWaysId:'own-pair',sha:'a'.repeat(40)}, {kind:'turn',turnId:''}, null]) assert.throws(() => validateBranchRequest({...request, point}));
+  assert.throws(() => validateBranchRequest({...request, turnId:'old-turn'}));
+});
 
 test('branch activation follows the external receipt and daemon confirmation', async () => {
   const before = { revision: 1, digest: '1'.repeat(64) }, after = { revision: 2, digest: '2'.repeat(64) };

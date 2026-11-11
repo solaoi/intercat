@@ -43,7 +43,7 @@ async fn reserve(
     ));
     let operation = Uuid::now_v7();
     let outcome=f.journal.reserve_turn(operation,id,word["revision"].as_i64().unwrap(),f.workspace.track_id.clone(),
-        json!({"commandId":operation,"sessionId":f.state.session_id,"input":[{"type":"text","text":"dummy fix"}]})).await;
+        json!({"commandId":operation,"sessionId":f.state.session_id,"input":[{"type":"text","text":"dummy fix"}]}), None).await;
     Ok((operation, outcome))
 }
 #[tokio::test]
@@ -565,7 +565,8 @@ async fn native_rereview_resolves_the_original_finding_from_the_saved_fix() -> R
     std::fs::create_dir(&rpc)?;
     f.journal.set_worker_config(Uuid::now_v7(), config).await?;
     let capacity = std::sync::Arc::new(crate::scheduler::Capacity::new(1));
-    let service = crate::reviewing::Service::start(crate::host_memory::Pool::new(),
+    let service = crate::reviewing::Service::start(
+        crate::host_memory::Pool::new(),
         f.journal.clone(),
         f.root.path().into(),
         rpc,
@@ -1064,7 +1065,8 @@ async fn native_required_fix_runs_once_then_reviewer_confirms_the_saved_result()
     std::fs::create_dir(&rpc)?;
     let editor = crate::runtime::tests::native_editor(f.root.path()).await?;
     let paused = std::sync::Arc::new(crate::dispatch_control::Gate::new(false));
-    let runtime = crate::runtime::Runtime::start(crate::host_memory::Pool::new(),
+    let runtime = crate::runtime::Runtime::start(
+        crate::host_memory::Pool::new(),
         f.root.path().into(),
         rpc.clone(),
         f.journal.clone(),
@@ -1072,7 +1074,8 @@ async fn native_required_fix_runs_once_then_reviewer_confirms_the_saved_result()
         std::sync::Arc::new(crate::scheduler::Capacity::new(1)),
         paused.clone(),
     );
-    let reviewer = crate::reviewing::Service::start(crate::host_memory::Pool::new(),
+    let reviewer = crate::reviewing::Service::start(
+        crate::host_memory::Pool::new(),
         f.journal.clone(),
         f.root.path().into(),
         rpc,
@@ -1292,7 +1295,8 @@ async fn native_interrupted_reviewer_closes_its_host_and_retries_after_reopening
     std::fs::create_dir(&rpc)?;
     let gate = std::sync::Arc::new(crate::dispatch_control::Gate::new(false));
     let capacity = std::sync::Arc::new(crate::scheduler::Capacity::new(1));
-    let service = crate::reviewing::Service::start(crate::host_memory::Pool::new(),
+    let service = crate::reviewing::Service::start(
+        crate::host_memory::Pool::new(),
         f.journal.clone(),
         f.root.path().into(),
         rpc.clone(),
@@ -1306,8 +1310,11 @@ async fn native_interrupted_reviewer_closes_its_host_and_retries_after_reopening
         .join(job.generation.to_string());
     let process = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if let Ok(record) = crate::process_ledger::read(&host_dir.join(crate::process_ledger::NAME))
-                && let Some(root) = record.root && crate::process::is_alive(root) {
+            if let Ok(record) =
+                crate::process_ledger::read(&host_dir.join(crate::process_ledger::NAME))
+                && let Some(root) = record.root
+                && crate::process::is_alive(root)
+            {
                 return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(root);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1347,7 +1354,8 @@ async fn native_interrupted_reviewer_closes_its_host_and_retries_after_reopening
         })
         .await?;
     assert_ne!(next.generation, held.generation);
-    let service = crate::reviewing::Service::start(crate::host_memory::Pool::new(),
+    let service = crate::reviewing::Service::start(
+        crate::host_memory::Pool::new(),
         journal.clone(),
         f.root.path().into(),
         rpc,
@@ -1447,5 +1455,205 @@ async fn stopping_a_review_is_idempotent_and_cannot_stop_a_newer_attempt() -> Re
         .await?;
     assert_eq!(window["clips"][0]["running"], false);
     assert_eq!(window["clips"][0]["approximate"], true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn corrections_follow_the_reviewed_requests_hold_boundary_instead_of_their_creation_time()
+-> Result<()> {
+    use crate::decision::{Decision, Kind as DecisionKind, Outcome, Target as InputTarget};
+    for request_after_hold in [true, false] {
+        let mut f = Fixture::new().await?;
+        if request_after_hold {
+            f.journal
+                .hold_inputs(Uuid::now_v7(), f.workspace.track_id.clone())
+                .await?;
+        }
+        let input = Uuid::now_v7();
+        f.journal
+            .stage_utterance(
+                input,
+                "Own request around a local hold".into(),
+                InputTarget::Lock(f.workspace.track_id.clone()),
+                None,
+                vec![],
+            )
+            .await?;
+        let claimed = f.journal.claim_input().await?.unwrap();
+        f.journal
+            .apply_input(
+                claimed.id,
+                claimed.revision,
+                Outcome::Classified(Decision {
+                    kind: DecisionKind::Extend,
+                    track_id: Some(f.workspace.track_id.clone()),
+                    boundary: Some("now".into()),
+                    command: None,
+                    confidence: 1.,
+                    inference_ms: 0.,
+                    timed_out: false,
+                    scores: json!({}),
+                }),
+            )
+            .await?;
+        let word = f.journal.read_utterance(input.to_string()).await?;
+        let operation = Uuid::now_v7();
+        let session = f.state.session_id.clone().unwrap();
+        let turn = Uuid::now_v7();
+        f.journal.reserve_turn(operation,input.to_string(),word["revision"].as_i64().unwrap(),f.workspace.track_id.clone(),json!({"commandId":operation,"sessionId":session,"input":[{"type":"text","text":"Own new request"}]}), None).await?;
+        git(
+            &f.workspace.path,
+            &[
+                "-c",
+                "user.name=Dummy",
+                "-c",
+                "user.email=dummy@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "Own post-hold checkpoint",
+            ],
+        );
+        let sha = git(&f.workspace.path, &["rev-parse", "HEAD"]);
+        let reference = format!("refs/intercat/dummy/checkpoints/{turn}");
+        git(&f.workspace.path, &["update-ref", &reference, &sha]);
+        for frame in [
+            json!({"method":"turn/started","params":{"sessionId":session,"turnId":turn,"commandId":operation}}),
+            json!({"method":"item/completed","params":{"sessionId":session,"turnId":turn,"item":{"itemId":format!("own-user-{turn}"),"turnId":turn,"kind":"userMessage","commandId":operation,"revision":1,"text":"Own new request"}}}),
+            json!({"method":"item/completed","params":{"sessionId":session,"turnId":turn,"item":{"itemId":format!("own-tool-{turn}"),"turnId":turn,"callId":format!("own-call-{turn}"),"kind":"toolCall","tool":"edit_file","status":"completed","revision":1,"args":"{}"}}}),
+            json!({"method":"item/completed","params":{"sessionId":session,"turnId":turn,"item":{"itemId":format!("own-report-{turn}"),"turnId":turn,"kind":"agentMessage","messagePhase":"finalAnswer","status":"completed","revision":1,"text":"Own report\nResult: done — own dummy work"}}}),
+            json!({"method":"turn/completed","params":{"sessionId":session,"turnId":turn,"terminal":"completed"}}),
+        ] {
+            f.journal
+                .try_msp(
+                    f.workspace.track_id.clone(),
+                    session.clone(),
+                    Stamp::now(),
+                    frame,
+                    None,
+                    None,
+                )?
+                .await??;
+        }
+        let db = database(&f)?;
+        db.execute(
+            "UPDATE utterances SET state='landed' WHERE id=?1",
+            [input.to_string()],
+        )?;
+        let calls = vec![format!("own-call-{turn}")];
+        f.journal
+            .save_step_source(crate::step_sources::Source {
+                id: crate::step_sources::identity(&session, &turn.to_string(), &calls),
+                track: f.workspace.track_id.clone(),
+                session: session.clone(),
+                turn: turn.to_string(),
+                calls,
+                paths: Some(vec!["math.rs".into()]),
+                workspace: f.workspace.clone(),
+                at: Stamp::now(),
+            })
+            .await?;
+        f.state.checkpoint = Some(crate::checkpoint::Checkpoint {
+            turn_id: turn,
+            sha,
+            reference,
+            unmerged_paths: vec![],
+            live_processes: false,
+        });
+        f.journal.worker_state(f.state.clone()).await?;
+        if !request_after_hold {
+            f.journal
+                .hold_inputs(Uuid::now_v7(), f.workspace.track_id.clone())
+                .await?;
+        }
+        let queued = f
+            .journal
+            .reviews()
+            .await?
+            .into_iter()
+            .find(|job| job.target.turn_id == turn.to_string())
+            .ok_or("Missing own post-hold review")?;
+        let job = f
+            .journal
+            .begin_review(queued.id, queued.generation, queued.revision)
+            .await?
+            .unwrap();
+        crate::reviewing::publish(
+            &f.journal,
+            &job,
+            Draft {
+                summary: "Own required correction".into(),
+                notes: vec![Fixture::note(&job)],
+                resolutions: vec![],
+            },
+        )
+        .await?;
+        let fix = crate::review_fix_store::list(&db)?
+            .into_iter()
+            .find(|fix| {
+                fix.note_id == crate::review_store::notes_for_job(&db, job.id).unwrap()[0].id
+            })
+            .unwrap();
+        let correction = f
+            .journal
+            .read_utterance(fix.input_id.unwrap().to_string())
+            .await?;
+        assert_eq!(
+            fix.state,
+            if request_after_hold {
+                FixState::Planned
+            } else {
+                FixState::Held
+            }
+        );
+        assert_eq!(
+            correction["state"],
+            if request_after_hold { "placed" } else { "held" }
+        );
+        assert_eq!(correction["dispatchRunnable"], request_after_hold);
+        assert_eq!(reserve(&f, &fix).await?.1.is_ok(), request_after_hold);
+        assert!(crate::worker_hold::current(&db, &f.workspace.track_id)?.is_some());
+        assert_eq!(
+            crate::worker_hold::turn_input(&db, &session, &turn.to_string())?,
+            Some(input.to_string())
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_fix_once_more_after_a_hold_authorizes_only_that_finding() -> Result<()> {
+    let (f, _, fixes) = reviewed(3).await?;
+    for fix in &fixes[..2] {
+        assert!(reserve(&f, fix).await?.1.is_ok());
+    }
+    assert!(reserve(&f, &fixes[2]).await?.1.is_err());
+    f.journal
+        .hold_inputs(Uuid::now_v7(), f.workspace.track_id.clone())
+        .await?;
+    let db = database(&f)?;
+    let blocked = crate::review_fix_store::read(&db, fixes[2].id)?;
+    assert_eq!(blocked.state, FixState::Blocked);
+    let extra = f
+        .journal
+        .review_fix_command(Command {
+            op_id: Uuid::now_v7(),
+            fix_id: blocked.id,
+            revision: blocked.revision,
+            action: Action::FixOnceMore,
+        })
+        .await?;
+    assert!(crate::worker_hold::allowed(
+        &db,
+        &f.workspace.track_id,
+        &extra.input_id.unwrap().to_string()
+    )?);
+    assert!(reserve(&f, &extra).await?.1.is_ok());
+    assert!(crate::worker_hold::current(&db, &f.workspace.track_id)?.is_some());
+    assert_eq!(
+        db.query_row("SELECT total FROM review_fix_file_budget", [], |row| row
+            .get::<_, i64>(0))?,
+        3
+    );
     Ok(())
 }

@@ -227,7 +227,7 @@ server=ThreadingHTTPServer(('127.0.0.1',0),Handler);print(json.dumps({'host':'12
             .await
             .unwrap();
         wake.notify_one();
-        tokio::time::timeout(Duration::from_secs(8), async {
+        let second_pass = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let calls = fs::read_to_string(source.join("calls.jsonl")).unwrap_or_default();
                 if calls
@@ -240,8 +240,20 @@ server=ThreadingHTTPServer(('127.0.0.1',0),Handler);print(json.dumps({'host':'12
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .unwrap();
+        .await;
+        if second_pass.is_err() {
+            let snapshot = journal.snapshot().await.unwrap();
+            let word = snapshot["utterances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|word| word["id"] == id.to_string());
+            panic!(
+                "No second pass for {text}: Editor={:?}, request={word:?}, calls={}",
+                editor.status(),
+                fs::read_to_string(source.join("calls.jsonl")).unwrap_or_default()
+            );
+        }
         let snapshot = journal.snapshot().await.unwrap();
         let word = snapshot["utterances"]
             .as_array()

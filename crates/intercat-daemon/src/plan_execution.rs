@@ -392,10 +392,13 @@ fn enqueue(db: &Transaction<'_>, plan: &Plan, item: &mut Item) -> Result<()> {
             "UPDATE utterances SET state='placed',decision=?2,reason=NULL WHERE id=?1",
             params![id.to_string(), decision.to_string()],
         )?;
+        crate::worker_hold::hold_blocked(db, &item.track_ref, &id.to_string())?;
         item.utterance_id = Some(id);
         return Ok(());
     };
-    db.execute("UPDATE utterances SET state='placed',reason=NULL WHERE id=?1 AND state='held' AND reason IN ('Turns stopped','Plan item restored')",[id.to_string()])?;
+    if crate::worker_hold::allowed(db, &item.track_ref, &id.to_string())? {
+        db.execute("UPDATE utterances SET state='placed',reason=NULL WHERE id=?1 AND state='held' AND reason IN ('Turns stopped','Plan item restored','Held after this turn')",[id.to_string()])?;
+    }
     Ok(())
 }
 pub(crate) fn admit(db: &Connection, input: &str) -> Result<()> {
@@ -418,12 +421,14 @@ pub(crate) fn admit(db: &Connection, input: &str) -> Result<()> {
             .iter_mut()
             .find(|item| item.plan_item_id == item_id)
             .unwrap();
+        item.track_ref = crate::continuation::current(db, &item.track_ref)?;
         item.utterance_id = Some(input.parse()?);
         item.state = ItemState::Running;
         item.detail = None;
         if plan.state == State::Done {
             plan.state = State::Running;
         }
+        crate::fresh_words::route_plan(db, &mut plan)?;
         return crate::plan_store::save(db, &plan, "plan.item-continued");
     }
     if item.utterance_id.map(|id| id.to_string()).as_deref() != Some(input)
@@ -564,6 +569,7 @@ pub(crate) fn advance(db: &mut Connection) -> Result<()> {
                 item.detail = detail;
             }
         }
+        crate::fresh_words::route_plan(&tx, &mut plan)?;
         if !crate::dispatch_control::paused(&tx)? {
             for index in 0..plan.items.len() {
                 if plan.items[index].state != ItemState::Planned {
@@ -623,6 +629,7 @@ mod tests {
     async fn fixture(inherit: bool) -> Result<(tempfile::TempDir, Journal, Plan)> {
         fixture_layout(inherit, None, false).await
     }
+    use crate::test_host::IdleTestHost;
     struct QueuedFixture {
         root: tempfile::TempDir,
         journal: Journal,
@@ -997,6 +1004,7 @@ server.serve_forever()
         )?;
         journal
             .workspace_result(crate::preparation::Workspace {
+                denied_roots: Vec::new(),
                 track_id: track.clone(),
                 path: path.clone(),
                 reference: "refs/intercat/test/tracks/A".into(),
@@ -1062,6 +1070,7 @@ server.serve_forever()
                 revision,
                 track.clone(),
                 json!({"sessionId":"dummy-parent-session","commandId":start}),
+                None,
             )
             .await?;
         journal.try_msp(track.clone(),"dummy-parent-session".into(),crate::clock::Stamp::now(),json!({"method":"item/updated","params":{"sessionId":"dummy-parent-session","item":{"kind":"userMessage","itemId":"dummy-input","commandId":start,"turnId":turn,"text":"Dummy parent","revision":1,"status":"completed"}}}),None,None)?.await??;
@@ -1640,6 +1649,7 @@ server.serve_forever()
                 revision,
                 scene.track.clone(),
                 json!({"sessionId":"dummy-parent-session","commandId":start}),
+                None,
             )
             .await?;
         scene.journal.try_msp(scene.track.clone(),"dummy-parent-session".into(),crate::clock::Stamp::now(),
@@ -2824,7 +2834,8 @@ server.serve_forever()
             prompts: vec![],
         };
         scene.journal.worker_state(worker.clone()).await?;
-        let identity = crate::process::identity(std::process::id())?;
+        let idle_host = IdleTestHost::new()?;
+        let identity = idle_host.identity()?;
         let boundary = crate::inheritance_apply::Boundary {
             guard: crate::inheritance_apply::Guard::Work(crate::msp::StartGuard::Stopped(
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2875,7 +2886,8 @@ server.serve_forever()
         workspace: &crate::preparation::Workspace,
         worker: &mut crate::runtime::WorkerState,
     ) -> Result<()> {
-        let identity = crate::process::identity(std::process::id())?;
+        let idle_host = IdleTestHost::new()?;
+        let identity = idle_host.identity()?;
         let applied = crate::inheritance_apply::prepare(
             &scene.journal,
             input.into(),
@@ -3444,6 +3456,7 @@ server.serve_forever()
         )?;
         journal
             .workspace_result(crate::preparation::Workspace {
+                denied_roots: Vec::new(),
                 track_id: track.clone(),
                 path: path.clone(),
                 reference: "refs/intercat/test/tracks/A".into(),
@@ -4425,6 +4438,7 @@ server.serve_forever()
                     serde_json::from_value(snapshot["project"].clone())?;
                 let source = project.only_folder()?.source().await?;
                 let mut workspace = crate::preparation::Workspace {
+                    denied_roots: Vec::new(),
                     track_id: track.clone(),
                     path: workspaces
                         .join(snapshot["session"]["id"].as_str().unwrap())
@@ -4809,7 +4823,7 @@ server.serve_forever()
             }
             for (path,index,head) in &original_folders {
                 assert_eq!(std::fs::read(path.join(".git/index"))?,*index);
-                assert_eq!(intercat_git::Repository::clean_project(path)?.head.to_string(),*head);
+                assert_eq!(crate::source_snapshot::clean_project(path).await?.head.to_string(),*head);
             }
             if inherit {
                 let db = Connection::open(root.path().join("db"))?;
@@ -4903,7 +4917,7 @@ server.serve_forever()
             .bind_session(
                 state["session"]["id"].as_str().unwrap().into(),
                 scene.plan.items[0].folder_id.clone(),
-                state["session"]["slug"].as_str().unwrap().into(),
+                "test".into(),
             )
             .await?;
         while let Some(ticket) = scene.journal.claim_assumptions().await? {

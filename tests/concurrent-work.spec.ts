@@ -1,7 +1,7 @@
 import { _electron as electron, expect, test } from '@playwright/test';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { configureEditor } from './support/editor';
 import { closeWindow } from './support/close';
@@ -54,10 +54,11 @@ test('a slow Check does not block another approval or Stop and cannot turn green
     const marker=await (async()=>{
       let found='';
       await expect.poll(async()=>{
-        const job=(await page.evaluate(()=>window.intercat.getStatus())).integration;
+        const job=(await page.evaluate(()=>window.intercat.getStatus())).integrations![0];
         if(!job)return false;
-        const file=path.join(data,'daemon/integration',job.id,String(job.candidate?.generation??job.revision),'repo/check.running');
-        try{if(Number(await readFile(file,'utf8'))>0){found=file;return true;}}catch{}
+        const parent=path.join(data,'daemon/integration',job.id);
+        const roots=job.candidate ? [job.candidate.workspace] : (await readdir(parent,{withFileTypes:true})).filter(entry=>entry.isDirectory()).map(entry=>path.join(parent,entry.name));
+        for(const root of roots){const file=path.join(root,'repo/check.running');try{if(Number(await readFile(file,'utf8'))>0){found=file;return true;}}catch{}}
         return false;
       },{timeout:30000}).toBe(true);
       return found;
@@ -87,7 +88,7 @@ test('a slow Check does not block another approval or Stop and cannot turn green
     await expect(page.locator('.status-bar')).toContainText('Daemon connected',{timeout:30000});
     const restored=await page.evaluate(()=>window.intercat.getStatus());daemon=restored.daemonPid;
     expect(restored.dispatchPaused).toBe(true);
-    expect(restored.integration?.status).toBe('failed');
+    expect(restored.integrations![0]?.status).toBe('failed');
     expect(restored.utterances?.find(w=>w.text.includes('CHANGELOG'))?.state).toBe('held');
     expect(restored.workers?.every(w=>!['starting','working','reconnecting','approval'].includes(w.phase))).toBe(true);
     observations.restored=restored;observations.passed=true;

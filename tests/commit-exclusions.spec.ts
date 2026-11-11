@@ -19,9 +19,9 @@ for (const zoom of [1, 2]) test(`conflict exclusions show their scope and surviv
       const job: IntegrationJob = { id: '01a1a200-0000-7000-8000-000000000001', revision: 1, status: 'merge-conflict',
         sessionName: 'Dummy inheritance', slug: 'dummy-inheritance', project: { id: 'dummy-folder', name: 'Dummy project', root: '/fixture', path: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'main' },
         error: null, tracks, candidate: null, messages: {}, keptSecrets: [], contributions: {}, assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0,
-        exclusions: [{ track: source, dependents: children, omitted: false }],
-        plan: { targetRef: 'refs/heads/intercat/dummy-inheritance', tree: null, rows: tracks.map((track, index) => ({ track: track.id, state: index === 0 ? 'included' : index === 1 ? 'conflict' : 'waiting', changes: [], conflicts: index === 1 ? [{ path: 'src/ダミー.ts', withTracks: [tracks[0].id] }] : [] })) } };
-      const state = { connected: true, sequence: 1, integration: job, project: { id: 'dummy-project', name: 'Dummy project', folders: [job.project] }, trackFolders: Object.fromEntries(tracks.map(track => [track.id, job.project.id])), tracks: tracks.map(track => ({ ...track, status: 'done' })), workspaces: [], workers: [], utterances: [] };
+        pathReview:{families:[],choices:{}},pathState:null,retirements:[],exclusions: [{ track: source, dependents: children, omitted: false }],
+        plan: { undoConflict:null,targetRef: 'refs/heads/intercat/dummy-inheritance', tree: null, rows: tracks.map((track, index) => ({ track: track.id, state: index === 0 ? 'included' : index === 1 ? 'conflict' : 'waiting', changes: [], conflicts: index === 1 ? [{ path: 'src/ダミー.ts', withTracks: [tracks[0].id] }] : [] })) } };
+      const state = { connected: true, sequence: 1, integrations: [job], project: { id: 'dummy-project', name: 'Dummy project', folders: [job.project] }, trackFolders: Object.fromEntries(tracks.map(track => [track.id, job.project.id])), tracks: tracks.map(track => ({ ...track, status: 'done' })), workspaces: [], workers: [], utterances: [] };
       const memory = { state, calls: [] as IntegrationRequest[], applied: new Map<string, IntegrationJob>(), saves: 0 };
       Object.assign(globalThis, { commitExclusions: memory });
       ipcMain.removeHandler('intercat:status'); ipcMain.handle('intercat:status', () => state);

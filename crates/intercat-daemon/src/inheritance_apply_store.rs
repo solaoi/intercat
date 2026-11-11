@@ -37,6 +37,7 @@ pub(crate) enum Change {
     Checkpoint {
         operation: Uuid,
         checkpoint: Checkpoint,
+        lfs_directory: std::path::PathBuf,
     },
     Complete(Uuid),
     HoldSource(Uuid),
@@ -132,7 +133,12 @@ pub(crate) fn pending(db: &Connection, track: &str) -> Result<Option<Application
         .transpose()
 }
 pub(crate) fn available(db: &Connection, track: &str, input: &str) -> Result<bool> {
-    Ok(pending(db, track)?.is_none_or(|saved| saved.dependencies.input == input))
+    Ok(crate::worker_hold::allowed(db, track, input)?
+        && !crate::continuation::closed(db, track)?
+        && crate::continuation::allowed(db, track, input)?
+        && !crate::fresh_store::holds(db, track)?
+        && !crate::realign_store::pending(db, track)?
+        && pending(db, track)?.is_none_or(|saved| saved.dependencies.input == input))
 }
 pub(crate) fn context(db: &Connection, input: &str) -> Result<Option<Context>> {
     let origin = crate::plan_files::pending(db, input)?;
@@ -297,6 +303,7 @@ pub(crate) fn change(db: &mut Connection, change: Change) -> Result<Option<Check
         Change::Checkpoint {
             operation,
             checkpoint,
+            lfs_directory,
         } => {
             let (app, state) = read(&tx, operation)?.ok_or("Missing inherited file operation.")?;
             if state != "dispatched" || checkpoint.turn_id != app.checkpoint_turn {
@@ -318,12 +325,21 @@ pub(crate) fn change(db: &mut Connection, change: Change) -> Result<Option<Check
                     );
                 }
                 crate::lineage_store::set_basis(&tx, &app.dependencies.track, &app.basis)?;
-                let payload = serde_json::json!({"trackId":app.dependencies.track,"checkpoint":checkpoint,"latestRef":format!("{}-checkpoint",app.workspace.reference),"expected":app.previous.as_ref().map(|p|&p.sha)});
+                let payload = serde_json::json!({"trackId":app.dependencies.track,"checkpoint":checkpoint,"latestRef":format!("{}-checkpoint",app.workspace.reference),"expected":app.previous.as_ref().map(|p|&p.sha),"lfsDirectory":lfs_directory});
                 tx.execute(
                     "INSERT INTO operations VALUES(?1,'checkpoint.save',?2,'prepared')",
                     params![id, payload.to_string()],
                 )?;
-                crate::lineage_store::reserve(&tx, &id, &payload)?;
+                crate::lineage_store::reserve(
+                    &tx,
+                    &id,
+                    payload["trackId"]
+                        .as_str()
+                        .ok_or("Missing checkpoint track.")?,
+                    payload["checkpoint"]["sha"]
+                        .as_str()
+                        .ok_or("Missing checkpoint tree.")?,
+                )?;
                 event(
                     &tx,
                     "inheritance.checkpoint-prepared",
@@ -453,6 +469,7 @@ mod tests {
         let word = journal.read_utterance(input.to_string()).await?;
         let track = word["decision"]["trackId"].as_str().unwrap().to_owned();
         let workspace = Workspace {
+            denied_roots: Vec::new(),
             track_id: track.clone(),
             path: root.path().join("worker"),
             reference: "refs/intercat/test/tracks/A".into(),
@@ -478,6 +495,8 @@ mod tests {
         };
         journal.worker_state(worker.clone()).await?;
         let parent = crate::lineage::Point {
+            views: Vec::new(),
+            parents: Default::default(),
             track: "parent".into(),
             number: 1,
             sha: "1".repeat(40),
@@ -548,6 +567,7 @@ mod tests {
             .change_inheritance(Change::Checkpoint {
                 operation: app.operation,
                 checkpoint: checkpoint.clone(),
+                lfs_directory: app.workspace.path.join(".git/lfs"),
             })
             .await?;
         let id = Uuid::new_v5(&app.checkpoint_turn, b"checkpoint");
@@ -797,7 +817,8 @@ mod tests {
             journal
                 .change_inheritance(Change::Checkpoint {
                     operation: app.operation,
-                    checkpoint
+                    checkpoint,
+                    lfs_directory: app.workspace.path.join(".git/lfs"),
                 })
                 .await
                 .is_err()

@@ -91,6 +91,7 @@ async fn fixture(
         .to_owned();
     journal
         .workspace_result(Workspace {
+            denied_roots: Vec::new(),
             track_id: track.clone(),
             path: repo,
             reference: "refs/intercat/dummy".into(),
@@ -233,7 +234,7 @@ async fn background_observation_offers_review_without_claiming_completion() -> R
         .read_utterance(response["inputId"].as_str().unwrap().into())
         .await?;
     assert_eq!(word["presentation"]["command"], "commit");
-    assert!(journal.snapshot().await?["integration"].is_null());
+    assert!(journal.snapshot().await?["integrations"][0].is_null());
     Ok(())
 }
 
@@ -247,8 +248,10 @@ async fn new_activity_and_work_invalidate_old_observations_and_answers() -> Resu
     let repair = intercat_daemon::repair_run::Run {
         id: Uuid::now_v7(),
         revision: 1,
-        job_id: Uuid::now_v7(),
-        job_revision: 1,
+        owner: intercat_daemon::repair_run::Owner::Commit {
+            id: Uuid::now_v7(),
+            revision: 1,
+        },
         track: worker.track_id.clone(),
         purpose: intercat_daemon::repair_run::Purpose::Check,
         phase: intercat_daemon::repair_run::Phase::Held,
@@ -271,12 +274,15 @@ async fn new_activity_and_work_invalidate_old_observations_and_answers() -> Resu
         selection: None,
         refresh: None,
         restoring: None,
+        remaining: None,
+        manual: None,
+        external_editor: false,
     };
     db.execute(
         "INSERT INTO repair_runs VALUES(?1,?2,1,?3)",
         rusqlite::params![
             repair.id.to_string(),
-            repair.job_id.to_string(),
+            repair.owner.id().to_string(),
             serde_json::to_string(&repair)?
         ],
     )?;
@@ -547,6 +553,7 @@ async fn second_saved_track(
         .to_owned();
     journal
         .workspace_result(Workspace {
+            denied_roots: Vec::new(),
             track_id: track.clone(),
             path: repo,
             reference: "refs/intercat/other".into(),
@@ -668,7 +675,7 @@ async fn quiet_overlap_review_prepares_the_exact_group_and_stales_after_new_acti
         word["presentation"]["commitTracks"],
         json!([first.track_id, second.track_id])
     );
-    assert!(journal.snapshot().await?["integration"].is_null());
+    assert!(journal.snapshot().await?["integrations"][0].is_null());
     journal.append("draft.saved", json!({"dummy":true})).await?;
     assert!(
         journal

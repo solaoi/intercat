@@ -48,6 +48,7 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, WorkerState)> {
         .to_owned();
     journal
         .workspace_result(Workspace {
+            denied_roots: Vec::new(),
             track_id: track.clone(),
             path: root.path().join("dummy-worktree"),
             reference: "refs/intercat/dummy".into(),
@@ -255,7 +256,7 @@ async fn commit_only_prepares_a_review_and_not_now_stays_dismissed() -> Result<(
         } else {
             assert!(result["inputId"].is_null());
         }
-        assert!(journal.snapshot().await?["integration"].is_null());
+        assert!(journal.snapshot().await?["integrations"][0].is_null());
         drop(journal);
         let journal = Journal::open(root.path().join("db"), Key::new([7; 32])).await?;
         assert!(journal.snapshot().await?["proposal"].is_null());

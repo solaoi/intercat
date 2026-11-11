@@ -51,7 +51,7 @@ test('application actions open the requested view and only record display, inclu
     await expect(review).toBeVisible();
     await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).utterances!.find(word => word.id === queued.id)?.state).toBe('landed');
     // This fixture has no project. Opening its review must remain separate from creating a commit.
-    expect((await page.evaluate(() => window.intercat.getStatus())).integration).toBeNull();
+    expect((await page.evaluate(() => window.intercat.getStatus())).integrations![0]).toBeNull();
     await review.getByRole('button', { name: 'Hide commit review', exact: true }).click();
     await expect(review).toHaveCount(0);
     await page.getByRole('button', { name: 'Settings', exact: true }).click();

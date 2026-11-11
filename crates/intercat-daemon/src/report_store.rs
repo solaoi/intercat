@@ -350,12 +350,7 @@ pub fn respond(
             tx.execute("INSERT INTO utterances(id,text,created_at,target,selected,state,revision,decision,reason,provisional,question_id,question_revision) VALUES(?1,?2,?3,?4,?5,?6,1,?7,?8,?5,?9,?10)",params![id,text,crate::journal::timestamp(),json!({"mode":"lock","trackId":q.track_id}).to_string(),q.track_id,if orphaned.is_some() { "orphaned" } else { "placed" },orphaned.is_none().then(|| decision.to_string()),orphaned,q.id,revision])?;
             if orphaned.is_none() {
                 crate::review_fix_store::human_input(&tx, &id, 1, &q.track_id)?;
-                crate::plan_continuation::attach_to_turn(
-                    &tx,
-                    &id,
-                    &q.session_id,
-                    &q.turn_id.to_string(),
-                )?;
+
                 q.reply_utterance_id = Some(id.clone());
                 q.state = "queued".into();
             }
@@ -375,6 +370,19 @@ pub fn respond(
         }
     };
     put_question(&tx, &q)?;
+    if let Some(input) = &input {
+        crate::fresh_words::route_reply(&tx, input, &q.track_id)?;
+        if orphaned.is_none() {
+            crate::plan_continuation::attach_to_turn(
+                &tx,
+                input,
+                &q.session_id,
+                &q.turn_id.to_string(),
+            )?;
+        }
+        q = read_question(&tx, question_id)?;
+    }
+
     tx.execute(
         "INSERT INTO operations VALUES(?1,'report.respond',?2,'complete')",
         params![id.to_string(), payload],

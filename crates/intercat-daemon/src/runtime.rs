@@ -98,7 +98,7 @@ pub struct WorkerState {
     pub prompts: Vec<crate::questions::Prompt>,
 }
 impl WorkerState {
-    fn released(&self) -> bool {
+    pub(crate) fn released(&self) -> bool {
         matches!(self.phase.as_str(), "stopped" | "sleeping")
             && self.active_turn.is_none()
             && !self.checkpoint_pending
@@ -136,6 +136,7 @@ pub struct Service {
     data: PathBuf,
     rpc: PathBuf,
     branches: Arc<tokio::sync::Mutex<()>>,
+    global_pause: Arc<crate::dispatch_control::Gate>,
     recoveries: crate::pickup_run::Runs,
     stopping: watch::Receiver<bool>,
     journal: Journal,
@@ -215,6 +216,251 @@ impl Service {
                 port.release_stop(generation);
             }
         }
+    }
+    pub async fn prepare_fresh(&self, request: crate::fresh::Request) -> Result<crate::fresh::Job> {
+        if *self.stopping.borrow() {
+            return Err("Shutdown has started.".into());
+        }
+        let job = self
+            .journal
+            .fresh(crate::fresh::Change::Request(request))
+            .await?;
+        if job.phase != crate::fresh::Phase::Cancelled
+            && let Ok(port) = self.port(&job.request.track_id)
+            && !port.is_closed()
+        {
+            port.hold(job.request.op_id)?;
+        }
+        Ok(job)
+    }
+    pub async fn cancel_fresh(
+        &self,
+        op_id: Uuid,
+        id: Uuid,
+        revision: u64,
+    ) -> Result<crate::fresh::Job> {
+        let replay = self.journal.operation(op_id).await?.is_some();
+        let old = self
+            .journal
+            .fresh_job(id)
+            .await?
+            .ok_or("Missing Start fresh request.")?;
+        let port = self
+            .port(&old.request.track_id)
+            .ok()
+            .filter(|port| !port.is_closed());
+        let generation = port.as_ref().map(|port| {
+            port.stop_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        });
+        let job = self
+            .journal
+            .fresh(crate::fresh::Change::Cancel {
+                op_id,
+                id,
+                revision,
+            })
+            .await?;
+        if !replay && let (Some(port), Some(generation)) = (port, generation) {
+            port.saved_local_hold(generation, Uuid::new_v5(&op_id, b"fresh-cancel-hold"));
+        }
+        Ok(job)
+    }
+    pub async fn fresh_command(&self, command: crate::fresh::Command) -> Result<crate::fresh::Job> {
+        use crate::fresh::{Action, Change};
+        let crate::fresh::Command {
+            op_id,
+            id,
+            revision,
+            action,
+        } = command;
+        match action {
+            Action::Cancel => self.cancel_fresh(op_id, id, revision).await,
+            Action::Retry => {
+                self.journal
+                    .fresh(Change::Retry {
+                        op_id,
+                        id,
+                        revision,
+                    })
+                    .await
+            }
+            Action::AllowAccess { fingerprint } => {
+                self.journal
+                    .fresh(Change::ApproveAccess {
+                        op_id,
+                        id,
+                        revision,
+                        fingerprint,
+                    })
+                    .await
+            }
+        }
+    }
+    pub(crate) async fn advance_fresh(&self, job: crate::fresh::Job) -> Result<crate::fresh::Job> {
+        use crate::fresh::{Change, Phase};
+        if *self.stopping.borrow() {
+            return Err(crate::fresh::Waiting("Shutdown has started.").into());
+        }
+        let id = job.request.op_id;
+        let revision = job.revision;
+        match job.phase {
+            Phase::WaitingForTurn => self.journal.fresh(Change::Capture { id, revision }).await,
+            Phase::Captured => self.journal.fresh(Change::Release { id, revision }).await,
+            Phase::Releasing => {
+                self.release_fresh_source(&job).await?;
+                self.journal.fresh(Change::Released { id, revision }).await
+            }
+            Phase::Cancelling => {
+                self.release_fresh_source(&job).await?;
+                crate::fresh_cancel::complete(&self.data, &self.journal, &job).await
+            }
+            Phase::Inspecting | Phase::NeedsAccess => {
+                crate::fresh_files::stopped(&self.data, &self.journal, &job).await?;
+                let inspection = crate::fresh_files::inspect(&job).await?;
+                self.journal
+                    .fresh(Change::Inspect {
+                        id,
+                        revision,
+                        inspection,
+                    })
+                    .await
+            }
+            Phase::CapturingFiles => {
+                crate::fresh_files::stopped(&self.data, &self.journal, &job).await?;
+                crate::fresh_files::capture(&self.journal, &job).await
+            }
+            Phase::PublishingFiles => {
+                crate::fresh_files::stopped(&self.data, &self.journal, &job).await?;
+                crate::fresh_files::publish(&self.journal, &job).await
+            }
+            Phase::SnapshotReady => {
+                if self.journal.worker_config().await?.is_none() {
+                    return Err(crate::fresh::Waiting(
+                        "Connect workers before making the handoff summary.",
+                    )
+                    .into());
+                }
+                if self.global_pause.paused() {
+                    return Err(
+                        crate::fresh::Waiting("Resume before making the handoff summary.").into(),
+                    );
+                }
+                let changes = crate::fresh_summary::changes(&job).await?;
+                self.journal
+                    .fresh(Change::PrepareSummary {
+                        id,
+                        revision,
+                        changes,
+                    })
+                    .await
+            }
+            Phase::Summarizing => {
+                let config = self
+                    .journal
+                    .worker_config()
+                    .await?
+                    .ok_or("Connect workers before making the handoff summary.")?;
+                let document = crate::fresh_summary::run(
+                    &self.journal,
+                    &job,
+                    &config,
+                    &self.data,
+                    &self.rpc,
+                    self.host_memory.clone(),
+                    self.assistant_capacity.clone(),
+                    self.global_pause.clone(),
+                    self.stopping.clone(),
+                )
+                .await?;
+                self.journal
+                    .fresh(Change::Summarized {
+                        id,
+                        revision,
+                        document,
+                    })
+                    .await
+            }
+            Phase::SummaryReady => {
+                crate::fresh_files::stopped(&self.data, &self.journal, &job).await?;
+                crate::fresh_files::transfer(&self.journal, &job).await
+            }
+            Phase::PublishingOwner => crate::fresh_files::publish_owner(&self.journal, &job).await,
+            Phase::FilesHeld
+            | Phase::SummaryHeld
+            | Phase::OwnerHeld
+            | Phase::Transferred
+            | Phase::Cancelled => Ok(job),
+        }
+    }
+    async fn release_fresh_source(&self, job: &crate::fresh::Job) -> Result<()> {
+        if let Ok(port) = self.port(&job.request.track_id)
+            && !port.is_closed()
+        {
+            let snapshot = self.journal.snapshot().await?;
+            if snapshot["workers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|worker| {
+                    worker["trackId"] == job.request.track_id
+                        && worker["sessionId"] == job.request.session_id
+                        && worker["activeTurn"].is_null()
+                        && worker["checkpointPending"] == false
+                        && matches!(
+                            worker["phase"].as_str(),
+                            Some("lost" | "failed" | "needs-recovery")
+                        )
+                })
+            {
+                port.stop(Uuid::new_v5(&job.request.op_id, b"release-source"))?;
+            }
+            return Err(
+                crate::fresh::Waiting("Waiting for the source actor to close its host.").into(),
+            );
+        }
+        let _guard = self.branches.lock().await;
+        let snapshot = self.journal.snapshot().await?;
+        let mut worker: WorkerState = serde_json::from_value(
+            snapshot["workers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|worker| worker["trackId"] == job.request.track_id)
+                .cloned()
+                .ok_or("Missing Start fresh source worker.")?,
+        )?;
+        if worker.session_id.as_deref() != Some(&job.request.session_id)
+            || worker.active_turn.is_some()
+            || worker.checkpoint_pending
+            || serde_json::to_value(&worker.checkpoint)?
+                != serde_json::to_value(job.boundary.as_ref().map(|value| &value.checkpoint))?
+        {
+            return Err("The source changed before its host could be released.".into());
+        }
+        // After a daemon restart there is no actor. The durable Fresh request
+        // already authorizes stopping this exact source's owned processes.
+        if !matches!(worker.phase.as_str(), "stopped" | "sleeping") {
+            let directory = self.data.join("hosts").join(&job.request.track_id);
+            let workspace = job.workspace.path.clone();
+            let expected = worker.identity;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                if let Some(mut tracker) =
+                    crate::process::Tracker::restore(&directory, &workspace, expected)?
+                {
+                    tracker.stop_confirmed()?;
+                }
+                Ok(())
+            })
+            .await??;
+            self.journal
+                .unmount_dependency_references(&job.request.track_id)
+                .await?;
+            worker.phase = "stopped".into();
+            worker.detail = Some("Source closed for Start fresh".into());
+            self.journal.worker_state(worker).await?;
+        }
+        crate::fresh_files::stopped(&self.data, &self.journal, job).await
     }
     pub async fn prepare_pickup(&self, request: crate::pickup::Request) -> Result<Value> {
         let service = self.clone();
@@ -370,6 +616,145 @@ impl Service {
             .await?;
         self.retry.send(recovery.request.track_id.clone())?;
         Ok(recovery)
+    }
+    pub(crate) async fn two_ways_options(
+        &self,
+        query: crate::two_ways::OptionsQuery,
+    ) -> Result<crate::two_ways::Options> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let source = service.journal.two_ways_source(query.clone()).await?;
+            let models = if let Ok(port) = service.port(&source.track)
+                && !port.is_closed()
+            {
+                port.two_ways_models(&source.session).await?
+            } else {
+                if !source.released {
+                    return Err("Reconnect this worker before reading its model choices.".into());
+                }
+                let config = service
+                    .journal
+                    .worker_config()
+                    .await?
+                    .ok_or("Connect workers to read their model choices.")?;
+                let workspace = service.journal.workspace(source.track.clone()).await?;
+                crate::two_ways_options::read(
+                    service.host_memory.clone(),
+                    &service.journal,
+                    &config,
+                    &service.data,
+                    &service.rpc,
+                    service.stopping.clone(),
+                    &workspace,
+                    &source.session,
+                )
+                .await?
+            };
+            let variation = crate::two_ways::Variation::from_catalog(&models)?;
+            if service.journal.two_ways_source(query).await? != source {
+                return Err(
+                    "The instruction or source session changed while reading its options.".into(),
+                );
+            }
+            Ok(crate::two_ways::Options {
+                input_id: source.query.input_id,
+                revision: source.query.revision,
+                selection: crate::two_ways::Selection {
+                    track_id: source.track,
+                    session_id: source.session,
+                    variation,
+                },
+            })
+        })
+        .await?
+    }
+    pub(crate) async fn advance_two_ways(
+        &self,
+        job: crate::two_ways::Job,
+    ) -> Result<crate::two_ways::Job> {
+        use crate::two_ways::{Change, Phase, Waiting};
+        if *self.stopping.borrow() || self.global_pause.paused() && job.phase != Phase::Cancelling {
+            return Err(Waiting("Paired preparation waits while turns are stopped.").into());
+        }
+        let id = job.request.op_id;
+        let revision = job.revision;
+        match job.phase {
+            Phase::Cancelling => {
+                let _branches = self.branches.lock().await;
+                let snapshot = self.journal.snapshot().await?;
+                if let Some(raw) = snapshot["branches"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|branch| branch["request"]["opId"] == job.branch_id.to_string())
+                {
+                    let branch: crate::branch::Branch = serde_json::from_value(raw.clone())?;
+                    crate::branch_run::release_hosts(&self.data, &branch).await?;
+                    if branch.session_id.is_some() {
+                        let catalog = self.journal.fingerprint_catalog().await?;
+                        if catalog.sealed.as_ref() != Some(&catalog.current) {
+                            return Err(Waiting(
+                                "Confirm the saved fingerprints before completing cancellation.",
+                            )
+                            .into());
+                        }
+                    }
+                } else if self
+                    .data
+                    .join("branch-hosts")
+                    .join(job.branch_id.to_string())
+                    .try_exists()?
+                {
+                    return Err("The branch host's saved owner is missing. Cancellation still needs review.".into());
+                }
+                self.journal
+                    .two_ways(Change::Cancelled { id, revision })
+                    .await
+            }
+            Phase::CapturingInitial => {
+                let port = self
+                    .port(&job.source_track)
+                    .map_err(|_| Waiting("Reconnect the empty paired source worker."))?;
+                port.verify_empty_session(&job.source_session).await?;
+                crate::two_ways_initial::capture(self.journal.clone(), job).await
+            }
+            Phase::Inspecting | Phase::InspectingConfirmedUsage => {
+                let port = self
+                    .port(&job.source_track)
+                    .map_err(|_| Waiting("Reconnect the paired source worker."))?;
+                let (usage, models) = port.two_ways_observation(&job.source_session).await?;
+                self.journal
+                    .two_ways(Change::Inspect {
+                        id,
+                        revision,
+                        usage,
+                        models,
+                    })
+                    .await
+            }
+            Phase::Forking => {
+                self.prepare_branch(job.branch_request()?).await?;
+                self.journal
+                    .two_ways(Change::BranchReady { id, revision })
+                    .await
+            }
+            Phase::AwaitingReceipt => {
+                let catalog = self.journal.fingerprint_catalog().await?;
+                if catalog.sealed.as_ref() != Some(&catalog.current) {
+                    return Err(Waiting(
+                        "Save the inherited fingerprints before starting both paths.",
+                    )
+                    .into());
+                }
+                let branch = self.activate_branch(job.branch_id).await?;
+                crate::two_ways_files::before_publish(&self.journal, &job, &branch.track_id)
+                    .await?;
+                self.journal
+                    .two_ways(Change::Publish { id, revision })
+                    .await
+            }
+            _ => Err(Waiting("This paired attempt needs no automatic preparation.").into()),
+        }
     }
     pub async fn prepare_branch(&self, request: crate::branch::Request) -> Result<Value> {
         let service = self.clone();
@@ -541,6 +926,96 @@ impl Service {
     ) -> Result<crate::deletion::Restored> {
         self.port(track)?.restore(id, snapshot).await
     }
+    pub async fn exclude_checkpoint(
+        &self,
+        command: crate::checkpoint_scope::Exclude,
+    ) -> Result<()> {
+        self.journal
+            .checkpoint_scope(crate::checkpoint_scope::Change::Exclude(command.clone()))
+            .await?;
+        let operation = self
+            .journal
+            .operation(command.op_id)
+            .await?
+            .ok_or("The checkpoint decision was not saved.")?;
+        if operation["state"] == "complete" {
+            return Ok(());
+        }
+        let issue: crate::checkpoint_scope::Issue =
+            serde_json::from_value(operation["payload"]["issue"].clone())?;
+        let checkpoint_id = Uuid::new_v5(&issue.turn_id, b"checkpoint");
+        let saved = self
+            .journal
+            .operation(checkpoint_id)
+            .await?
+            .is_some_and(|operation| {
+                operation["kind"] == "checkpoint.save" && operation["state"] == "complete"
+            });
+        if !saved {
+            if let Ok(port) = self.port(&issue.track_id)
+                && !port.is_closed()
+            {
+                let workspace = self.journal.workspace(issue.track_id.clone()).await?;
+                port.retry_checkpoint(issue.turn_id, workspace).await?;
+            } else {
+                let retry = serde_json::from_value(operation["payload"]["retryId"].clone())?;
+                self.retry(retry, issue.track_id.clone()).await?;
+            }
+        }
+        let id = command.op_id.to_string();
+        if operation["state"] == "prepared" {
+            self.journal.finish(&id, "dispatched").await?;
+        }
+        self.journal.finish(&id, "complete").await
+    }
+    pub(crate) async fn remaining_realign_processes(
+        &self,
+        track: &str,
+        host: crate::process::Identity,
+    ) -> Result<bool> {
+        self.port(track)?.remaining_processes(host).await
+    }
+    pub(crate) async fn stop_realign_processes(
+        &self,
+        request: crate::realign::Request,
+        command: Uuid,
+    ) -> Result<()> {
+        self.port(&request.track_id)?
+            .stop_realign_processes(request, command)
+            .await
+    }
+    pub async fn request_realign(
+        &self,
+        request: crate::realign::Request,
+    ) -> Result<crate::realign::Job> {
+        self.journal
+            .change_realign_queue(crate::realign_queue::Change::Request(request))
+            .await?
+            .ok_or_else(|| "The realignment request was not saved.".into())
+    }
+    pub async fn control_realign(
+        &self,
+        control: crate::realign::Control,
+    ) -> Result<crate::realign::Job> {
+        self.journal
+            .change_realign_queue(crate::realign_queue::Change::Control(control))
+            .await?
+            .ok_or_else(|| "The realignment request changed.".into())
+    }
+    pub async fn approve_realign_access(
+        &self,
+        consent: crate::workspace_access::Consent,
+    ) -> Result<()> {
+        self.journal.approve_realign_access(consent).await
+    }
+    pub async fn realign(&self, request: crate::realign::Request) -> Result<()> {
+        self.port(&request.track_id)
+            .map_err(|_| {
+                Box::new(crate::realign::Waiting) as Box<dyn std::error::Error + Send + Sync>
+            })?
+            .realign(request)
+            .await
+    }
     pub async fn finish_inheritance(&self, id: Uuid, track: &str, application: Uuid) -> Result<()> {
         self.port(track)?.finish_inheritance(id, application).await
     }
@@ -628,13 +1103,269 @@ impl Service {
         }
         self.journal.stop_lost_worker(id, state, turn).await
     }
-    pub async fn start_turn(&self, id: Uuid, track: &str) -> Result<()> {
+    pub async fn restore_path(
+        &self,
+        request: crate::path_restore::Request,
+    ) -> Result<crate::path_restore::Job> {
+        self.journal.restore_path(request).await
+    }
+    pub async fn control_path_restore(
+        &self,
+        control: crate::path_restore::Control,
+    ) -> Result<crate::path_restore::Job> {
+        let _guard = self.branches.lock().await;
+        self.journal
+            .change_path_restore(crate::path_restore_store::Change::Control(control))
+            .await
+    }
+    pub async fn aside_processes(&self, id: Uuid) -> Result<crate::aside_processes::Info> {
+        let (entry, worker) = self.journal.aside_process_scope(id).await?;
+        let stops: Vec<crate::aside_processes::Status> =
+            serde_json::from_value(self.journal.snapshot().await?["asideProcessStops"].clone())?;
+        let stop = stops
+            .into_iter()
+            .find(|status| status.record.request.retirement_id == id);
+        let host = worker.as_ref().and_then(|state| state.identity);
+        let tracker = self
+            .port(&entry.track)
+            .ok()
+            .and_then(|port| port.process_tracker());
+        let directory = self.data.join("hosts").join(&entry.track);
+        let result = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let scan = if let Some(tracker) = tracker {
+                Some(tracker.lock().unwrap().refresh()?)
+            } else {
+                crate::process::Tracker::restore(&directory, &entry.workspace.path, host)?
+                    .map(|mut tracker| tracker.refresh())
+                    .transpose()?
+            };
+            Ok(scan
+                .map(|scan| crate::aside_processes::count(scan, host))
+                .unwrap_or(0))
+        })
+        .await?;
+        Ok(match result {
+            Ok(groups) => crate::aside_processes::Info {
+                retirement_id: id,
+                groups: Some(groups),
+                error: None,
+                stop,
+            },
+            Err(error) => crate::aside_processes::Info {
+                retirement_id: id,
+                groups: None,
+                error: Some(error.to_string()),
+                stop,
+            },
+        })
+    }
+    pub async fn stop_aside_processes(
+        &self,
+        request: crate::aside_processes::Request,
+    ) -> Result<crate::aside_processes::Status> {
+        let _guard = self.branches.lock().await;
+        self.journal
+            .change_aside_processes(crate::aside_processes::Change::Begin(request))
+            .await
+    }
+    pub(crate) async fn finish_aside_processes(
+        &self,
+        request: crate::aside_processes::Request,
+    ) -> Result<()> {
+        let _guard = self.branches.lock().await;
+        let status = self
+            .journal
+            .change_aside_processes(crate::aside_processes::Change::Begin(request.clone()))
+            .await?;
+        if status.state == "complete" {
+            return Ok(());
+        }
+        let (entry, worker) = self
+            .journal
+            .aside_process_scope(request.retirement_id)
+            .await?;
+        if entry.track != status.record.track
+            || entry.saved.as_ref().unwrap().session_id != status.record.session
+        {
+            return Err("The process Stop belongs to another worker session.".into());
+        }
+        self.journal
+            .finish(&request.op_id.to_string(), "dispatched")
+            .await?;
+        if let Some((port, tracker, identity)) = self
+            .port(&entry.track)
+            .ok()
+            .filter(|port| !port.is_closed())
+            .and_then(|port| {
+                Some((
+                    port.clone(),
+                    port.process_tracker()?,
+                    worker.as_ref()?.identity?,
+                ))
+            })
+        {
+            let generation = port
+                .stop_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let guard = crate::inheritance_apply::Guard::Recovery {
+                generation: port.stop_generation.clone(),
+                expected: generation,
+                gate: self.global_pause.clone(),
+                epoch: self.global_pause.epoch(),
+            };
+            crate::inheritance_apply::stop_children(tracker, identity, guard).await?;
+        } else {
+            let directory = self.data.join("hosts").join(&entry.track);
+            let host = worker.as_ref().and_then(|worker| worker.identity);
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                if let Some(mut tracker) =
+                    crate::process::Tracker::restore(&directory, &entry.workspace.path, host)?
+                {
+                    tracker.stop_confirmed()?;
+                }
+                Ok(())
+            })
+            .await??;
+        }
+        self.journal
+            .change_aside_processes(crate::aside_processes::Change::Complete(request.op_id))
+            .await?;
+        Ok(())
+    }
+    pub(crate) async fn apply_path_restore(
+        &self,
+        request: crate::path_restore::Request,
+    ) -> Result<()> {
+        let _guard = self.branches.lock().await;
+        let job = self.journal.restore_path(request.clone()).await?;
+        if job.phase == crate::path_restore::Phase::Done {
+            return Ok(());
+        }
+        if job.phase == crate::path_restore::Phase::Held {
+            return Err(crate::path_restore::Waiting("This Restore is held.").into());
+        }
+        if self.journal.snapshot().await?["asideProcessStops"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|stop| {
+                stop["record"]["request"]["retirementId"] == request.retirement_id.to_string()
+            })
+        {
+            return Err(
+                crate::path_restore::Waiting("Waiting for this path's processes to stop.").into(),
+            );
+        }
+        if let Ok(port) = self.port(&job.track_id)
+            && !port.is_closed()
+        {
+            return port.restore_path(request).await;
+        }
+        let workspace = self.journal.workspace(job.track_id.clone()).await?;
+        let snapshot = self.journal.snapshot().await?;
+        let mut worker = snapshot["workers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|worker| worker["trackId"] == job.track_id)
+            .cloned()
+            .map(serde_json::from_value::<WorkerState>)
+            .transpose()?;
+        let guard = crate::inheritance_apply::Guard::Recovery {
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            expected: 0,
+            gate: self.global_pause.clone(),
+            epoch: self.global_pause.epoch(),
+        };
+        let applied = crate::path_restore_apply::apply(
+            &self.journal,
+            request,
+            crate::path_restore_apply::Boundary::Offline {
+                guard,
+                directory: self.data.join("hosts").join(&job.track_id),
+                workspace: workspace.path,
+                expected: worker.as_ref().and_then(|worker| worker.identity),
+            },
+        )
+        .await?;
+        if let Some(applied) = applied {
+            if let Some(worker) = &mut worker {
+                worker.checkpoint = Some(applied.checkpoint);
+                worker.checkpoint_pending = false;
+                self.journal.worker_state(worker.clone()).await?;
+            }
+            self.journal
+                .change_path_restore(crate::path_restore_store::Change::Complete(
+                    applied.operation,
+                ))
+                .await?;
+        }
+        Ok(())
+    }
+    pub(crate) async fn stop_path_boundary(
+        &self,
+        id: Uuid,
+        track: &str,
+    ) -> Result<(Option<String>, Option<crate::checkpoint::Checkpoint>)> {
         if let Ok(port) = self.port(track)
+            && !port.is_closed()
+        {
+            let stopped = port.stop_and_wait(id).await?;
+            let generation = port
+                .stop_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let hold = Uuid::new_v5(&id, b"hold-after-stop");
+            self.journal.hold_inputs(hold, track.to_owned()).await?;
+            port.saved_local_hold(generation, hold);
+            return Ok((Some(stopped.session_id), stopped.checkpoint));
+        }
+        let snapshot = self.journal.snapshot().await?;
+        let worker = snapshot["workers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|state| state["trackId"] == track);
+        if worker.is_none() {
+            return Ok((None, None));
+        }
+        if worker.is_some_and(|state| {
+            state["checkpointPending"] == true || !state["activeTurn"].is_null()
+        }) {
+            return Err(
+                "Recover the worker's final checkpoint before setting this path aside.".into(),
+            );
+        }
+        self.stop(id, track).await?;
+        let snapshot = self.journal.snapshot().await?;
+        let worker = snapshot["workers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|state| state["trackId"] == track)
+            .ok_or("The stopped worker is unavailable.")?;
+        let worker: WorkerState = serde_json::from_value(worker.clone())?;
+        if worker.active_turn.is_some()
+            || worker.checkpoint_pending
+            || !worker.approvals.is_empty()
+            || !worker.prompts.is_empty()
+        {
+            return Err("Wait for the stopped worker's saved boundary.".into());
+        }
+        Ok((worker.session_id, worker.checkpoint))
+    }
+    pub async fn start_turn(&self, id: Uuid, track: &str) -> Result<()> {
+        let snapshot = self.journal.snapshot().await?;
+        let has_placed = snapshot["utterances"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|word| word["decision"]["trackId"] == track && word["state"] == "placed");
+        if has_placed
+            && let Ok(port) = self.port(track)
             && !port.is_closed()
         {
             return port.start(id).await;
         }
-        let snapshot = self.journal.snapshot().await?;
         if let Some(operation) = self.journal.operation(id).await? {
             if operation["kind"] == "utterance.start"
                 && snapshot["utterances"]
@@ -785,8 +1516,12 @@ impl Service {
         if result["state"] == "placed" {
             let started = match (port, generation) {
                 (Some(port), Some(generation)) => {
-                    port.start_admitted(Uuid::new_v5(&id, b"start-held"), generation, true)
-                        .await
+                    port.start_admitted(
+                        Uuid::new_v5(&id, b"start-held"),
+                        generation,
+                        Some(input.clone()),
+                    )
+                    .await
                 }
                 _ => self.retry.send(track.to_owned()).map_err(Into::into),
             };
@@ -938,6 +1673,7 @@ impl Runtime {
             data: data.clone(),
             rpc: rpc.clone(),
             branches: branches.clone(),
+            global_pause: paused.clone(),
             recoveries: recoveries.clone(),
             stopping: stopping.clone(),
             journal: journal.clone(),
@@ -948,6 +1684,28 @@ impl Runtime {
         };
         let host_memory = service.host_memory.clone();
         let shutdown = stop.clone();
+        let two_ways_driver = crate::two_ways_driver::Driver::start(
+            service.clone(),
+            journal.clone(),
+            stopping.clone(),
+        );
+        let fresh_driver =
+            crate::fresh_driver::Driver::start(service.clone(), journal.clone(), stopping.clone());
+        let realign_driver = crate::realign_driver::Driver::start(
+            service.clone(),
+            journal.clone(),
+            stopping.clone(),
+        );
+        let retirement_driver = crate::path_retirement_driver::Driver::start(
+            service.clone(),
+            journal.clone(),
+            stopping.clone(),
+        );
+        let restore_driver = crate::path_restore_driver::Driver::start(
+            service.clone(),
+            journal.clone(),
+            stopping.clone(),
+        );
         let task = tokio::spawn(async move {
             let mut changes = journal.subscribe();
             let mut secret_changes = project_secrets.subscribe();
@@ -974,7 +1732,10 @@ impl Runtime {
                         let Some(track) = workspace["trackId"].as_str() else {
                             continue;
                         };
-                        if workspace["state"] != "ready" || started.contains(track) {
+                        if workspace["state"] != "ready"
+                            || workspace["writerClosed"] == true
+                            || started.contains(track)
+                        {
                             continue;
                         }
                         let previous = snapshot["workers"]
@@ -986,9 +1747,68 @@ impl Runtime {
                             .cloned()
                             .and_then(|value| serde_json::from_value::<WorkerState>(value).ok());
                         if previous.as_ref().is_some_and(WorkerState::released)
+                            && snapshot["freshTracks"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .any(|job| {
+                                    job["request"]["trackId"] == track
+                                        && job["phase"] != "cancelled"
+                                })
+                        {
+                            continue;
+                        }
+                        // A persisted Fresh boundary already owns source closure.
+                        // Do not relabel it as generic dirty startup or hold its
+                        // future words before the Fresh driver can release it.
+                        if let Some(fresh) = snapshot["freshTracks"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .find(|job| {
+                                job["request"]["trackId"] == track && job["phase"] != "cancelled"
+                            })
+                            && (fresh["phase"] != "waiting-for-turn"
+                                || previous.as_ref().is_some_and(|worker| {
+                                    worker.active_turn.is_none()
+                                        && !worker.checkpoint_pending
+                                        && worker.checkpoint.is_some()
+                                        && worker.approvals.is_empty()
+                                        && worker.prompts.is_empty()
+                                }))
+                        {
+                            continue;
+                        }
+                        let retiring = snapshot["pathRetirements"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .find(|entry| entry["track"] == track);
+                        if retiring.is_some_and(|entry| {
+                            entry["phase"] != "stopping"
+                                || previous.as_ref().is_none_or(WorkerState::released)
+                        }) {
+                            continue;
+                        }
+                        let realign_requested = snapshot["realignments"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|job| {
+                                job["request"]["trackId"] == track
+                                    && matches!(
+                                        job["phase"].as_str(),
+                                        Some(
+                                            "queued" | "waiting-for-worker" | "stopping-processes"
+                                        )
+                                    )
+                            });
+                        if previous.as_ref().is_some_and(WorkerState::released)
+                            && !realign_requested
                             && !snapshot["utterances"].as_array().into_iter().flatten().any(
                                 |word| {
                                     word["state"] == "placed"
+                                        && word["dispatchRunnable"] != false
                                         && word["decision"]["trackId"] == track
                                         && word["decision"]["boundary"] != "when-told"
                                         && (word["startCondition"].is_null()
@@ -1018,7 +1838,13 @@ impl Runtime {
                             started.insert(track.to_string());
                             continue;
                         }
-                        if paused.paused() {
+                        // Explicit file-only work may reopen a saved session while
+                        // turns remain paused. New sessions still need work admission.
+                        let reconnect_for_realign = realign_requested
+                            && previous
+                                .as_ref()
+                                .is_some_and(|state| state.session_id.is_some());
+                        if paused.paused() && !reconnect_for_realign {
                             continue;
                         }
                         started.insert(track.to_string());
@@ -1068,6 +1894,11 @@ impl Runtime {
             recoveries.shutdown();
             // The stop watch is shared by every host; await their bounded shutdown.
             while tasks.join_next().await.is_some() {}
+            two_ways_driver.shutdown().await;
+            fresh_driver.shutdown().await;
+            realign_driver.shutdown().await;
+            retirement_driver.shutdown().await;
+            restore_driver.shutdown().await;
             let _branches_closed = branches.lock().await;
         });
         Self {
@@ -1102,8 +1933,9 @@ pub(crate) async fn open_session(
     scanner: Option<&crate::secret_scan::Scanner>,
     expected: crate::reconcile::Expected,
 ) -> Result<Opened> {
+    let reservation = journal.session_start(track).await?;
     let reserved = if previous.is_none() {
-        journal.backup_resume(track).await?
+        reservation
     } else {
         None
     };
@@ -1120,10 +1952,10 @@ pub(crate) async fn open_session(
     let previous = previous.or_else(|| {
         reserved
             .as_ref()
-            .filter(|(_, opened)| *opened)
-            .map(|(resume, _)| resume.session_id.as_str())
+            .filter(|resume| resume.opened)
+            .map(|resume| resume.session_id.as_str())
     });
-    if let Some((resume, _)) = &reserved {
+    if let Some(resume) = &reserved {
         connection
             .client
             .set_redaction(journal.session_mask(track, &resume.session_id).await?);
@@ -1139,8 +1971,8 @@ pub(crate) async fn open_session(
     }
     let id = reserved
         .as_ref()
-        .filter(|(_, opened)| !*opened)
-        .map(|(r, _)| r.start_command.to_string())
+        .filter(|resume| !resume.opened)
+        .map(|resume| resume.start_command.to_string())
         .unwrap_or_else(|| Uuid::now_v7().to_string());
     let (method, params) = if let Some(session) = previous {
         (
@@ -1150,7 +1982,12 @@ pub(crate) async fn open_session(
     } else {
         ("session/start", {
             let mut params = json!({"commandId":id,"workspaceRoot":workspace,"approvalMode":"promptUnmatched","providerId":"meta","modelId":"muse-spark-1.3-contributor","recoveryMode":"on"});
-            if let Some((resume, _)) = &reserved {
+            #[cfg(test)]
+            if host::OFFLINE_ECHO.try_with(|_| ()).is_ok() {
+                params["providerId"] = json!("echo");
+                params.as_object_mut().unwrap().remove("modelId");
+            }
+            if let Some(resume) = &reserved {
                 params["sessionId"] = json!(resume.session_id);
             }
             params
@@ -1190,7 +2027,7 @@ pub(crate) async fn open_session(
     }
     if reserved
         .as_ref()
-        .is_some_and(|(resume, _)| resume.session_id != session)
+        .is_some_and(|resume| resume.session_id != session)
     {
         return Err("The new recovery session has a different identity.".into());
     }
@@ -1248,7 +2085,7 @@ pub(crate) async fn open_session(
         .await?;
     journal.finish(&id, "complete").await?;
     if reserved.is_some() {
-        journal.backup_resume_opened(track, &session).await?;
+        journal.session_start_opened(track, &session).await?;
     }
     Ok(Opened {
         id: session,
@@ -1644,8 +2481,12 @@ impl WorkerRunner {
         let error = "The worker is reconnecting. Wait for its current state.";
         match command {
             Command::Start { reply, .. }
+            | Command::RetryCheckpoint { reply, .. }
             | Command::StopInheritance { reply, .. }
             | Command::FinishInheritance { reply, .. }
+            | Command::Realign { reply, .. }
+            | Command::RestorePath { reply, .. }
+            | Command::StopRealignProcesses { reply, .. }
             | Command::Retry { reply, .. }
             | Command::Answer { reply, .. }
             | Command::Respond { reply, .. }
@@ -1832,7 +2673,15 @@ impl WorkerRunner {
         if !self.reserve_recovery_slot().await? {
             return Ok(());
         }
-        let guard = self.execution.port.start_guard();
+        // Reopening durable history must remain possible while work is held:
+        // the connected actor also handles file recovery and process controls.
+        // open_session below still receives the work guard separately, so a
+        // held request cannot be replayed by this host-memory admission.
+        let guard = if self.state.session_id.is_some() {
+            Some(crate::msp::StartGuard::Shutdown(self.stopping.clone()))
+        } else {
+            self.execution.port.start_guard()
+        };
         let Some(guard) = guard else {
             return Ok(());
         };
@@ -1932,7 +2781,7 @@ impl WorkerRunner {
             self.state.phase=if self.state.active_turn.is_some(){"working"}else if self.state.prompts.is_empty(){"ready"}else{"question"}.into();
             self.state.detail=None;
             self.journal.worker_state(self.state.clone()).await?;
-            self.execution.port.attach(host.connection.client.clone(),self.state.session_id.clone().unwrap());
+            self.execution.port.attach(host.connection.client.clone(),self.state.session_id.clone().unwrap(),self.state.active_turn);
             let began=std::time::Instant::now();let checkpoint=self.state.checkpoint.as_ref().map(|c|c.turn_id);
             let result=crate::execution::run(crate::execution::WorkerIo{connection:&mut host.connection,tracker:host.tracker.clone(),identity:host.identity,recovery:session.recovery,continuity:&mut self.continuity},&self.journal,&self.path,&mut self.state,&mut self.execution,&mut self.stopping).await;
             self.stable=began.elapsed()>=std::time::Duration::from_secs(20)||checkpoint!=self.state.checkpoint.as_ref().map(|c|c.turn_id);

@@ -14,9 +14,12 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, Request)> {
     let root = tempfile::tempdir()?;
     let journal = Journal::open(root.path().join("db"), Key::new([7; 32])).await?;
     let request = Request {
+        instructions: intercat_daemon::branch::InstructionMode::Checkpoint,
         op_id: Uuid::now_v7(),
         parent_track_id: Uuid::now_v7().to_string(),
-        turn_id: Uuid::now_v7(),
+        point: intercat_daemon::branch_start::Selection::Turn {
+            turn_id: Uuid::now_v7(),
+        },
     };
     let db = rusqlite::Connection::open(root.path().join("db"))?;
     db.execute(
@@ -24,6 +27,7 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, Request)> {
         [&request.parent_track_id],
     )?;
     let workspace = Workspace {
+        denied_roots: Vec::new(),
         attachment_roots: Vec::new(),
         track_id: request.parent_track_id.clone(),
         path: root.path().join("session/parent"),
@@ -39,7 +43,7 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, Request)> {
         &request.parent_track_id,
         "parent-session",
         &workspace,
-        request.turn_id,
+        turn(&request),
     )
     .await?;
     Ok((root, journal, request))
@@ -52,6 +56,27 @@ async fn a_checkpoint_keeps_its_original_session_after_file_recovery() -> Result
     db.execute("UPDATE workers SET record=json_set(record,'$.sessionId','replacement-session') WHERE track_id=?1",[&request.parent_track_id])?;
     let branch = journal.branch(Change::Prepare(request)).await?;
     assert_eq!(branch.parent_session_id, "parent-session");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_branch_keeps_the_recorded_origin_when_later_history_changes_the_source_time()
+-> Result<()> {
+    let (root, journal, request) = fixture().await?;
+    let db = rusqlite::Connection::open(root.path().join("db"))?;
+    let clip = json!({"turnId":turn(&request),"sessionId":"parent-session","repairRunId":null,"start":{"bootId":"dummy"},"end":{"bootId":"dummy","epochMs":1000,"timelineMs":100},"recovered":false});
+    db.execute(
+        "INSERT INTO timeline_clips VALUES('origin',?1,1,?2)",
+        rusqlite::params![request.parent_track_id, clip.to_string()],
+    )?;
+    let branch = journal.branch(Change::Prepare(request.clone())).await?;
+    assert_eq!(branch.origin.ended_at, Some(1000));
+    assert_eq!(branch.origin.timeline_at, Some(100));
+    assert_eq!(branch.origin.turn_number, 1);
+    db.execute("UPDATE timeline_clips SET record=json_set(record,'$.end.epochMs',2000,'$.end.timelineMs',200) WHERE id='origin'", [])?;
+    let replay = journal.branch(Change::Prepare(request)).await?;
+    assert_eq!(replay.origin.ended_at, branch.origin.ended_at);
+    assert_eq!(replay.origin.timeline_at, branch.origin.timeline_at);
     Ok(())
 }
 
@@ -80,6 +105,10 @@ async fn a_branch_copies_the_saved_basis_even_after_the_parent_basis_changes() -
     assert_eq!(child.base, saved.base_at);
     assert_eq!(child.base_inherits, saved.base_inherits_at);
     assert_eq!(child.inherits[&request.parent_track_id], saved.inherited());
+    assert_eq!(
+        child.parents,
+        std::collections::BTreeMap::from([(request.parent_track_id.clone(), saved.inherited())])
+    );
     assert_ne!(child.base, later.base);
     Ok(())
 }
@@ -253,9 +282,10 @@ async fn grandchildren_inherit_but_a_fresh_session_does_not() -> Result<()> {
     let grandchild = finish(
         &journal,
         Request {
+            instructions: intercat_daemon::branch::InstructionMode::Checkpoint,
             op_id: Uuid::now_v7(),
             parent_track_id: child.track_id.clone(),
-            turn_id: turn,
+            point: intercat_daemon::branch_start::Selection::Turn { turn_id: turn },
         },
     )
     .await?;
@@ -288,7 +318,9 @@ async fn grandchildren_inherit_but_a_fresh_session_does_not() -> Result<()> {
 async fn wrong_boundaries_and_reused_operations_never_create_another_track() -> Result<()> {
     let (_root, journal, request) = fixture().await?;
     let mut wrong = request.clone();
-    wrong.turn_id = Uuid::now_v7();
+    wrong.point = intercat_daemon::branch_start::Selection::Turn {
+        turn_id: Uuid::now_v7(),
+    };
     assert!(journal.branch(Change::Prepare(wrong)).await.is_err());
     let first = journal.branch(Change::Prepare(request.clone())).await?;
     let mut wrong = request.clone();
@@ -363,4 +395,11 @@ async fn pending_empty_fingerprint_children_still_own_their_sessions() -> Result
         2
     );
     Ok(())
+}
+
+fn turn(request: &Request) -> Uuid {
+    let intercat_daemon::branch_start::Selection::Turn { turn_id } = request.point else {
+        panic!("Expected a completed turn")
+    };
+    turn_id
 }

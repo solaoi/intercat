@@ -233,7 +233,6 @@
 .review-conflict details { margin-top: 12px; }
 
 .worker-model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 400; }
-.worker-controls > .worker-model { color: #a6b0c2; font-size: 10px; margin-right: 0; }
 .model-status { display: flex; flex: none; justify-content: flex-end; min-height: 18px; margin-top: 8px; color: #c9cbd1; font-size: 11px; line-height: 18px; }
 .step-metadata > .worker-model { margin-left: auto; }
 
@@ -427,6 +426,12 @@
 .inheritance-recovery p { margin: 0; line-height: 1.5; overflow-wrap: anywhere; }
 .inheritance-actions { position: sticky; bottom: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; padding-block: 8px; background: #0e1013; }
 .inheritance-actions button { padding: 6px 10px; border: 1px solid #53515b; border-radius: 5px; background: #292932; color: #e2dfe9; }
+.checkpoint-recovery strong { overflow-wrap: anywhere; }
+.checkpoint-recovery .inheritance-actions { position: static; }
+@media (max-height: 550px) {
+  .app:where(:not(.stage-mode)):has(.attention-card:not([hidden]) .checkpoint-recovery) .session-header,
+  .app:where(:not(.stage-mode)):has(.attention-card:not([hidden]) .checkpoint-recovery) .session-subtitle { display: none; }
+}
 .inheritance-paths { margin: 0; padding-left: 20px; max-height: 100px; overflow: auto; overflow-wrap: anywhere; }
 .session-subtitle{overflow-x:auto;flex-shrink:0}.session-subtitle .folder-chip{flex:none;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .review-conflict { display: block; min-width: 0; overflow-wrap: anywhere; }
@@ -435,3 +440,30 @@
 .review-conflict > .quiet { display: block; margin-top: 8px; }
 .review-fix-actions { flex-wrap: wrap; }
 .review-fix-actions button { white-space: nowrap; }
+
+.checks-setting { display: grid; gap: .6rem; padding-block: 1rem; border-top: 1px solid #283346; }
+.checks-setting h3, .checks-setting p { margin: 0; }
+.checks-setting input:not([type="checkbox"]), .checks-setting select { min-width: 0; width: 100%; box-sizing: border-box; }
+.checks-setting .check-history { display: flex; gap: .55rem; align-items: flex-start; }
+.checks-setting-actions { display: flex; justify-content: flex-end; margin-top: .4rem; }
+.run-processes { display: grid; gap: 8px; }
+.run-processes p { margin: 0; }
+.run-process-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.run-process-actions button { padding: 6px 10px; border-radius: 4px; background: #283346; }
+
+.track-name .track-integration-failure{color:#d5b47d}
+
+.realignment{display:grid;gap:8px}.realignment p{margin:0;overflow-wrap:anywhere}.realignment-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;margin-top:6px}.realignment-actions button{padding:6px 10px;border-radius:4px;background:#283346}.realign-request{display:inline-flex;flex-direction:column;align-items:flex-end;gap:6px}.realign-request [role=alert]{max-width:300px;color:#e7b5a5;font-size:12px}
+@media(max-height:620px){.realignment{gap:4px;font-size:12px;line-height:1.35}.realignment-actions{gap:8px;margin-top:0}.realignment-actions button{min-height:28px;padding:4px 8px}}
+
+.project-selection-path { overflow-wrap: anywhere; }
+.project-selection ul { padding-left: 18px; margin: 4px 0; max-height: 48px; overflow: auto; }
+.project-selection-roots { margin-top: 6px; font-size: 11px; }
+@media(max-height:620px) { .project-selection ul { max-height: 24px; } .project-selection { padding: 8px 10px; gap: 6px; } }
+
+@media(max-height:620px) {
+  .app:where(:not(.stage-mode)):has(.project-selection) .session-header,
+  .app:where(:not(.stage-mode)):has(.project-selection) .session-subtitle,
+  .app:where(:not(.stage-mode)):has(.project-selection) .desk-heading { display: none; }
+}
+.commit-menu{display:flex;align-items:center;flex:none;position:relative;-webkit-app-region:no-drag}.commit-menu>details>summary{cursor:pointer;padding:7px 9px;list-style:none}.commit-menu>details>div{position:absolute;right:0;top:100%;z-index:50;min-width:170px;max-width:70vw;max-height:50vh;overflow:auto;display:flex;flex-direction:column;padding:5px;background:#1d222c;border:1px solid #3a4353;border-radius:5px;box-shadow:0 6px 20px #0006}.commit-menu>details button{padding:8px 10px;text-align:left;overflow-wrap:anywhere}

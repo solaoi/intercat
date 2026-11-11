@@ -33,10 +33,10 @@ pub(crate) fn save(db: &Connection, run: &Run) -> Result<()> {
     if run.phase == Phase::Discarded
         && let crate::repair_run::Purpose::Assumption { id, .. } = run.purpose
     {
-        crate::integration_assumptions::finish_change(db, run.job_id, id, false)?;
+        crate::integration_assumptions::finish_change(db, run.owner.id(), id, false)?;
     }
     db.execute("INSERT INTO repair_runs VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET active=excluded.active,record=excluded.record",
-        params![run.id.to_string(), run.job_id.to_string(), run.phase != Phase::Discarded && (run.phase != Phase::Done || run.refresh.as_ref().is_some_and(|r| r.error.is_none())), serde_json::to_string(run)?])?;
+        params![run.id.to_string(), run.owner.id().to_string(), run.phase != Phase::Discarded && (run.phase != Phase::Done || run.refresh.as_ref().is_some_and(|r| r.error.is_none())), serde_json::to_string(run)?])?;
     Ok(())
 }
 
@@ -90,7 +90,8 @@ fn operation(db: &Connection, op: Uuid, kind: &str, request: Value, run: &Run) -
 }
 
 fn current(db: &Connection, run: &Run) -> Result<integration::Job> {
-    let job = integration_store::read(db, run.job_id)?;
+    let (id, revision) = run.owner.commit()?;
+    let job = integration_store::read(db, id)?;
     let valid_status = if run.phase == Phase::Applying {
         job.status == integration::Status::Staging
     } else {
@@ -99,7 +100,7 @@ fn current(db: &Connection, run: &Run) -> Result<integration::Job> {
             integration::Status::Failed | integration::Status::Checked
         )
     };
-    if job.revision != run.job_revision || !valid_status {
+    if job.revision != revision || !valid_status {
         return Err(crate::repair_run::Rejected(
             "The integration changed while its repair Run was active.",
         )
@@ -107,15 +108,132 @@ fn current(db: &Connection, run: &Run) -> Result<integration::Job> {
     }
     Ok(job)
 }
+pub(crate) fn source(db: &Connection, id: Uuid) -> Result<(Run, crate::run_input::Source)> {
+    let run = read(db, id)?;
+    let source = match run.owner {
+        crate::repair_run::Owner::Commit { .. } => {
+            let job = current(db, &run)?;
+            let settings = integration_store::settings(db, job.id, job.revision)?
+                .ok_or("Missing Run settings.")?;
+            crate::run_input::Source::Commit {
+                job: Box::new(job),
+                settings: Box::new(settings),
+            }
+        }
+        crate::repair_run::Owner::Realign { .. } => crate::run_input::Source::Realign(Box::new(
+            crate::realign_merge_store::for_run(db, &run)?,
+        )),
+        crate::repair_run::Owner::Undo { .. } => {
+            crate::run_input::Source::Undo(Box::new(crate::undo_merge_store::for_run(db, &run)?))
+        }
+        crate::repair_run::Owner::Shared { .. } => crate::run_input::Source::Shared(Box::new(
+            crate::shared_merge_store::for_run(db, &run)?,
+        )),
+        crate::repair_run::Owner::Restore { .. } => crate::run_input::Source::Restore(Box::new(
+            crate::restore_merge_store::for_run(db, &run)?,
+        )),
+    };
+    Ok((run, source))
+}
 
 pub(crate) fn start(db: &mut Connection, request: Request) -> Result<Run> {
+    start_in(db, request, false)
+}
+pub(crate) fn start_manual(db: &mut Connection, request: Request) -> Result<Run> {
+    if !matches!(request.purpose, crate::repair_run::Purpose::Merge) {
+        return Err("Only an integration conflict can open this editor.".into());
+    }
+    start_in(db, request, true)
+}
+fn start_in(db: &mut Connection, request: Request, manual: bool) -> Result<Run> {
     let tx = db.transaction()?;
     let value = serde_json::to_value(&request)?;
-    if let Some(run) = replay(&tx, request.op_id, "repair.start", &value)? {
+    let kind = if manual {
+        "merge.start"
+    } else {
+        "repair.start"
+    };
+    if let Some(run) = replay(&tx, request.op_id, kind, &value)? {
         return Ok(run);
     }
-    let mut job = integration_store::read(&tx, request.job_id)?;
+    if let crate::repair_run::Owner::Restore { id, .. } = request.owner {
+        if active(&tx, id)? {
+            return Err("This Restore already has an active merge Run.".into());
+        }
+        let run = Run::new(request.clone(), request.owner, manual);
+        let input = crate::restore_merge_store::validate_start(&tx, &run)?;
+        let trigger = input.automatic_operation();
+        if request.op_id.get_version_num() != 7 && request.op_id != trigger {
+            return Err("Invalid Restore merge request ID.".into());
+        }
+        operation(&tx, request.op_id, kind, value, &run)?;
+        if trigger != request.op_id {
+            tx.execute("INSERT INTO operations VALUES(?1,'merge.trigger',?2,'complete') ON CONFLICT(id) DO NOTHING",params![trigger.to_string(),json!({"run":run.id,"restore":id,"input":input.id}).to_string()])?;
+        }
+        tx.commit()?;
+        return Ok(run);
+    }
+    if let crate::repair_run::Owner::Shared { id, .. } = request.owner {
+        if active(&tx, id)? {
+            return Err("This shared conflict already has an active merge Run.".into());
+        }
+        let run = Run::new(request.clone(), request.owner, manual);
+        let input = crate::shared_merge_store::validate_start(&tx, &run)?;
+        let trigger = input.automatic_operation();
+        if request.op_id.get_version_num() != 7 && request.op_id != trigger {
+            return Err("Invalid shared merge request ID.".into());
+        }
+        operation(&tx, request.op_id, kind, value, &run)?;
+        if trigger != request.op_id {
+            tx.execute("INSERT INTO operations VALUES(?1,'merge.trigger',?2,'complete') ON CONFLICT(id) DO NOTHING",params![trigger.to_string(),json!({"run":run.id,"shared":id,"input":input.id}).to_string()])?;
+        }
+        tx.commit()?;
+        return Ok(run);
+    }
+    if let crate::repair_run::Owner::Undo { id, .. } = request.owner {
+        if active(&tx, id)? {
+            return Err("This undo already has an active merge Run.".into());
+        }
+        let run = Run::new(request.clone(), request.owner, manual);
+        let input = crate::undo_merge_store::for_run(&tx, &run)?;
+        let trigger = input.automatic_operation();
+        if request.op_id.get_version_num() != 7 && request.op_id != trigger {
+            return Err("Invalid undo merge request ID.".into());
+        }
+        operation(&tx, request.op_id, kind, value, &run)?;
+        if trigger != request.op_id {
+            tx.execute("INSERT INTO operations VALUES(?1,'merge.trigger',?2,'complete') ON CONFLICT(id) DO NOTHING",params![trigger.to_string(),json!({"run":run.id,"undo":id,"input":input.id}).to_string()])?;
+        }
+        tx.commit()?;
+        return Ok(run);
+    }
+    if let crate::repair_run::Owner::Realign { id, .. } = request.owner {
+        if active(&tx, id)? {
+            return Err(
+                "This realignment already has a merge Run or the request ID is invalid.".into(),
+            );
+        }
+        let run = Run::new(request.clone(), request.owner, manual);
+        let input = crate::realign_merge_store::for_run(&tx, &run)?;
+        let trigger = input.automatic_operation();
+        if request.op_id.get_version_num() != 7 && request.op_id != trigger {
+            return Err("Invalid realignment merge request ID.".into());
+        }
+        operation(&tx, request.op_id, kind, value, &run)?;
+        if trigger != request.op_id {
+            tx.execute("INSERT INTO operations VALUES(?1,'merge.trigger',?2,'complete') ON CONFLICT(id) DO NOTHING",params![trigger.to_string(),json!({"run":run.id,"realignment":id,"input":input.id}).to_string()])?;
+        }
+        tx.commit()?;
+        return Ok(run);
+    }
+    let (request_job, request_revision) = request.owner.commit()?;
+    let mut job = integration_store::read(&tx, request_job)?;
     Run::validate_request(&job, &request)?;
+    let trigger = if matches!(request.purpose, crate::repair_run::Purpose::Merge) {
+        crate::merge_resolution::automatic_request(&job)?.map(|request| request.op_id)
+    } else {
+        None
+    };
     if active(&tx, job.id)? {
         return Err(crate::repair_run::Rejected("This candidate already has a repair Run.").into());
     }
@@ -132,40 +250,22 @@ pub(crate) fn start(db: &mut Connection, request: Request) -> Result<Run> {
         .checked_add(1)
         .ok_or("Integration revision overflow.")?;
     job.candidate.as_mut().unwrap().revision = job.revision;
-    integration_store::copy_settings(&tx, job.id, request.revision, job.revision, None)?;
+    integration_store::copy_settings(&tx, job.id, request_revision, job.revision, None)?;
     integration_store::save(&tx, &job)?;
-    let run = Run {
-        id: Uuid::new_v5(&request.op_id, b"repair"),
-        revision: 1,
-        job_id: job.id,
-        job_revision: job.revision,
-        track: request.track,
-        selection: match &request.purpose {
-            crate::repair_run::Purpose::Edit { selection, .. } => Some(selection.clone()),
-            _ => None,
+    let run = Run::new(
+        request.clone(),
+        crate::repair_run::Owner::Commit {
+            id: job.id,
+            revision: job.revision,
         },
-        purpose: request.purpose,
-        phase: Phase::Queued,
-        created_at: crate::journal::timestamp(),
-        host: None,
-        host_nonce: None,
-        secret_revision: None,
-        secret_input: None,
-        checkpoint: None,
-        session: None,
-        session_ready: false,
-        workspace_ready: false,
-        start_command: None,
-        turn: None,
-        failure: None,
-        approvals: vec![],
-        prompts: vec![],
-        output: None,
-        instruction: None,
-        refresh: None,
-        restoring: None,
-    };
-    operation(&tx, request.op_id, "repair.start", value, &run)?;
+        manual,
+    );
+    operation(&tx, request.op_id, kind, value, &run)?;
+    if let Some(trigger) = trigger
+        && trigger != request.op_id
+    {
+        tx.execute("INSERT INTO operations VALUES(?1,'merge.trigger',?2,'complete') ON CONFLICT(id) DO NOTHING",params![trigger.to_string(),json!({"run":run.id,"job":job.id}).to_string()])?;
+    }
     tx.commit()?;
     Ok(run)
 }
@@ -177,7 +277,7 @@ pub(crate) fn control(db: &mut Connection, command: Command) -> Result<Run> {
         return Ok(run);
     }
     let mut run = read(&tx, command.id)?;
-    current(&tx, &run)?;
+    source(&tx, run.id)?;
     if run.revision != command.revision {
         return Err("The repair Run changed. Review it again.".into());
     }
@@ -208,7 +308,12 @@ pub(crate) fn begin_refresh(
     }
     let job = integration_store::read(&tx, request.job_id)?;
     let mut run = read(&tx, request.repair_id)?;
-    if job.revision != request.revision || run.job_id != job.id || run.job_revision != job.revision
+    if job.revision != request.revision
+        || run.owner
+            != (crate::repair_run::Owner::Commit {
+                id: job.id,
+                revision: job.revision,
+            })
     {
         return Err(Rejected("The review changed. Confirm Refresh again.").into());
     }
@@ -216,9 +321,10 @@ pub(crate) fn begin_refresh(
         job.status,
         integration::Status::Failed | integration::Status::Checked
     ) || run.restoring.is_some()
+        || run.external_editor
         || matches!(
             run.phase,
-            Phase::Applying | Phase::NeedsRecovery | Phase::Discarded
+            Phase::Manual | Phase::Applying | Phase::NeedsRecovery | Phase::Discarded
         )
         || run
             .refresh
@@ -430,14 +536,20 @@ pub(crate) fn followup_in(
     }
     crate::repair_run::validate_instruction(&request.text)?;
     let mut run = read(tx, request.id)?;
+    if run.remaining.is_some() {
+        return Err(
+            "Stop this Run's remaining processes before sending another instruction.".into(),
+        );
+    }
     if crate::secret_input_store::repair_pending(tx, run.id)? {
         return Err(
             "A secret is being prepared. Stop the repair before sending another instruction."
                 .into(),
         );
     }
-    let job = current(tx, &run)?;
+    source(tx, run.id)?;
     if let Some(selection) = &request.selection {
+        let job = current(tx, &run)?;
         Run::validate_selection(&job, &run.track, selection)?;
     }
     if run.revision != request.revision {
@@ -488,7 +600,7 @@ pub(crate) fn transition(
         return Ok(run);
     }
     let mut run = read(&tx, id)?;
-    current(&tx, &run)?;
+    source(&tx, run.id)?;
     if run.revision != revision {
         return Err("The repair transition was superseded.".into());
     }
@@ -497,6 +609,11 @@ pub(crate) fn transition(
         if let Some(id) = run.secret_input {
             crate::secret_input_store::validate_repair_start(&tx, id, &run)?;
         }
+    }
+    if matches!(event, Event::BeginManual | Event::CaptureManual { .. })
+        && crate::secret_input_store::repair_pending(&tx, run.id)?
+    {
+        return Err("A secret is being prepared. Wait before editing this merge.".into());
     }
     run.transition(&event)?;
     run.revision = run
@@ -533,7 +650,7 @@ pub(crate) fn begin_restore(
         return Ok(run);
     }
     let mut run = read(&tx, id)?;
-    current(&tx, &run)?;
+    source(&tx, run.id)?;
     if crate::secret_input_store::repair_pending(&tx, run.id)? {
         return Err("A secret is being prepared. Stop the repair before restoring files.".into());
     }
@@ -542,6 +659,7 @@ pub(crate) fn begin_restore(
         return Err(Rejected("These saved files belong to another worker or repair.").into());
     }
     if !matches!(run.phase, Phase::Held | Phase::Failed)
+        || run.external_editor
         || run.host.is_some()
         || !run.workspace_ready
         || run.restoring.is_some()
@@ -650,10 +768,6 @@ pub(crate) fn applied(
         return Err("The repair result was superseded.".into());
     }
     if let Ok(candidate) = &result {
-        let plan = candidate
-            .repair
-            .as_ref()
-            .ok_or("Missing repair attribution.")?;
         let settings = integration_store::settings(&tx, job.id, job.revision)?
             .ok_or("Missing repair settings.")?;
         let mut input = job.clone();
@@ -666,15 +780,29 @@ pub(crate) fn applied(
         } else {
             integration::Status::Failed
         };
-        plan.validate(&input, &settings)?;
-        if plan.requested_track != run.track || candidate.generation != job.revision {
+        let owner_matches = if matches!(run.purpose, crate::repair_run::Purpose::Merge) {
+            let plan = candidate
+                .resolution
+                .as_ref()
+                .ok_or("Missing saved merge resolution.")?;
+            plan.validate(&input, &settings)?;
+            plan.basis.track == run.track && plan.basis.marker == run.id
+        } else {
+            let plan = candidate
+                .repair
+                .as_ref()
+                .ok_or("Missing repair attribution.")?;
+            plan.validate(&input, &settings)?;
+            plan.requested_track == run.track
+        };
+        if !owner_matches || candidate.build_revision != job.revision {
             return Err("The rebuilt candidate belongs to another repair.".into());
         }
     }
     let failed = result.is_err();
-    integration_store::apply_candidate(&tx, &mut job, run.job_revision, result)?;
+    integration_store::apply_candidate(&tx, &mut job, run.owner.revision(), result)?;
     if !failed && let crate::repair_run::Purpose::Assumption { id, .. } = run.purpose {
-        crate::integration_assumptions::finish_change(&tx, run.job_id, id, true)?;
+        crate::integration_assumptions::finish_change(&tx, run.owner.id(), id, true)?;
     }
     run.phase = if failed { Phase::Failed } else { Phase::Done };
     run.failure = failed.then_some(crate::repair_run::Failure::Capture);
@@ -690,7 +818,7 @@ pub(crate) fn applied(
 
 pub(crate) fn snapshot(db: &Connection) -> Result<Value> {
     let mut statement =
-        db.prepare("SELECT record FROM repair_runs WHERE active=1 OR (json_extract(record,'$.refresh.operation') IS NOT NULL AND json_extract(record,'$.refresh.error') IS NULL) OR rowid IN (SELECT rowid FROM repair_runs WHERE active=0 ORDER BY rowid DESC LIMIT 100) ORDER BY rowid DESC")?;
+        db.prepare("SELECT record FROM repair_runs WHERE active=1 OR json_type(record,'$.remaining')='object' OR (json_extract(record,'$.refresh.operation') IS NOT NULL AND json_extract(record,'$.refresh.error') IS NULL) OR rowid IN (SELECT rowid FROM repair_runs WHERE active=0 ORDER BY rowid DESC LIMIT 100) ORDER BY rowid DESC")?;
     let values = statement
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;

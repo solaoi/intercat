@@ -53,7 +53,12 @@ impl Basis {
             return Err("The failed candidate changed. Review it again.".into());
         }
         let plan = job.plan.as_ref().ok_or("No frozen integration plan.")?;
-        let mut parent = plan.target_head.clone();
+        let target = candidate
+            .undo
+            .as_ref()
+            .map(|undo| undo.sha.clone())
+            .unwrap_or_else(|| plan.target_head.clone());
+        let mut parent = target.clone();
         let mut tracks = HashSet::new();
         let mut position = None;
         let mut commits = Vec::new();
@@ -93,7 +98,7 @@ impl Basis {
         Ok(Self {
             job_id: job.id,
             revision: job.revision,
-            target: plan.target_head.clone(),
+            target,
             head: tip.sha.clone(),
             tree: tip.tree.clone(),
             settings_hash: candidate.settings_hash.clone(),
@@ -177,6 +182,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn snapshot_workspace(&self, run: Uuid) -> crate::preparation::Workspace {
         crate::preparation::Workspace {
+            denied_roots: self.checkout.configuration.denied_roots.clone(),
             attachment_roots: self.checkout.attachment_roots.clone(),
             track_id: self.owner.clone(),
             path: self.checkout.workdir.clone(),
@@ -218,7 +224,7 @@ impl Workspace {
         let checkout = Checkout::resume(
             root,
             source,
-            settings.checkout.clone(),
+            original.child_configuration()?,
             OsString::from(&settings.path),
             settings.toolchain.clone(),
         )
@@ -262,7 +268,7 @@ impl Workspace {
             root,
             source,
             basis.head.parse()?,
-            settings.checkout.clone(),
+            candidate.child_configuration()?,
             OsString::from(&settings.path),
             settings.toolchain.clone(),
             cancel.clone(),
@@ -277,7 +283,8 @@ impl Workspace {
         })
     }
 
-    /// The editing host and all its children must have stopped before capture.
+    /// The model turn must have ended before capture. Remaining processes keep
+    /// this old workspace; the rebuilt candidate and Check use separate paths.
     /// This returns object IDs in this workspace, never imports into the project.
     pub async fn finish(
         &self,
@@ -417,7 +424,7 @@ fn attribute(
                     trees.push(tree);
                     current = tree;
                 }
-                Merge::Conflicts(_) => break,
+                Merge::Conflicts { .. } => break,
             }
         }
         if trees.len() == original.len() && current == repaired {

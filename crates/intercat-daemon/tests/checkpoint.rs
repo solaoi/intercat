@@ -40,11 +40,9 @@ async fn fixture(root: &Path) -> Result<Workspace> {
     let base = git(&source, &["rev-parse", "HEAD"]);
     let path = root.join("worker");
     let src = worktree::inspect(&source).await?;
-    worktree::GitTool::system()
-        .await?
-        .prepare_detached(&src, &path)
-        .await?;
+    worktree::prepare_detached(&src, &path).await?;
     Ok(Workspace {
+        denied_roots: Vec::new(),
         attachment_roots: Vec::new(),
         track_id: "track".into(),
         path,
@@ -144,6 +142,95 @@ async fn snapshots_real_index_without_changing_either_checkout_and_chains_turns(
     assert!(second.live_processes);
     Ok(())
 }
+
+#[tokio::test]
+async fn lfs_checkpoint_clean_cannot_read_old_objects_and_publishes_verified_payloads() -> Result<()>
+{
+    use intercat_git::Repository;
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let workspace = fixture(&root).await?;
+    let source = root.join("source");
+    let storage = root.join("lfs-store");
+    fs::create_dir_all(storage.join("objects/old"))?;
+    let past = storage.join("objects/old/history");
+    fs::write(&past, b"dummy historical payload")?;
+    let old_blob = git(&source, &["rev-parse", "HEAD:keep"]);
+    let tool = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.tools/git-lfs-3.8.1/git-lfs")
+        .canonicalize()?;
+    let wrapper = workspace.path.join("dummy-lfs-filter.sh");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif /usr/bin/env -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES /usr/bin/git --git-dir='{}' cat-file -e '{old_blob}' 2>/dev/null; then exit 42; fi\nif /bin/cat '{}' >/dev/null 2>&1; then exit 43; fi\nexec '{}' \"$@\"\n",
+            source.join(".git").display(),
+            past.display(),
+            tool.display(),
+        ),
+    )?;
+    fs::write(
+        source.join(".git/info/attributes"),
+        "*.lfs filter=lfs -text\n",
+    )?;
+    git(
+        &source,
+        &["config", "lfs.storage", storage.to_str().unwrap()],
+    );
+    git(
+        &source,
+        &[
+            "config",
+            "filter.lfs.process",
+            &format!("/bin/sh '{}' filter-process", wrapper.display()),
+        ],
+    );
+    git(&source, &["config", "filter.lfs.required", "true"]);
+    let index_path = git(&workspace.path, &["rev-parse", "--git-path", "index"]);
+    let index = fs::read(&index_path)?;
+    let source_index = fs::read(source.join(".git/index"))?;
+    let journal = registered_journal(root.join("events.sqlite"), &workspace).await?;
+    let bytes = b"agent-created LFS checkpoint text\n";
+    fs::write(workspace.path.join("asset.lfs"), bytes)?;
+    let saved = checkpoint::save(
+        workspace.clone(),
+        uuid::Uuid::now_v7(),
+        None,
+        false,
+        journal.clone(),
+    )
+    .await?;
+    let repo = Repository::open(&workspace.path)?;
+    let pointers = repo.lfs_entries(repo.tree_id(saved.sha.parse()?)?)?;
+    assert_eq!(pointers.len(), 1);
+    assert_eq!(pointers[0].path, "asset.lfs");
+    let expected = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(pointers[0].pointer.oid(), expected);
+    let payload = storage
+        .join("objects")
+        .join(&expected[..2])
+        .join(&expected[2..4])
+        .join(&expected);
+    assert_eq!(fs::read(&payload)?, bytes);
+    assert_eq!(fs::read(&index_path)?, index);
+    assert_eq!(fs::read(source.join(".git/index"))?, source_index);
+    assert_eq!(git(&source, &["rev-parse", "HEAD"]), workspace.base);
+    assert_eq!(fs::read(past)?, b"dummy historical payload");
+    // A replay must still refuse a now-missing referenced payload rather than
+    // declare an incomplete checkpoint successfully published.
+    fs::remove_file(payload)?;
+    let error = checkpoint::save(workspace, saved.turn_id, None, false, journal)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.downcast_ref(), Some(intercat_daemon::lfs_store::Problem::Missing { path }) if path == "asset.lfs")
+    );
+    Ok(())
+}
 #[tokio::test]
 async fn filter_can_transform_content_but_cannot_read_original_objects() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -178,7 +265,10 @@ async fn filter_can_transform_content_but_cannot_read_original_objects() -> Resu
             &format!(
                 "/usr/bin/env GIT_OBJECT_DIRECTORY={} {} --git-dir={} cat-file -p {}",
                 root.join("source/.git/objects").display(),
-                worktree::GitTool::system().await?.binary().display(),
+                intercat_daemon::git_tool::GitTool::system()
+                    .await?
+                    .binary()
+                    .display(),
                 root.join("source/.git").display(),
                 git(path, &["rev-parse", "HEAD:keep"])
             ),
@@ -308,7 +398,8 @@ async fn interrupted_checkpoint_reuses_its_saved_tree_despite_later_file_changes
         let journal = registered_journal(root.join("events.sqlite"), &workspace).await?;
         let turn = Uuid::now_v7();
         fs::write(workspace.path.join("keep"), "frozen snapshot\n")?;
-        let captured = checkpoint::capture(&workspace, &workspace.base, "frozen\n").await?;
+        let captured =
+            checkpoint::capture(&workspace, &workspace.base, "frozen\n", &journal).await?;
         let saved = checkpoint::Checkpoint {
             turn_id: turn,
             sha: captured.sha,
@@ -318,7 +409,7 @@ async fn interrupted_checkpoint_reuses_its_saved_tree_despite_later_file_changes
         };
         let latest = format!("{}-checkpoint", workspace.reference);
         let id = Uuid::new_v5(&turn, b"checkpoint");
-        journal.intent(&id.to_string(),"checkpoint.save",json!({"trackId":workspace.track_id,"checkpoint":saved,"latestRef":latest,"expected":null})).await?;
+        journal.intent(&id.to_string(),"checkpoint.save",json!({"trackId":workspace.track_id,"checkpoint":saved,"latestRef":latest,"expected":null,"lfsDirectory":captured.lfs_directory})).await?;
         let repo = Repository::open(&workspace.path)?;
         if written_refs >= 1 {
             repo.compare_and_swap(&saved.reference, None, saved.sha.parse()?)?;
@@ -555,6 +646,134 @@ async fn unregistered_attachment_names_remain_user_files() -> Result<()> {
     let files = intercat_git::Repository::open(&workspace.path)?.saved_files(saved.sha.parse()?)?;
     assert!(files.contains_key(".intercat/attachments/user.txt"));
     assert!(!files.contains_key(".intercat-attachments-2/copy.txt"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_snapshots_keep_missing_exclusions_and_capture_materialized_changes() -> Result<()> {
+    for mode in ["cone", "non-cone", "sparse-index", "split-index"] {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let mut workspace = fixture(&root).await?;
+        let path = &workspace.path;
+        for name in [
+            "inside/changed",
+            "inside/deleted",
+            "inside/manual",
+            "outside/changed",
+            "outside/missing",
+        ] {
+            let file = path.join(name);
+            fs::create_dir_all(file.parent().unwrap())?;
+            fs::write(file, "before\n")?;
+        }
+        git(path, &["add", "-A"]);
+        git(
+            path,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "sparse baseline",
+            ],
+        );
+        workspace.base = git(path, &["rev-parse", "HEAD"]);
+        if mode == "non-cone" {
+            git(path, &["sparse-checkout", "init", "--no-cone"]);
+            git(
+                path,
+                &["sparse-checkout", "set", "--no-cone", "/*", "!/outside/"],
+            );
+        } else {
+            git(
+                path,
+                &[
+                    "sparse-checkout",
+                    "init",
+                    "--cone",
+                    if mode == "sparse-index" {
+                        "--sparse-index"
+                    } else {
+                        "--no-sparse-index"
+                    },
+                ],
+            );
+            git(path, &["sparse-checkout", "set", "inside"]);
+        }
+        if mode == "split-index" {
+            git(path, &["config", "core.splitIndex", "true"]);
+            git(path, &["update-index", "--split-index"]);
+        }
+        intercat_daemon::source_snapshot::clean_project(path).await?;
+        assert!(!path.join("outside/missing").exists(), "{mode}");
+        fs::create_dir_all(path.join("outside"))?;
+        fs::write(path.join("outside/changed"), "after outside\n")?;
+        git(
+            path,
+            &["update-index", "--assume-unchanged", "inside/changed"],
+        );
+        fs::write(path.join("inside/changed"), "after inside\n")?;
+        git(path, &["update-index", "--skip-worktree", "inside/manual"]);
+        fs::remove_file(path.join("inside/manual"))?;
+        fs::remove_file(path.join("inside/deleted"))?;
+        let index_path = path.join(git(path, &["rev-parse", "--git-path", "index"]));
+        let before_index = fs::read(&index_path)?;
+        let shared = || -> Result<Vec<std::path::PathBuf>> {
+            let mut paths = fs::read_dir(index_path.parent().unwrap())?
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("sharedindex.")
+                })
+                .collect::<Vec<_>>();
+            paths.sort();
+            Ok(paths)
+        };
+        let before_shared = shared()?;
+        let journal = registered_journal(root.join("events.sqlite"), &workspace).await?;
+        let saved = checkpoint::save(
+            workspace.clone(),
+            uuid::Uuid::now_v7(),
+            None,
+            false,
+            journal,
+        )
+        .await?;
+        for (name, expected) in [
+            ("inside/changed", "after inside"),
+            ("outside/changed", "after outside"),
+            ("outside/missing", "before"),
+        ] {
+            assert_eq!(
+                git(path, &["show", &format!("{}:{name}", saved.sha)]),
+                expected,
+                "{mode}: {name}"
+            );
+        }
+        let names = git(path, &["ls-tree", "-r", "--name-only", &saved.sha]);
+        for removed in ["inside/deleted", "inside/manual"] {
+            assert!(
+                !names.lines().any(|name| name == removed),
+                "{mode}: {removed}"
+            );
+        }
+        assert_eq!(
+            fs::read(&index_path)?,
+            before_index,
+            "{mode}: original index"
+        );
+        assert_eq!(shared()?, before_shared, "{mode}: shared index files");
+        assert_eq!(
+            git(path, &["rev-parse", "HEAD"]),
+            workspace.base,
+            "{mode}: HEAD"
+        );
+    }
     Ok(())
 }
 

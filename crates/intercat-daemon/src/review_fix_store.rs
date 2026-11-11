@@ -105,7 +105,7 @@ fn limit_reason(total: i64, file: i64, path: &str) -> Option<String> {
         None
     }
 }
-fn input(db: &Transaction<'_>, fix: &mut Fix, note: &Note) -> Result<()> {
+fn input(db: &Transaction<'_>, fix: &mut Fix, note: &Note, explicit: bool) -> Result<()> {
     let job = crate::review_store::read(db, note.review_id)?.ok_or("The review is unavailable.")?;
     let owner = crate::plan_execution::turn_owner(db, &job.target.session_id, &job.target.turn_id)?;
     if let Some((plan, item)) = owner {
@@ -144,13 +144,13 @@ fn input(db: &Transaction<'_>, fix: &mut Fix, note: &Note) -> Result<()> {
     if let Some((plan, item)) = owner {
         crate::plan_continuation::attach(db, &id.to_string(), plan, item)?;
     }
-    let held:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM operations h WHERE h.kind='worker.hold' AND json_extract(h.payload,'$.trackId')=?1
-        AND NOT EXISTS(SELECT 1 FROM operations later WHERE later.kind='worker.hold' AND later.rowid>h.rowid AND json_extract(later.payload,'$.trackId')=?1)
-        AND NOT EXISTS(SELECT 1 FROM utterances u JOIN operations request ON request.id=u.id
-            WHERE request.kind='utterance.create' AND request.rowid>h.rowid AND u.id!=?2
-            AND NOT EXISTS(SELECT 1 FROM review_fix_inputs fi WHERE fi.input=u.id)
-            AND u.state IN ('placed','starting','sent','landed') AND json_extract(u.decision,'$.trackId')=?1))",
-        params![fix.track_id,id.to_string()],|r|r.get(0))?;
+    let held = !explicit
+        && !crate::worker_hold::turn_allowed(
+            db,
+            &fix.track_id,
+            &job.target.session_id,
+            &job.target.turn_id,
+        )?;
     if held {
         db.execute(
             "UPDATE utterances SET state='held',reason='Worker stopped' WHERE id=?1",
@@ -208,7 +208,7 @@ pub(crate) fn enqueue_with_reason(
         completed_sha: None,
     };
     let blocked = fix.reason.is_some();
-    input(db, &mut fix, note)?;
+    input(db, &mut fix, note, false)?;
     if blocked && fix.state != State::Outdated {
         fix.state = State::Blocked;
         if let Some(input) = fix.input_id {
@@ -443,7 +443,7 @@ pub(crate) fn command(db: &mut Connection, command: &Command) -> Result<Fix> {
                 false
             };
             if !reused {
-                input(&tx, &mut fix, &note)?;
+                input(&tx, &mut fix, &note, true)?;
             }
         }
     }

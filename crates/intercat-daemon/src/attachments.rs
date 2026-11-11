@@ -164,7 +164,7 @@ pub fn reserve_checkout(control: &Path, workspace: &Path, base: &str) -> Result<
     sync(&exclude)?;
     Ok(roots)
 }
-pub fn resume_checkout(control: &Path, workspace: &Path) -> Result<Vec<String>> {
+fn read_registry(control: &Path) -> Result<Registry> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -180,7 +180,10 @@ pub fn resume_checkout(control: &Path, workspace: &Path) -> Result<Vec<String>> 
     }
     let mut bytes = Vec::new();
     file.take(16385).read_to_end(&mut bytes)?;
-    let registry: Registry = serde_json::from_slice(&bytes)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+pub fn resume_checkout(control: &Path, workspace: &Path) -> Result<Vec<String>> {
+    let registry = read_registry(control)?;
     if registry.roots.is_empty() {
         return Err("The attachment directory ownership record is empty.".into());
     }
@@ -190,4 +193,36 @@ pub fn resume_checkout(control: &Path, workspace: &Path) -> Result<Vec<String>> 
     }
     ensure(workspace, &registry.base, &registry.roots)?;
     Ok(registry.roots)
+}
+
+/// Rebind the copied registry to the new directory only after validating the
+/// original. The old inode record is not a valid resume record for a clone.
+pub(crate) fn clone_checkout(
+    source_control: &Path,
+    source: &Path,
+    control: &Path,
+    workspace: &Path,
+) -> Result<Vec<String>> {
+    let roots = resume_checkout(source_control, source)?;
+    let registry = read_registry(source_control)?;
+    ensure(workspace, &registry.base, &roots)?;
+    let metadata = fs::symlink_metadata(workspace)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err("The copied attachment workspace is not owned by Intercat.".into());
+    }
+    let registry = Registry {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        base: registry.base,
+        roots: roots.clone(),
+    };
+    let mut file = tempfile::NamedTempFile::new_in(control)?;
+    file.write_all(&serde_json::to_vec(&registry)?)?;
+    sync(file.as_file())?;
+    file.persist(control.join("attachment-roots.json"))?;
+    sync(&File::open(control)?)?;
+    Ok(roots)
 }

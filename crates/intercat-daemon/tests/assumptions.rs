@@ -706,20 +706,32 @@ async fn preemption_discards_completed_parts_until_the_whole_batch_is_retried() 
     std::fs::write(directory.path().join("preempt-third"), "")?;
     let manager = editor(directory.path(), false).await?;
     let service = assumptions::Service::start(journal.clone(), manager.clone());
-    let result = async {
+    let result: Result<Value> = async {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !directory.path().join("preempted").exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
-        .await?;
+        .await
+        .map_err(|error| {
+            let requests =
+                std::fs::read_to_string(directory.path().join("assumption-generations.jsonl"))
+                    .ok()
+                    .map(|text| text.lines().count());
+            format!(
+                "Waiting for dummy preemption (requests: {requests:?}, Editor: {}): {error}",
+                manager.status().phase
+            )
+        })?;
         assert!(
             journal.snapshot().await?["assumptions"]
                 .as_array()
                 .unwrap()
                 .is_empty()
         );
-        wait_assumptions(&journal, 5).await
+        wait_assumptions(&journal, 5).await.map_err(|error| {
+            format!("Waiting for the complete retried assumption batch: {error}").into()
+        })
     }
     .await;
     service.shutdown().await;

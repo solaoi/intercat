@@ -16,6 +16,7 @@ pub enum Hold {
     Report,
     Review,
     Redirect,
+    Realign,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

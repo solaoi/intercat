@@ -12,6 +12,16 @@ export function mergeStatus(current: DaemonStatus, value: DaemonStatus): DaemonS
       return newer && newer.rev > plan.rev ? newer : plan;
     }) };
   }
+  if (current.daemonPid === value.daemonPid && current.session?.id === value.session?.id && value.connected && value.freshTracks && current.freshTracks) {
+    const known = new Map(current.freshTracks.map(job => [job.request.opId, job]));
+    value = { ...value, freshTracks: value.freshTracks.map(job => {
+      const newer = known.get(job.request.opId);
+      return newer && newer.revision > job.revision ? newer : job;
+    }) };
+  }
+  if(current.daemonPid===value.daemonPid&&current.session?.id===value.session?.id&&value.connected&&value.twoWays&&current.twoWays){
+    const known=new Map(current.twoWays.map(job=>[job.request.opId,job]));value={...value,twoWays:value.twoWays.map(job=>{const old=known.get(job.request.opId);return old&&old.revision>job.revision?old:job;})};
+  }
   const result = { ...value };
   let changed = Object.keys(current).length !== Object.keys(value).length;
   for (const key of Object.keys(value) as (keyof DaemonStatus)[]) {

@@ -1,3 +1,4 @@
+import { preparing,phaseText } from '../twoWays/types';
 import { waitSourceLabel } from '../waitSource';
 import type { HostMemoryStatus, ConfirmationStatus, InputResolution, LiveTrack, RedirectState, SchedulingStatus, Utterance } from '../bridge';
 import { ConfirmationChip } from './Confirmation';
@@ -11,6 +12,7 @@ import type { AttentionCard } from './NeedsYou';
 import { PrivacyText, usePrivacyText } from './PrivacyText';
 
 interface Props {
+  retiredTracks:ReadonlySet<string>;
   scheduling?: SchedulingStatus;
   hostMemory?: HostMemoryStatus;
   words: Utterance[];
@@ -28,6 +30,7 @@ interface Props {
 }
 
 function resultLabel(word: Utterance, tracks: LiveTrack[], redirects: RedirectState[], editingTokens: string[], scheduling?: SchedulingStatus, hostMemory?: HostMemoryStatus) {
+  if(word.twoWays&&preparing(word.twoWays))return phaseText[word.twoWays.phase];
   if (word.editHold) return editingTokens.includes(word.editHold.token) ? 'editing' : 'editing in another window';
   if (word.dependencyRetryRunnable === false) return 'held · retry source changed';
   if (word.state === 'held' && word.reason === 'editing was interrupted') return 'held · editing was interrupted';
@@ -71,7 +74,7 @@ export function requestCards({ words, tracks, onResolve, onEdit, onCut, drafts, 
       kind: 'question',
       version: word.revision,
       destination: track ? { trackId: track.id, label: track.label } : undefined,
-      title: word.startWaiting && !word.review ? `Start waiting work · ${requestTitle(word)}` : word.state === 'asked' ? `Can’t place “${requestTitle(word)}”` : `Reply needs a destination · ${requestTitle(word)}`,
+      title: word.startWaiting && !word.review ? `Start waiting work · ${requestTitle(word)}` : word.state === 'asked' ? `Can’t place “${requestTitle(word)}”` : `${word.replyTo || word.planReply ? 'Reply' : 'Instruction'} needs a destination · ${requestTitle(word)}`,
       content: word.state === 'orphaned'
         ? <OrphanedRequest word={word} tracks={tracks} edit={() => onEdit(word)} resolve={resolution => onResolve(word, resolution)} takeBack={() => onCut(word)} />
         : word.startWaiting && !word.review
@@ -81,7 +84,7 @@ export function requestCards({ words, tracks, onResolve, onEdit, onCut, drafts, 
   });
 }
 
-function RequestChip({ word, tracks, redirects, editingTokens, scheduling, hostMemory, onSelect, onCut, onStart }: Pick<Props, 'hostMemory' | 'scheduling' | 'tracks' | 'redirects' | 'editingTokens' | 'onSelect' | 'onCut' | 'onStart'> & { word: Utterance }) {
+function RequestChip({ retiredTracks, word, tracks, redirects, editingTokens, scheduling, hostMemory, onSelect, onCut, onStart }: Pick<Props, 'retiredTracks' | 'hostMemory' | 'scheduling' | 'tracks' | 'redirects' | 'editingTokens' | 'onSelect' | 'onCut' | 'onStart'> & { word: Utterance }) {
   const { view, error } = usePrivacyText(requestTitle(word));
   const label = view?.text ?? error ?? 'Checking privacy…';
   return <div className={`request-chip ${word.startCondition?.detail && !word.startCondition.ready ? 'held' : word.state}`}>
@@ -90,21 +93,21 @@ function RequestChip({ word, tracks, redirects, editingTokens, scheduling, hostM
           {word.attachments.length > 0 && <small className="request-attachments" aria-label="Attached reference files" title={word.attachments.map(file => file.name).join(', ')}>📎 {word.attachments.map(file => file.name).join(', ')}</small>}
           <small className="request-result"><PrivacyText text={resultLabel(word, tracks, redirects, editingTokens, scheduling, hostMemory)} interactive={false} /></small>
         </button>
-        {(word.state === 'held' || word.state === 'placed' && word.decision?.boundary === 'when-told') && !word.editHold && <button disabled={word.dependencyRetryRunnable === false || !!word.startCondition && !word.startCondition.ready} onClick={() => onStart(word)} aria-label={`Start request: ${label}`}>Start</button>}
-        {!word.editHold && !word.interruptStarted && !['redirecting', 'starting', 'sent', 'landed', 'orphaned'].includes(word.state) && <button aria-label={`Cut request: ${label}`} onClick={event => { event.stopPropagation(); onCut(word); }} onKeyDown={event => {
+        {!(word.twoWays&&preparing(word.twoWays))&& (word.state === 'held' || word.state === 'placed' && word.decision?.boundary === 'when-told') && !word.editHold && <button title={word.decision?.kind!=='command'&&word.decision?.trackId&&retiredTracks.has(word.decision.trackId)?'Restore this worker first':undefined} disabled={word.decision?.kind!=='command'&&!!word.decision?.trackId&&retiredTracks.has(word.decision.trackId)||word.dependencyRetryRunnable === false || !!word.startCondition && !word.startCondition.ready} onClick={() => onStart(word)} aria-label={`Start request: ${label}`}>Start</button>}
+        {!(word.twoWays&&preparing(word.twoWays))&&!word.editHold && !word.interruptStarted && !['redirecting', 'starting', 'sent', 'landed', 'orphaned'].includes(word.state) && <button aria-label={`Cut request: ${label}`} onClick={event => { event.stopPropagation(); onCut(word); }} onKeyDown={event => {
           if (['Enter', 'Delete', 'Backspace'].includes(event.key)) { event.preventDefault(); event.stopPropagation(); onCut(word); }
         }}>×</button>}
       </div>;
 }
 
-export function Requests({ words, redirects, tracks, editingTokens, scheduling, hostMemory, onSelect, onCut, onStart, confirmation, onConfirmed, onConfirmationChanged }: Omit<Props, 'onEdit' | 'onResolve'>) {
+export function Requests({ retiredTracks, words, redirects, tracks, editingTokens, scheduling, hostMemory, onSelect, onCut, onStart, confirmation, onConfirmed, onConfirmationChanged }: Omit<Props, 'onEdit' | 'onResolve'>) {
   const visible = words.filter(word => !word.reviewFix && (!word.planItemId || word.planContinuation) && !['cut', 'landed'].includes(word.state) && (word.state !== 'asked' || !!word.confirmation));
   return <>
     <div className="draft-strip request-strip" data-empty={!visible.length}>
       <span className="draft-label">REQUESTS</span>
       {visible.length ? visible.map(word => word.confirmation
         ? <ConfirmationChip key={`${word.id}/${word.revision}/${word.confirmation.decisionId}`} word={word} tracks={tracks} mode={confirmation} edit={() => onSelect(word)} cut={() => onCut(word)} confirmed={onConfirmed} modeChanged={onConfirmationChanged} />
-        : <RequestChip key={word.id} scheduling={scheduling} hostMemory={hostMemory} word={word} tracks={tracks} redirects={redirects} editingTokens={editingTokens} onSelect={onSelect} onCut={onCut} onStart={onStart} />) : <span>Nothing queued</span>}
+        : <RequestChip retiredTracks={retiredTracks} key={word.id} scheduling={scheduling} hostMemory={hostMemory} word={word} tracks={tracks} redirects={redirects} editingTokens={editingTokens} onSelect={onSelect} onCut={onCut} onStart={onStart} />) : <span>Nothing queued</span>}
     </div>
   </>;
 }

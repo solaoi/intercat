@@ -227,6 +227,7 @@ async fn received_message_lands_before_turn_start_acknowledgement() -> Result<()
         input.revision,
         track.clone(),
         json!({"commandId":command,"sessionId":"session"}),
+        None,
     )
     .await?;
     let mut message = item("user", "userMessage", 1, "completed");

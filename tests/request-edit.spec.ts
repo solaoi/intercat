@@ -367,8 +367,8 @@ test('the Japanese edit context and composer actions fit a small window at 200 p
 test('an obsolete Reply can be edited as an ordinary request', async () => {
   const page = await app.firstWindow();
   await app.evaluate(() => {
-    const state = (globalThis as typeof globalThis & { editFixture: { state: { sequence: number; utterances: { state: string }[] } } }).editFixture.state;
-    state.utterances[0].state = 'orphaned'; state.sequence++;
+    const state = (globalThis as typeof globalThis & { editFixture: { state: { sequence: number; utterances: { state: string; replyTo?: { id: string; revision: number; question: null } }[] } } }).editFixture.state;
+    state.utterances[0].state = 'orphaned'; state.utterances[0].replyTo = { id: 'own-obsolete-question', revision: 1, question: null }; state.sequence++;
   });
   await expect(page.locator('.orphaned-request')).toBeAttached();
   await page.getByRole('button', { name: /^\+\d+ more/ }).click();

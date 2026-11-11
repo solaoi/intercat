@@ -1,7 +1,19 @@
 //! Git object and ref operations. Durability is a separate daemon responsibility.
 
 mod attachments;
+pub mod lfs;
+mod lfs_config;
+pub mod merge;
+mod project_location;
+mod push_objects;
+mod remote_address;
+mod snapshot_index;
+mod worker_base;
 pub use attachments::AttachmentPaths;
+pub use project_location::ProjectLocation;
+pub use push_objects::PushHistory;
+pub use remote_address::{RemoteAddress, Transport, validate_branch_reference};
+pub use snapshot_index::{NestedRepository, validate_exclusion};
 
 use std::{collections::HashSet, fs::File, os::fd::AsRawFd, path::Path};
 
@@ -12,6 +24,14 @@ use gix::prelude::Write;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub struct Repository(gix::Repository);
+
+pub fn validate_reference(reference: &str) -> Result<()> {
+    if reference.len() > 1024 {
+        return Err("Git reference is too long.".into());
+    }
+    let _: gix::refs::FullName = reference.try_into().map_err(|_| "Invalid Git reference.")?;
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct WorktreeSource {
@@ -25,6 +45,7 @@ pub struct SnapshotIndex {
     pub common_dir: std::path::PathBuf,
     pub object_dirs: Vec<std::path::PathBuf>,
     pub unmerged_paths: Vec<String>,
+    pub add_exclusions: Vec<String>,
 }
 /// Only settings needed to reproduce checkout conversion. Executable values
 /// are data here; the daemon runs them in its isolated checkout sandbox.
@@ -32,6 +53,7 @@ pub struct CheckoutConfiguration {
     pub values: std::collections::BTreeMap<String, String>,
     pub attributes_file: Option<std::path::PathBuf>,
     pub hooks_directory: std::path::PathBuf,
+    pub lfs_directory: std::path::PathBuf,
 }
 pub struct CommitDetails {
     pub tree: ObjectId,
@@ -44,6 +66,10 @@ pub struct CommitDetails {
 pub struct SavedFile {
     pub object: ObjectId,
     pub mode: u16,
+}
+enum TreeScope {
+    Workspace,
+    Push,
 }
 
 /// Added/replaced line ranges in the new bytes, zero based and end exclusive.
@@ -93,7 +119,12 @@ pub fn secret_path(path: &str) -> bool {
 #[derive(Debug)]
 pub enum Merge {
     Clean(ObjectId),
-    Conflicts(Vec<BString>),
+    Conflicts {
+        base: ObjectId,
+        target: ObjectId,
+        incoming: ObjectId,
+        paths: Vec<BString>,
+    },
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -110,8 +141,22 @@ fn full_sync(path: &Path) -> std::io::Result<()> {
 }
 
 impl Repository {
+    pub fn worktree_root(&self) -> Result<std::path::PathBuf> {
+        Ok(self
+            .0
+            .workdir()
+            .ok_or("A working repository is required.")?
+            .canonicalize()?)
+    }
     pub fn common_directory(&self) -> Result<std::path::PathBuf> {
         Ok(self.0.common_dir().canonicalize()?)
+    }
+    pub fn working_directory(&self) -> Result<std::path::PathBuf> {
+        Ok(self
+            .0
+            .workdir()
+            .ok_or("A worker needs a working repository.")?
+            .canonicalize()?)
     }
     pub fn commit_details(&self, id: ObjectId) -> Result<CommitDetails> {
         let commit = self.0.find_commit(id)?;
@@ -188,10 +233,24 @@ impl Repository {
             .trusted_path("core.hooksPath")?
             .map(path)
             .unwrap_or_else(|| repo.common_dir().join("hooks"));
+        // Git LFS resolves relative storage against the shared Git directory,
+        // including when this is a linked worktree. This is metadata only.
+        let lfs_directory = match config.string("lfs.storage") {
+            Some(value) if !value.is_empty() => {
+                let value = std::path::PathBuf::from(std::str::from_utf8(&value)?);
+                if value.is_absolute() {
+                    value
+                } else {
+                    repo.common_dir().join(value)
+                }
+            }
+            _ => repo.common_dir().join("lfs"),
+        };
         Ok(CheckoutConfiguration {
             values,
             attributes_file,
             hooks_directory,
+            lfs_directory,
         })
     }
     pub fn tree_id(&self, commit: ObjectId) -> Result<ObjectId> {
@@ -207,6 +266,21 @@ impl Repository {
         &self,
         tree: ObjectId,
     ) -> Result<std::collections::BTreeMap<String, SavedFile>> {
+        self.files_in_tree(tree, TreeScope::Workspace)
+    }
+    /// Gitlink IDs are metadata of another repository, not uploaded blobs.
+    /// Workspace operations continue to reject them through `tree_files`.
+    pub fn push_tree_files(
+        &self,
+        tree: ObjectId,
+    ) -> Result<std::collections::BTreeMap<String, SavedFile>> {
+        self.files_in_tree(tree, TreeScope::Push)
+    }
+    fn files_in_tree(
+        &self,
+        tree: ObjectId,
+        scope: TreeScope,
+    ) -> Result<std::collections::BTreeMap<String, SavedFile>> {
         let mut files = std::collections::BTreeMap::new();
         let mut pending = vec![(String::new(), tree)];
         while let Some((prefix, tree)) = pending.pop() {
@@ -217,7 +291,9 @@ impl Repository {
                 if entry.mode.is_tree() {
                     pending.push((format!("{path}/"), entry.oid.to_owned()));
                 } else if entry.mode.is_commit() {
-                    return Err("Nested repository in saved tree.".into());
+                    if matches!(scope, TreeScope::Workspace) {
+                        return Err("Nested repository in saved tree.".into());
+                    }
                 } else {
                     files.insert(
                         path,
@@ -334,8 +410,11 @@ impl Repository {
         base: ObjectId,
         destination: &Path,
         attachments: &[String],
+        exclusions: &[String],
     ) -> Result<SnapshotIndex> {
-        self.write_snapshot_index(self.0.open_index()?, base, destination, attachments)
+        let index = snapshot_index::expand(&self.0, self.0.open_index()?)?;
+        snapshot_index::check_nested(&self.0, &index, exclusions, attachments)?;
+        self.write_snapshot_index(index, base, destination, attachments, exclusions)
     }
 
     pub fn sanitize_snapshot_index(
@@ -343,27 +422,91 @@ impl Repository {
         base: ObjectId,
         path: &Path,
         attachments: &[String],
+        exclusions: &[String],
     ) -> Result<()> {
         let index = gix::index::File::at(path, self.0.object_hash(), false, Default::default())?;
-        self.write_snapshot_index(index, base, path, attachments)?;
+        self.write_snapshot_index(index, base, path, attachments, exclusions)?;
         Ok(())
+    }
+
+    /// Prepare a source-inspection index. Starting points respect manual
+    /// assume-unchanged/skip-worktree flags; normal entries are rehashed. Never
+    /// hide staged changes, secret paths or untracked files during inspection.
+    pub fn inspection_index(&self, base: ObjectId, destination: &Path) -> Result<SnapshotIndex> {
+        let mut index = snapshot_index::expand(
+            &self.0,
+            self.0.index_or_load_from_head_or_empty()?.into_owned(),
+        )?;
+        let expected = self.tree_files(self.tree_id(base)?)?;
+        let actual = self.files_in_index(&index)?;
+        if actual != expected {
+            return Err(
+                "Your checkout has uncommitted changes. Commit or stash them before starting."
+                    .into(),
+            );
+        }
+        snapshot_index::check_nested(&self.0, &index, &[], &[])?;
+        for entry in index.entries_mut() {
+            entry
+                .flags
+                .remove(gix::index::entry::Flags::FSMONITOR_VALID);
+            entry.stat = Default::default();
+        }
+        self.store_snapshot_index(index, destination, Vec::new(), Vec::new())
+    }
+
+    fn files_in_index(
+        &self,
+        index: &gix::index::File,
+    ) -> Result<std::collections::BTreeMap<String, SavedFile>> {
+        index
+            .entries()
+            .iter()
+            .map(|entry| {
+                if entry.stage_raw() != 0 || entry.mode == gix::index::entry::Mode::COMMIT {
+                    return Err(
+                        "The source index contains conflicts or a nested repository.".into(),
+                    );
+                }
+                Ok((
+                    std::str::from_utf8(entry.path(index))?.into(),
+                    SavedFile {
+                        object: entry.id,
+                        mode: entry.mode.bits() as u16,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    pub fn changed_index_paths(
+        &self,
+        index: &Path,
+        base: ObjectId,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let index = gix::index::File::at(index, self.0.object_hash(), false, Default::default())?;
+        let current = self.files_in_index(&index)?;
+        let expected = self.tree_files(self.tree_id(base)?)?;
+        Ok(current
+            .keys()
+            .chain(expected.keys())
+            .filter(|path| current.get(*path) != expected.get(*path))
+            .cloned()
+            .collect())
     }
 
     fn write_snapshot_index(
         &self,
-        mut index: gix::index::File,
+        index: gix::index::File,
         base: ObjectId,
         destination: &Path,
         owned_attachments: &[String],
+        exclusions: &[String],
     ) -> Result<SnapshotIndex> {
-        if self
-            .0
-            .config_snapshot()
-            .boolean("core.sparseCheckout")
-            .unwrap_or(false)
-        {
-            return Err(std::io::Error::other("Sparse checkout is not supported yet.").into());
+        for path in exclusions {
+            validate_exclusion(path)?;
         }
+        let mut index = snapshot_index::prepare(&self.0, index)?;
         let mut baseline = HashSet::new();
         let mut pending = vec![(String::new(), self.0.find_commit(base)?.tree_id()?.detach())];
         while let Some((prefix, tree)) = pending.pop() {
@@ -387,19 +530,50 @@ impl Repository {
             if entry.stage_raw() != 0 && !attachments.excludes(path) {
                 unmerged_paths.push(path.to_owned());
             }
-            entry.flags.remove(
-                gix::index::entry::Flags::ASSUME_VALID
-                    | gix::index::entry::Flags::SKIP_WORKTREE
-                    | gix::index::entry::Flags::FSMONITOR_VALID,
-            );
-            // The copy must inspect the file contents, not trust cached stat data.
-            entry.stat = Default::default();
         }
         index.remove_entries(|_, path, _| {
             std::str::from_utf8(path).is_ok_and(|path| {
-                attachments.excludes(path) || (secret_path(path) && !baseline.contains(path))
+                attachments.excludes(path)
+                    || snapshot_index::excluded(path, exclusions)
+                    || (secret_path(path) && !baseline.contains(path))
             })
         });
+        if let Some(entry) = index
+            .entries()
+            .iter()
+            .find(|entry| entry.mode == gix::index::entry::Mode::COMMIT)
+        {
+            return Err(NestedRepository {
+                path: std::str::from_utf8(entry.path(&index))?.to_owned(),
+            }
+            .into());
+        }
+        let mut add_exclusions = Vec::new();
+        let mut ignores = self.0.excludes(
+            &index,
+            None,
+            gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+        )?;
+        for path in exclusions.iter().chain(owned_attachments) {
+            if !ignores
+                .at_path(Path::new(path), Some(gix::index::entry::Mode::DIR))?
+                .is_excluded()
+            {
+                add_exclusions.push(path.clone());
+            }
+        }
+        add_exclusions.sort();
+        add_exclusions.dedup();
+        self.store_snapshot_index(index, destination, unmerged_paths, add_exclusions)
+    }
+
+    fn store_snapshot_index(
+        &self,
+        mut index: gix::index::File,
+        destination: &Path,
+        mut unmerged_paths: Vec<String>,
+        add_exclusions: Vec<String>,
+    ) -> Result<SnapshotIndex> {
         index.remove_tree();
         index.write_to(
             File::create(destination)?,
@@ -410,21 +584,13 @@ impl Repository {
         )?;
         unmerged_paths.sort();
         unmerged_paths.dedup();
-        let mut object_dirs = vec![self.0.objects.store_ref().path().canonicalize()?];
-        object_dirs.extend(
-            self.0
-                .objects
-                .store_ref()
-                .alternate_db_paths()?
-                .into_iter()
-                .map(|p| p.canonicalize())
-                .collect::<std::io::Result<Vec<_>>>()?,
-        );
+        let object_dirs = self.object_directories()?;
         Ok(SnapshotIndex {
             git_dir: self.0.git_dir().canonicalize()?,
             common_dir: self.0.common_dir().canonicalize()?,
             object_dirs,
             unmerged_paths,
+            add_exclusions,
         })
     }
 
@@ -477,9 +643,31 @@ impl Repository {
         };
         self.write_commit(tree, &[parent], message, signature)
     }
+    /// Immutable derived context, reproducible across independent consumers.
+    /// It does not change a worker checkpoint or any reference.
+    pub fn context_commit(
+        &self,
+        tree: ObjectId,
+        parent: ObjectId,
+        message: &str,
+    ) -> Result<ObjectId> {
+        self.write_commit(
+            tree,
+            &[parent],
+            message,
+            gix::actor::Signature {
+                name: "Intercat".into(),
+                email: "intercat@localhost".into(),
+                time: gix::date::Time {
+                    seconds: 0,
+                    offset: 0,
+                },
+            },
+        )
+    }
     /// Discover a clean repository without changing its HEAD or index. An
     /// unborn repository receives an empty, parentless starting-point object.
-    pub fn clean_project(path: &Path) -> Result<WorktreeSource> {
+    pub fn project_source(path: &Path) -> Result<WorktreeSource> {
         let selected = path.canonicalize()?;
         let discovered = gix::discover_opts(
             &selected,
@@ -505,20 +693,6 @@ impl Repository {
             repo.head_commit()?
         };
         let source = Self::worktree_source(&root, Some(head))?;
-        let mut changes = repo
-            .0
-            .status(gix::progress::Discard)?
-            .untracked_files(gix::status::UntrackedFiles::Files)
-            .into_iter(std::iter::empty::<BString>())?;
-        if let Some(change) = changes.next() {
-            change?;
-            return Err(std::io::Error::other(
-                "Your checkout has uncommitted changes. Commit or stash them before starting.",
-            )
-            .into());
-        }
-        // Validate objects while the selected starting point is still fixed.
-        repo.sync_objects(&[source.head])?;
         Ok(source)
     }
 
@@ -552,13 +726,6 @@ impl Repository {
             .ok_or_else(|| std::io::Error::other("a working repository is required"))?
             .canonicalize()?;
         if repo
-            .config_snapshot()
-            .boolean("core.sparseCheckout")
-            .unwrap_or(false)
-        {
-            return Err(std::io::Error::other("sparse checkout is not supported yet").into());
-        }
-        if repo
             .index_or_empty()?
             .entries()
             .iter()
@@ -570,40 +737,8 @@ impl Repository {
             Some(id) => id,
             None => repo.head_id()?.detach(),
         };
-        let mut trees = vec![repo.find_commit(head)?.tree_id()?.detach()];
-        while let Some(tree) = trees.pop() {
-            let object = repo.find_object(tree)?;
-            for entry in gix::objs::TreeRefIter::from_bytes(&object.data, repo.object_hash()) {
-                let entry = entry?;
-                if entry.mode.is_commit() || entry.filename == ".gitmodules" {
-                    return Err(std::io::Error::other("submodules are not supported yet").into());
-                }
-                if entry.mode.is_tree() {
-                    trees.push(entry.oid.to_owned());
-                }
-                if entry.filename == ".lfsconfig" {
-                    return Err(std::io::Error::other("Git LFS is not supported yet").into());
-                }
-                if entry.filename == ".gitattributes" {
-                    let attributes = repo.find_blob(entry.oid.to_owned())?;
-                    let attributes = String::from_utf8_lossy(&attributes.data);
-                    for line in attributes
-                        .lines()
-                        .filter(|line| !line.trim_start().starts_with('#'))
-                    {
-                        if line
-                            .split_whitespace()
-                            .skip(1)
-                            .any(|token| token.starts_with("filter="))
-                        {
-                            return Err(std::io::Error::other(
-                                "checkout filters are not supported yet",
-                            )
-                            .into());
-                        }
-                    }
-                }
-            }
+        if project_location::has_submodules(&repo, Some(head))? {
+            return Err(std::io::Error::other("submodules are not supported yet").into());
         }
         Ok(WorktreeSource {
             root,
@@ -654,6 +789,38 @@ impl Repository {
             .0
             .try_find_reference(name)?
             .and_then(|r| r.target().try_id().map(ToOwned::to_owned)))
+    }
+
+    /// Name a fixed object through a currently protecting ref when one exists.
+    /// Git clone needs that name when the source HEAD is unborn. The receiver
+    /// still verifies the resulting object against the frozen ID.
+    pub fn reference_to(&self, id: ObjectId) -> Result<Option<String>> {
+        let references = self.0.references()?;
+        for reference in references.all()? {
+            let reference = reference?;
+            if reference.target().try_id() == Some(&id) {
+                return Ok(Some(
+                    std::str::from_utf8(reference.name().as_bstr())?.into(),
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn object_directories(&self) -> Result<Vec<std::path::PathBuf>> {
+        let mut paths = vec![self.0.objects.store_ref().path().canonicalize()?];
+        paths.extend(
+            self.0
+                .objects
+                .store_ref()
+                .alternate_db_paths()?
+                .into_iter()
+                .map(|path| path.canonicalize())
+                .collect::<std::io::Result<Vec<_>>>()?,
+        );
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
     pub fn head_commit(&self) -> Result<ObjectId> {
         Ok(self.0.head_id()?.detach())
@@ -743,6 +910,26 @@ impl Repository {
     pub fn tree_from_index(&self, index: &Path) -> Result<ObjectId> {
         let index = gix::index::File::at(index, self.0.object_hash(), false, Default::default())?;
         self.index_tree(&index)
+    }
+
+    pub fn install_worktree_index(&self, captured: &Path) -> Result<()> {
+        let mut index =
+            gix::index::File::at(captured, self.0.object_hash(), false, Default::default())?;
+        if self.files_in_index(&index)? != self.saved_files(self.head_commit()?)? {
+            return Err(
+                "The materialized worker index does not match its frozen starting point.".into(),
+            );
+        }
+        let destination = self.0.index_path();
+        index.set_path(&destination);
+        index.remove_tree();
+        index.write(gix::index::write::Options {
+            extensions: gix::index::write::Extensions::None,
+            skip_hash: false,
+        })?;
+        full_sync(&destination)?;
+        full_sync(self.0.git_dir())?;
+        Ok(())
     }
 
     pub fn tree_from_index_without_attachments(
@@ -1038,55 +1225,5 @@ impl Repository {
 
     pub fn merge_base(&self, ours: ObjectId, theirs: ObjectId) -> Result<Option<ObjectId>> {
         Ok(self.0.merge_base(ours, theirs)?.map(|id| id.detach()))
-    }
-
-    pub fn merge_trees(&self, base: ObjectId, ours: ObjectId, theirs: ObjectId) -> Result<Merge> {
-        // The high-level API uses the repository's current index for
-        // attributes. That index belongs to the user's checkout, not this
-        // integration. Resolve versioned attributes from the frozen target.
-        let index = self.0.index_from_tree(&ours)?;
-        let attrs = self
-            .0
-            .attributes_only(
-                &index,
-                gix::worktree::stack::state::attributes::Source::IdMapping,
-            )?
-            .detach();
-        let mut diff_cache = self.0.diff_resource_cache_for_tree_diff()?;
-        diff_cache.attr_stack = attrs.clone();
-        let mut blob_merge = self.0.merge_resource_cache(Default::default())?;
-        blob_merge.attr_stack = attrs;
-        let mut outcome = gix::merge::plumbing::tree(
-            &base,
-            &ours,
-            &theirs,
-            Default::default(),
-            &self.0,
-            |buf| self.0.write_buf(gix::objs::Kind::Blob, buf),
-            &mut Default::default(),
-            &mut diff_cache,
-            &mut blob_merge,
-            self.0.tree_merge_options()?.into(),
-        )?;
-        let mut paths = Vec::new();
-        for conflict in &outcome.conflicts {
-            if conflict.is_unresolved(gix::merge::tree::TreatAsUnresolved::git()) {
-                paths.push(BString::from(conflict.ours.location()));
-                paths.push(BString::from(conflict.theirs.location()));
-            }
-        }
-        if !paths.is_empty() {
-            paths.sort();
-            paths.dedup();
-            return Ok(Merge::Conflicts(paths));
-        }
-        Ok(Merge::Clean(outcome.tree.write(
-            |tree| -> Result<ObjectId> {
-                let id = self.0.write_object(tree)?.detach();
-                // Keep the high-level writer's filename/object validation when
-                // using the plumbing merge API. Each emitted subtree is checked.
-                Ok(self.0.edit_tree(id)?.write()?.detach())
-            },
-        )?))
     }
 }

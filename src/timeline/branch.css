@@ -4,6 +4,10 @@
 .branch-dialog header,.branch-dialog footer{display:flex;align-items:center;gap:12px;padding:12px 16px;flex-shrink:0}
 .branch-dialog header{justify-content:space-between;border-bottom:1px solid #454951}
 .branch-dialog h2{font-size:16px;margin:0}
+.branch-point-actions{position:absolute;inset:0;pointer-events:none;z-index:3}
+.branch-point-actions button{position:absolute;width:14px;height:24px;padding:0;pointer-events:auto;border-radius:3px}
+.branch-point-actions button:hover,.branch-point-actions button:focus-visible{outline:2px solid #dce5f5;outline-offset:1px;background:#dce5f522}
+.timeline>.branch-points-error{position:absolute;left:180px;right:8px;bottom:0;margin:0;padding:3px 6px;background:#171b24;color:#c1cadb;font-size:10px;overflow-wrap:anywhere}
 .branch-dialog-body{min-height:0;overflow:auto;padding:16px;overflow-wrap:anywhere}
 .branch-dialog-body>p{margin:0 0 16px}
 .branch-dialog-body>label{display:grid;gap:8px;margin-bottom:16px}

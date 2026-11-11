@@ -605,6 +605,7 @@ async fn input_workspace(
     git(&path, &["commit", "-qm", "base"]);
     let base = git(&path, &["rev-parse", "HEAD"]);
     let workspace = Workspace {
+        denied_roots: Vec::new(),
         attachment_roots: intercat_daemon::attachments::reserve(&path, &base)?,
         track_id: track,
         path,
@@ -916,6 +917,7 @@ async fn dispatch_reference(
             1,
             workspace.track_id.clone(),
             serde_json::json!({"commandId":command,"sessionId":session,"input":[]}),
+            None,
         )
         .await?;
     if arrived {
@@ -986,7 +988,8 @@ async fn verify_branch_reference(pasted: bool, refresh: bool) -> Result<()> {
     let request = Request {
         op_id: Uuid::now_v7(),
         parent_track_id: workspace.track_id.clone(),
-        turn_id: first,
+        point: intercat_daemon::branch_start::Selection::Turn { turn_id: first },
+        instructions: intercat_daemon::branch::InstructionMode::Checkpoint,
     };
     let branch = journal.branch(Change::Prepare(request.clone())).await?;
     if refresh {
@@ -1008,11 +1011,8 @@ async fn verify_branch_reference(pasted: bool, refresh: bool) -> Result<()> {
     dispatch_reference(&journal, &workspace, &late_input, "parent-session", true).await?;
     fs::remove_file(source)?;
     let mut source = intercat_git::Repository::worktree_source(&workspace.path, None)?;
-    source.head = branch.checkpoint.sha.parse()?;
-    intercat_daemon::worktree::GitTool::system()
-        .await?
-        .prepare_detached(&source, &branch.workspace.path)
-        .await?;
+    source.head = branch.point.sha().parse()?;
+    intercat_daemon::worktree::prepare_detached(&source, &branch.workspace.path).await?;
     let roots =
         intercat_daemon::attachments::reserve(&branch.workspace.path, &branch.workspace.base)?;
     let branch = journal

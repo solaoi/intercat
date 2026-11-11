@@ -210,6 +210,9 @@ pub(crate) fn internal_hook(
 }
 
 pub(crate) fn owner(db: &Connection, track: &str, session: &str) -> Result<Option<Workspace>> {
+    if crate::continuation::closed(db, track)? {
+        return Ok(None);
+    }
     let row: Option<(String, String)> = db
         .query_row(
             "SELECT w.record,p.record FROM workers w JOIN workspaces p ON p.track_id=w.track_id

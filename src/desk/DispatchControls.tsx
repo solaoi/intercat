@@ -3,7 +3,7 @@ import type { DaemonStatus } from '../bridge';
 export function DispatchControls({status, change}:{status:DaemonStatus;change:(paused:boolean)=>void}) {
   const running=(status.workers??[]).filter(worker=>worker.activeTurn).length
     +(status.repairRuns??[]).filter(run=>['queued','preparing','running'].includes(run.phase)).length;
-  const active=running>0 || ['building','staging','committing'].includes(status.integration?.status??'');
+  const active=running>0 || !!status.integrations?.some(job=>['building','staging','committing'].includes(job.status));
   if (!active && !status.dispatchPaused) return null;
   const held=(status.utterances??[]).filter(word=>word.state==='held').length;
   return <>

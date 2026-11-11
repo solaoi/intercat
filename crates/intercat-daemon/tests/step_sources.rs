@@ -57,6 +57,7 @@ impl Fixture {
             ],
         );
         let workspace = Workspace {
+            denied_roots: Vec::new(),
             attachment_roots: vec![".intercat/attachments".into()],
             track_id: Uuid::now_v7().to_string(),
             path,

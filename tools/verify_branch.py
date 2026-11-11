@@ -13,7 +13,8 @@ def verify(directory):
     assert branch["phase"] == "ready"
     parent, child = branch["parentSessionId"], branch["sessionId"]
     assert parent != child
-    first = branch["checkpoint"]["turnId"]
+    assert branch["point"]["kind"] == "turn"
+    first = branch["point"]["checkpoint"]["turnId"]
     starts = [(seq, json.loads(raw)) for seq, raw in db.execute("SELECT seq,payload FROM events WHERE kind='intent.turn.start' ORDER BY seq")]
     assert len(starts) == 3
     assert starts[0][1]["payload"]["commandId"] == first

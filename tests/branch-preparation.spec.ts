@@ -4,21 +4,21 @@ import { mockDrafts } from './support/drafts';
 import { closeWindow } from './support/close';
 import { configureEditor } from './support/editor';
 
-async function setup(options: { zoom?: number; fail?: boolean; failLoad?: boolean; slow?: boolean; empty?: boolean; recovery?: boolean; defer?: boolean; step?: boolean; unlocked?: boolean } = {}) {
+async function setup(options: { zoom?: number; fail?: boolean; failLoad?: boolean; slow?: boolean; empty?: boolean; recovery?: boolean; defer?: boolean; step?: boolean; unlocked?: boolean; updated?: boolean } = {}) {
   const directory = await mkdtemp('/private/tmp/ic-branch-preparation-');
   const app = await electron.launch({ args: ['.', '--preview', '--user-data-dir=' + directory] });
   await mockDrafts(app);
   await app.evaluate(({ ipcMain, BrowserWindow }, options) => {
     const opId = '01960000-0000-7000-8000-000000000001';
     const receipt = '01960000-0000-7000-8000-000000000002';
-    const point = { id: 30, turnId: 'turn-a', checkpoint: 'a'.repeat(40), endedAt: 1_730_000_000_000, timelineAt: 1000, shellWasRunning: true, available: true };
+    const point = { turnNumber: 3, id: 30, turnId: 'turn-a', checkpoint: 'a'.repeat(40), endedAt: new Date(2026, 0, 1, 14, 1, 30).getTime(), timelineAt: new Date(2026, 0, 1, 14, 1, 30).getTime(), shellWasRunning: true, available: true };
     const start = new Date(2026, 0, 1, 14, 0, 0).getTime();
     const clip = { id: 'dummy-step', trackId: 'A', repairRunId: null, ordinal: 1, sessionId: 'parent', turnId: 'turn-a', category: 'step', label: 'Dummy saved step', kind: 'edit', start: start + 60_000, end: start + 90_000, running: false, generationEnd: null, approximate: false, toolTicks: [] };
     const word = { id: 'branch-command', text: 'Branch from a saved turn', revision: 1, state: 'placed', createdAt: 1, attachments: [], target: { mode: 'lock', trackId: 'A' },
       decision: { kind: 'command', command: 'branch-from', trackId: 'A', boundary: null },
       presentation: { command: 'branch-from', operationId: opId, receiptId: receipt, trackId: options.unlocked ? null : 'A' } as object | null };
-    const pending = { request: { opId, parentTrackId: 'A', turnId: point.turnId }, trackId: 'A2', parentSessionId: 'parent', sessionId: null as string | null, workspace: {}, checkpoint: {}, phase: 'preparing' };
-    const state = { connected: true, sequence: 1, workerConfigured: true, workers: [], tracks: [{ id: 'A', label: 'A', title: 'ダミーの仕事', status: 'working' }, { id: 'B', label: 'B', title: '別のダミー', status: 'done' }], utterances: options.recovery || options.defer ? [] : [word], branches: options.recovery ? [pending] : [] };
+    const pending = { request: { opId, parentTrackId: 'A', point: {kind:'turn',turnId:point.turnId}, instructions: 'current' }, trackId: 'A2', parentSessionId: 'parent', sessionId: null as string | null, workspace: {}, point: {kind:'turn',checkpoint: { turnId: point.turnId, sha: point.checkpoint, reference: 'refs/intercat/dummy/checkpoint', unmergedPaths: [], liveProcesses: false }}, instructions: null as { reference: string; sha: string; changed: string[] } | null, origin: { endedAt: point.endedAt, timelineAt: point.timelineAt, turnNumber: point.turnNumber }, phase: 'preparing' };
+    const state = { connected: true, sequence: 1, project: { id: 'dummy-project', name: 'Generated project', folders: [{ id: 'dummy-folder', root: '/private/tmp/generated-branch-project', name: 'Generated folder' }] }, trackFolders: { A: 'dummy-folder', B: 'dummy-folder' }, workerConfigured: true, workers: [] as object[], tracks: [{ id: 'A', label: 'A', title: 'ダミーの仕事', status: 'working' }, { id: 'B', label: 'B', title: '別のダミー', status: 'done' }], utterances: options.recovery || options.defer ? [] : [word], branches: options.recovery ? [pending] : [] };
     const fixture = { branchCalls: [] as object[], pointCalls: [] as object[], fail: !!options.fail, failLoad: !!options.failLoad, release: null as (() => void) | null, publish: () => { state.utterances.push(word); state.sequence++; } };
     Object.assign(globalThis, { branchFixture: fixture });
     ipcMain.removeHandler('intercat:status'); ipcMain.handle('intercat:status', () => state);
@@ -35,13 +35,15 @@ async function setup(options: { zoom?: number; fail?: boolean; failLoad?: boolea
       if (options.slow && request.trackId === 'A') await new Promise<void>(resolve => { fixture.release = resolve; });
       if (options.empty) return { points: [], before: null };
       if (request.trackId === 'B') return { points: [{ ...point, id: 40, turnId: 'turn-b', checkpoint: 'b'.repeat(40), shellWasRunning: false }], before: null };
-      if (request.before !== null) return { points: [{ ...point, id: 10, turnId: 'older-turn', checkpoint: 'c'.repeat(40), endedAt: point.endedAt - 300_000 }], before: null };
+      if (request.before !== null) return { points: [{ ...point, id: 10, turnId: 'older-turn', checkpoint: 'c'.repeat(40), endedAt: point.endedAt - 300_000, timelineAt: point.timelineAt - 300_000, turnNumber: 1 }], before: null };
       return { points: [point, { ...point, id: 20, turnId: 'invalid-turn', checkpoint: 'd'.repeat(40), available: false }], before: 20 };
     });
     ipcMain.removeHandler('intercat:branch'); ipcMain.handle('intercat:branch', (_event, request) => {
       fixture.branchCalls.push(request);
       if (fixture.fail) { fixture.fail = false; state.branches = [pending]; throw new Error('Lost branch acknowledgement'); }
-      const result = { ...pending, request, sessionId: 'child', phase: 'ready' };
+      const result = { ...pending, request, sessionId: 'child', phase: 'ready', instructions: options.updated ? { reference: 'refs/intercat/dummy/instructions', sha: 'f'.repeat(40), changed: ['AGENTS.md', 'nested/.claude/CLAUDE.md'] } : null };
+      Object.assign(state.trackFolders, { A2: 'dummy-folder' });
+      if (options.updated) state.workers.push({ trackId: 'A2', phase: 'held', sessionId: 'child', identity: null, activeTurn: null, approvals: [], prompts: [], checkpointPending: false, checkpoint: pending.point.checkpoint, output: null, detail: null });
       state.branches = [result]; state.tracks.push({ id: 'A2', label: 'A2', title: 'Branch · ダミーの仕事', status: 'stopped' }); state.sequence++;
       return result;
     });
@@ -58,9 +60,11 @@ test('a spoken branch only opens preparation; confirmation uses the selected old
     await app.evaluate(() => (globalThis as any).branchFixture.publish());
     const dialog = page.getByRole('dialog', { name: 'Branch from a saved turn', exact: true });
     await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole('combobox', { name: 'Branch instructions' })).toHaveValue('current');
+    await expect(dialog.getByText('Current instructions from /private/tmp/generated-branch-project', { exact: true })).toBeVisible();
     await expect(dialog.getByRole('button', { name: 'Branch from here', exact: true })).toBeDisabled();
     expect(await app.evaluate(() => (globalThis as any).branchFixture.branchCalls)).toEqual([]);
-    await expect(dialog.getByText('End of A’s turn · aaaaaaaaaa · shell was running', { exact: true })).toBeVisible();
+    await expect(dialog.getByText('End of A’s turn 3 · aaaaaaaaaa · shell was running', { exact: true })).toBeVisible();
     await expect(dialog.getByRole('radio').nth(1)).toBeDisabled();
     await dialog.getByRole('button', { name: 'Load older turns', exact: true }).click();
     await expect(dialog.getByRole('radio')).toHaveCount(3);
@@ -68,7 +72,7 @@ test('a spoken branch only opens preparation; confirmation uses the selected old
     await dialog.getByRole('button', { name: 'Branch from here', exact: true }).click();
     await expect(dialog).toHaveCount(0);
     const calls = await app.evaluate(() => (globalThis as any).branchFixture.branchCalls);
-    expect(calls).toEqual([{ opId: '01960000-0000-7000-8000-000000000001', parentTrackId: 'A', turnId: 'older-turn' }]);
+    expect(calls).toEqual([{ opId: '01960000-0000-7000-8000-000000000001', parentTrackId: 'A', point: {kind:'turn',turnId:'older-turn'}, instructions: 'current' }]);
     await expect(page.getByRole('combobox', { name: 'Request destination', exact: true })).toHaveValue('A2');
     await expect(page.getByRole('textbox', { name: 'Request draft', exact: true })).toHaveValue('Keep this dummy draft.');
   } finally { await cleanup(); }
@@ -79,14 +83,17 @@ test('a lost branch acknowledgement retries the same turn and operation', async 
   try {
     const dialog = page.getByRole('dialog', { name: 'Branch from a saved turn', exact: true });
     await dialog.getByRole('radio').first().check();
+    await dialog.getByRole('combobox', { name: 'Branch instructions' }).selectOption('checkpoint');
     await dialog.getByRole('button', { name: 'Branch from here', exact: true }).click();
     await expect(dialog.getByRole('alert')).toContainText('Lost branch acknowledgement');
     await expect(dialog.getByRole('combobox', { name: 'Branch source worker' })).toBeDisabled();
     await expect(dialog.getByRole('radio').first()).toBeDisabled();
+    await expect(dialog.getByRole('combobox', { name: 'Branch instructions' })).toBeDisabled();
     await dialog.getByRole('button', { name: 'Retry branch', exact: true }).click();
     await expect(dialog).toHaveCount(0);
     const calls = await app.evaluate(() => (globalThis as any).branchFixture.branchCalls);
     expect(calls).toHaveLength(2); expect(calls[1]).toEqual(calls[0]);
+    expect(calls[0].instructions).toBe('checkpoint');
   } finally { await cleanup(); }
 });
 
@@ -116,6 +123,50 @@ test('a branch command can use the open step preview without losing the selected
     expect(await app.evaluate(() => (globalThis as any).branchFixture.branchCalls)).toEqual([]);
     await dialog.getByRole('button', { name: 'Close branch preparation' }).click();
     await expect(page.getByRole('button', { name: 'Close step preview' })).toBeVisible();
+  } finally { await cleanup(); }
+});
+
+for (const zoom of [1, 2]) test(`a saved turn marker and Command B open the exact branch point at ${zoom * 100}%`, async ({}, info) => {
+  const { app, page, cleanup } = await setup({ defer: true, step: true, zoom });
+  try {
+    await page.getByRole('button', { name: 'Open step A:1: Dummy saved step', exact: true }).click();
+    const marker = page.getByRole('button', { name: 'Branch at end of A’s turn 3', exact: true });
+    await expect(marker).toBeVisible();
+    await marker.focus();
+    expect(await marker.evaluate(element => { const rect = element.getBoundingClientRect(); return element.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)); })).toBe(true);
+    const pixels = await app.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));
+    await writeFile(info.outputPath('saved-turn-marker.png'), Buffer.from(pixels, 'base64'));
+    await marker.press('Enter');
+    const dialog = page.getByRole('dialog', { name: 'Branch from a saved turn', exact: true });
+    await expect(dialog.getByRole('radio').first()).toBeChecked();
+    await expect(dialog.locator('footer')).toContainText('end of A’s turn 3');
+    expect(await app.evaluate(() => (globalThis as any).branchFixture.branchCalls)).toEqual([]);
+    await dialog.getByRole('button', { name: 'Close branch preparation' }).click();
+    await page.keyboard.press('Meta+b');
+    await expect(dialog.getByRole('radio').first()).toBeChecked();
+    expect(await app.evaluate(() => (globalThis as any).branchFixture.branchCalls)).toEqual([]);
+  } finally { await cleanup(); }
+});
+
+for (const zoom of [1, 2]) test(`the branch names its updated instruction files at ${zoom * 100}%`, async ({}, info) => {
+  const { app, page, cleanup } = await setup({ defer: true, updated: true, zoom });
+  try {
+    await app.evaluate(() => (globalThis as any).branchFixture.publish());
+    const dialog = page.getByRole('dialog', { name: 'Branch from a saved turn', exact: true });
+    await dialog.getByRole('radio').first().check();
+    await dialog.getByRole('button', { name: 'Branch from here', exact: true }).click();
+    const card = page.locator('[data-attention-card^="branch-instructions-"]');
+    await page.mouse.move(0, 0);
+    await expect(card).toBeVisible();
+    await expect(card).toContainText('Worker A2 · instructions updated');
+    await expect(card).toContainText('AGENTS.md · nested/.claude/CLAUDE.md');
+    for (const text of [card.locator('strong'), card.locator('p').last()]) {
+      await text.scrollIntoViewIfNeeded();
+      expect(await text.evaluate(element => { const rect = element.getBoundingClientRect(); return element.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)); })).toBe(true);
+    }
+    const pixels = await app.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));
+    await writeFile(info.outputPath('instructions-updated.png'), Buffer.from(pixels, 'base64'));
+    await expect(page.getByRole('combobox', { name: 'Request destination', exact: true })).toHaveValue('A2');
   } finally { await cleanup(); }
 });
 
@@ -154,7 +205,7 @@ test('a delayed result for another worker never changes the selected branch poin
     await dialog.getByRole('radio').check();
     await dialog.getByRole('button', { name: 'Branch from here', exact: true }).click();
     const calls = await app.evaluate(() => (globalThis as any).branchFixture.branchCalls);
-    expect(calls[0].parentTrackId).toBe('B'); expect(calls[0].turnId).toBe('turn-b');
+    expect(calls[0].parentTrackId).toBe('B'); expect(calls[0].point.turnId).toBe('turn-b');
   } finally { await cleanup(); }
 });
 
@@ -164,7 +215,7 @@ test('a previously confirmed pending branch can finish after reopening the app',
     await page.getByRole('button', { name: 'Retry branch preparation', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Retry branch preparation', exact: true })).toHaveCount(0);
     const calls = await app.evaluate(() => (globalThis as any).branchFixture.branchCalls);
-    expect(calls).toEqual([{ opId: '01960000-0000-7000-8000-000000000001', parentTrackId: 'A', turnId: 'turn-a' }]);
+    expect(calls).toEqual([{ opId: '01960000-0000-7000-8000-000000000001', parentTrackId: 'A', point: {kind:'turn',turnId:'turn-a'}, instructions: 'current' }]);
   } finally { await cleanup(); }
 });
 
@@ -191,16 +242,24 @@ test('a point read failure is not reported as an empty history and can be retrie
   } finally { await cleanup(); }
 });
 
-for (const zoom of [1, 2]) test(`saved branch points and confirmation remain reachable at ${zoom * 100}%`, async () => {
+for (const zoom of [1, 2]) test(`saved branch points and confirmation remain reachable at ${zoom * 100}%`, async ({}, info) => {
   const { app, page, cleanup } = await setup({ zoom });
   try {
     const dialog = page.getByRole('dialog', { name: 'Branch from a saved turn', exact: true });
     await dialog.getByRole('radio').first().check();
+    const instructions = dialog.getByRole('combobox', { name: 'Branch instructions' });
+    await instructions.scrollIntoViewIfNeeded();
+    expect(await instructions.evaluate(element => { const rect = element.getBoundingClientRect(); return element.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)); })).toBe(true);
+    await instructions.selectOption('checkpoint');
+    await expect(dialog).toContainText('Uses instructions saved at the checkpoint.');
+    await instructions.selectOption('current');
+    const source = dialog.locator('.branch-instruction-source');
+    await source.scrollIntoViewIfNeeded();
+    expect(await source.evaluate(element => { const rect = element.getBoundingClientRect(); return element.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)); })).toBe(true);
     const confirm = dialog.getByRole('button', { name: 'Branch from here', exact: true });
     await confirm.focus(); await expect(confirm).toBeInViewport();
-    await mkdir('research/verify/m2-branch-preparation-20261107', { recursive: true });
     const pixels = await app.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));
-    await writeFile(`research/verify/m2-branch-preparation-20261107/preparation-${zoom * 100}.png`, Buffer.from(pixels, 'base64'));
+    await writeFile(info.outputPath('branch-instructions.png'), Buffer.from(pixels, 'base64'));
     await page.keyboard.press('Escape'); await expect(dialog).toHaveCount(0);
   } finally { await cleanup(); }
 });

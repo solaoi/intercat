@@ -4,6 +4,7 @@ import { ConfirmationSetting } from './Confirmation';
 import { ProjectSecrets } from './ProjectSecrets';
 import { PrivacySettings } from './PrivacySettings';
 import { CheckEnvironment } from './CheckEnvironment';
+import { Checks } from './Checks';
 import { ExecutionLimits } from './ExecutionLimits';
 import { PlansStartSetting } from '../plans/PlansStartSetting';
 import type { EditorPresentation } from '../bridge';
@@ -57,7 +58,7 @@ export function PolicySettings({ open, stops, close, saved, project, tracks, con
     {open && project && <ProjectSecrets project={project} tracks={tracks} />}
     {open && <ExecutionLimits />}
     {open && <PlansStartSetting />}
-    {open && <CheckEnvironment />}
+    {open && <><Checks /><CheckEnvironment /></>}
     {error && <p role="alert">{error}</p>}
     <footer><button disabled={saving} onClick={close}>Cancel</button><button disabled={saving} onClick={() => { void save(); }}>{saving ? 'Saving…' : 'Save'}</button></footer>
   </dialog>;

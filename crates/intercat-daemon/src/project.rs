@@ -61,8 +61,8 @@ impl Folder {
 }
 
 async fn inspect_folder(path: PathBuf) -> Result<Folder> {
+    let source = crate::source_snapshot::clean_project(&path).await?;
     tokio::task::spawn_blocking(move || {
-        let source = Repository::clean_project(&path)?;
         let base_branch = Repository::open(&source.root)?.base_branch()?;
         Ok(Folder {
             id: Uuid::new_v5(
@@ -150,6 +150,9 @@ impl Project {
 pub async fn inspect(id: Uuid, name: String, paths: Vec<PathBuf>) -> Result<Project> {
     if paths.len() > 8 {
         return Err("A project can contain at most eight folders.".into());
+    }
+    if let Some(issue) = crate::project_selection::inspect(paths.clone()).await? {
+        return Err(issue.into());
     }
     let mut project = Project {
         id,

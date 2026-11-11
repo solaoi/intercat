@@ -108,8 +108,8 @@ test.describe('observed worker model presentation', () => {
     const page = await app.firstWindow();
     await app.evaluate(() => {
       const { state } = (globalThis as typeof globalThis & { modelFixture: { state: DaemonStatus } }).modelFixture;
-      state.repairRuns = [{ id: 'repair-b', jobId: 'job', jobRevision: 1, revision: 1, track: 'B', purpose: { kind: 'check' }, phase: 'held',
-        approvals: [], prompts: [], output: null, failure: null, session: 'repair-session', refresh: null, restoring: null, turn: null, secretInput: null,
+      state.repairRuns = [{ id: 'repair-b', owner:{kind:'commit',id:'job',revision:1}, revision: 1, track: 'B', purpose: { kind: 'check' }, phase: 'held',
+        approvals: [], prompts: [], output: null, failure: null, session: 'repair-session', refresh: null, remaining: null, restoring: null, turn: null, secretInput: null,
         model: { modelId: 'repair-model', providerId: null, reasoningEffort: 'medium' } }];
       state.sequence!++;
     });
@@ -125,6 +125,48 @@ test.describe('observed worker model presentation', () => {
     await expect(status).toHaveText('Worker B · for the commit · Model — · effort —');
     await page.getByRole('button', { name: 'Clear repair target', exact: true }).click();
     await expect(status).toHaveText('Worker A · Spark 1.3 · minimal');
+  });
+
+  for (const zoom of [1,2]) test(`the paired first effort stays distinct from defaults and later work at ${zoom*100}%`,async()=>{
+    const page=await app.firstWindow();
+    await app.evaluate(({BrowserWindow},zoom)=>{const window=BrowserWindow.getAllWindows()[0];window.setSize(1040,760);window.webContents.setZoomFactor(zoom);},zoom);
+    await app.evaluate(()=>{
+      const {state}=(globalThis as any).modelFixture;
+      const worker=state.workers[1];worker.phase='ready';worker.activeTurn=null;
+      worker.model={modelId:'muse-spark-1.3-contributor',providerId:'meta',reasoningEffort:'minimal'};
+      worker.pairedInstruction={inputId:'own-paired-word',effort:'xhigh',phase:'pending'};state.sequence++;
+    });
+    const card=page.locator('[data-worker-card="B"]');
+    await expect(card.locator('.worker-model')).toHaveText('Spark 1.3 · default minimal');
+    await expect(card.locator('.worker-paired-effort')).toHaveText('Two-way instruction: xhigh · queued');
+    const model=card.locator('.worker-models');await model.scrollIntoViewIfNeeded();
+    await expect(model).toBeInViewport();
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    const start=card.getByRole('button',{name:'Start Worker B',exact:true});await start.focus();await expect(start).toBeFocused();
+    expect(await start.evaluate(element=>{const rect=element.getBoundingClientRect();return element.contains(document.elementFromPoint(rect.left+rect.width/2,rect.top+rect.height/2));})).toBe(true);
+    const stop=card.getByRole('button',{name:'Stop Worker B',exact:true});
+    const startRect=(await start.boundingBox())!,stopRect=(await stop.boundingBox())!;
+    expect(stopRect.x-startRect.x-startRect.width).toBeLessThanOrEqual(8);
+    await model.scrollIntoViewIfNeeded();await capture(app,`paired-pending-${zoom}.png`);
+    await app.evaluate(()=>{const {state}=(globalThis as any).modelFixture;const worker=state.workers[1];worker.activeTurn='own-paired-turn';worker.phase='working';worker.model.reasoningEffort='xhigh';worker.pairedInstruction.phase='active';state.sequence++;});
+    await expect(card.locator('.worker-model')).toHaveText('Spark 1.3 · xhigh');
+    await expect(card.locator('.worker-paired-effort')).toHaveText('Two-way instruction: xhigh');
+    await app.evaluate(()=>{const {state}=(globalThis as any).modelFixture;const worker=state.workers[1];worker.activeTurn=null;worker.phase='ready';worker.model.reasoningEffort='minimal';worker.pairedInstruction.phase='finished';state.sequence++;});
+    await expect(card.locator('.worker-model')).toHaveText('Spark 1.3 · default minimal');
+    await expect(card.locator('.worker-paired-effort')).toHaveText('Two-way instruction: xhigh · finished');
+    await model.scrollIntoViewIfNeeded();await capture(app,`paired-finished-${zoom}.png`);
+    await page.getByRole('combobox',{name:'Request destination'}).selectOption('B');
+    await expect(page.getByLabel('Request model',{exact:true})).toHaveText('Only B · Spark 1.3 · minimal');
+    await app.evaluate(()=>{const {state}=(globalThis as any).modelFixture;const worker=state.workers[1];worker.activeTurn='own-next-turn';worker.phase='working';state.sequence++;});
+    await expect(card.locator('.worker-model')).toHaveText('Spark 1.3 · minimal');
+    await expect(card.locator('.worker-paired-effort')).toHaveText('Two-way instruction: xhigh · finished');
+    await app.evaluate(()=>{const {state}=(globalThis as any).modelFixture;state.workers[1].model.modelId='own-'+('future-model-'.repeat(32));state.sequence++;});
+    await expect(card.locator('.worker-model')).toContainText('own-future-model-');
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await stop.focus();await expect(stop).toBeFocused();
+    expect(await stop.evaluate(element=>{const rect=element.getBoundingClientRect();return element.contains(document.elementFromPoint(rect.left+rect.width/2,rect.top+rect.height/2));})).toBe(true);
+    await app.evaluate(()=>{const {state}=(globalThis as any).modelFixture;state.workers[1].pairedInstruction=null;state.sequence++;});
+    await expect(card.locator('.worker-paired-effort')).toHaveCount(0);
   });
 });
 

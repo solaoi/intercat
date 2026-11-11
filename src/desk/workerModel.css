@@ -1,0 +1,6 @@
+.worker-models { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; min-width: 0; max-width: 100%; }
+.worker-controls .worker-models > span { margin-right: 0; color: #a6b0c2; font-size: 10px; }
+.worker-models > .worker-model { max-width: 100%; }
+.worker-paired-effort { max-width: 240px; text-align: right; overflow-wrap: anywhere; }
+.worker-controls { flex-wrap: wrap; row-gap: 6px; }
+.worker-actions { margin-left: auto; }

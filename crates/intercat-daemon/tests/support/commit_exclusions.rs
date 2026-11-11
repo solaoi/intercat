@@ -15,9 +15,12 @@ async fn branch_from(f: &mut Fixture, parent: usize, point: &Checkpoint) -> Resu
         .journal
         .branch(intercat_daemon::branch::Change::Prepare(
             intercat_daemon::branch::Request {
+                instructions: intercat_daemon::branch::InstructionMode::Checkpoint,
                 op_id: Uuid::now_v7(),
                 parent_track_id: f.workspaces[parent].track_id.clone(),
-                turn_id: point.turn_id,
+                point: intercat_daemon::branch_start::Selection::Turn {
+                    turn_id: point.turn_id,
+                },
             },
         ))
         .await?;
@@ -53,7 +56,7 @@ async fn publish(f: &Fixture, job: &Job) -> Result<Job> {
 }
 
 #[tokio::test]
-async fn a_conflict_omits_transitive_multiple_parent_and_branched_work_from_the_commit()
+async fn a_conflict_omits_transitive_multiple_parent_work_and_keeps_its_alternate_excluded()
 -> Result<()> {
     let mut f = Fixture::new(6).await?;
     fs::write(f.workspaces[1].path.join("b.txt"), "B first half\n")?;
@@ -95,14 +98,32 @@ async fn a_conflict_omits_transitive_multiple_parent_and_branched_work_from_the_
         "B conflicting second half\n",
     )?;
     f.save(1, Some(b1)).await?;
-    let opened = f.open().await?;
+    let choosing = f.open().await?;
+    assert_eq!(choosing.status, Status::Choosing);
+    let opened = f
+        .action(Action::ChoosePath {
+            id: choosing.id,
+            revision: choosing.revision,
+            track: f.workspaces[1].track_id.clone(),
+        })
+        .await?;
     assert_eq!(opened.status, Status::MergeConflict);
-    let projection = f.journal.snapshot().await?["integration"].clone();
+    let projection = f.journal.snapshot().await?["integrations"][0].clone();
     let b = f.workspaces[1].track_id.clone();
-    let expected: std::collections::BTreeSet<_> = [2, 3, branch]
+    let active_dependents: std::collections::BTreeSet<_> = [2, 3]
         .into_iter()
         .map(|index| f.workspaces[index].track_id.clone())
         .collect();
+    let mut expected = active_dependents.clone();
+    expected.insert(f.workspaces[branch].track_id.clone());
+    assert!(
+        !opened
+            .tracks
+            .iter()
+            .find(|track| track.id == f.workspaces[branch].track_id)
+            .unwrap()
+            .included
+    );
     let impact = projection["exclusions"]
         .as_array()
         .unwrap()
@@ -116,7 +137,7 @@ async fn a_conflict_omits_transitive_multiple_parent_and_branched_work_from_the_
             .iter()
             .map(|id| id.as_str().unwrap().to_owned())
             .collect::<std::collections::BTreeSet<_>>(),
-        expected
+        active_dependents
     );
     let command = IntegrationCommand {
         op_id: Uuid::now_v7(),
@@ -139,6 +160,22 @@ async fn a_conflict_omits_transitive_multiple_parent_and_branched_work_from_the_
             track.id != b && !expected.contains(&track.id)
         );
     }
+    let projection = f.journal.snapshot().await?["integrations"][0].clone();
+    let omitted = projection["exclusions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| value["track"] == b)
+        .unwrap();
+    assert_eq!(
+        omitted["dependents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
     let replay = f.service.command(command).await?;
     assert_eq!(replay.revision, left.revision);
     let mut invalid = left.clone();
@@ -259,7 +296,7 @@ async fn a_conflict_omits_transitive_multiple_parent_and_branched_work_from_the_
         intercat_daemon::secrets::Key::new([7; 32]),
     )
     .await?;
-    let saved: Job = serde_json::from_value(reopened.snapshot().await?["integration"].clone())?;
+    let saved: Job = serde_json::from_value(reopened.snapshot().await?["integrations"][0].clone())?;
     assert_eq!(saved.omitted_conflicts, left.omitted_conflicts);
     assert!(
         reopened

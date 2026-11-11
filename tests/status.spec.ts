@@ -32,3 +32,13 @@ test('a plan revision from a command survives an older status response', () => {
   expect(mergeStatus(before, { ...incoming, daemonPid: 18 }).plans?.[0].rev).toBe(2);
   expect(mergeStatus(before, { ...incoming, plans: [] }).plans).toEqual([]);
 });
+
+test('paired command revisions survive older status while removal, another board, and daemon restarts remain authoritative',()=>{
+  const job={request:{opId:'own-pair'},revision:4,phase:'cancelling'} as NonNullable<DaemonStatus['twoWays']>[number];
+  const before={...status(),session:{id:'own-board',name:'Own board',slug:'own',createdAt:1},twoWays:[job]};
+  const incoming={...before,sequence:101,twoWays:[{...job,revision:3,phase:'forking' as const}]};
+  expect(mergeStatus(before,incoming).twoWays?.[0]).toBe(job);
+  expect(mergeStatus(before,{...incoming,twoWays:[]}).twoWays).toEqual([]);
+  expect(mergeStatus(before,{...incoming,daemonPid:18}).twoWays?.[0].revision).toBe(3);
+  expect(mergeStatus(before,{...incoming,session:{...before.session,id:'other-board'}}).twoWays?.[0].revision).toBe(3);
+});

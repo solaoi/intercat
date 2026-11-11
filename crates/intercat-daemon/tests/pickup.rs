@@ -25,6 +25,7 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, Request, WorkerState)>
         [&request.track_id],
     )?;
     let workspace = Workspace {
+        denied_roots: Vec::new(),
         attachment_roots: Vec::new(),
         track_id: request.track_id.clone(),
         path: root.path().into(),

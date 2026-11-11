@@ -160,7 +160,7 @@ db.execute('UPDATE utterances SET state=?,decision=?,dispatch_command=? WHERE id
 db.execute('INSERT INTO operations VALUES(?,?,?,?)',(command,'turn.start',json.dumps({'sessionId':session,'commandId':command}),'complete'))
 db.execute('INSERT INTO attachment_turns VALUES(?,?,?,?,?)',(session,command,turn,1,0))
 db.execute('INSERT INTO timeline_turns VALUES(?,?,?)',(session,turn,json.dumps({'track':track,'repair_run_id':None,'current':None,'index':0,'terminal':True})))
-db.execute('INSERT INTO workspaces VALUES(?,?)',(track,json.dumps({'trackId':track,'path':repo,'reference':reference,'base':base,'state':'ready','error':None,'attachmentRoots':[]})))
+db.execute('INSERT INTO workspaces VALUES(?,?)',(track,json.dumps({'trackId':track,'path':repo,'reference':reference,'base':base,'state':'ready','error':None,'deniedRoots':[],'attachmentRoots':[]})))
 db.execute('INSERT INTO operations VALUES(?,?,?,?)',(str(uuid.uuid5(uuid.UUID(turn),'checkpoint')),'checkpoint.save',json.dumps({'trackId':track,'checkpoint':checkpoint}),'complete'))
 worker={'trackId':track,'phase':'ready','sessionId':session,'secretRevision':None,'identity':None,'detail':None,'activeTurn':None,'approvals':[],'output':None,'checkpointPending':False,'checkpoint':checkpoint,'prompts':[]}
 db.execute('INSERT INTO workers VALUES(?,?)',(track,json.dumps(worker))); db.commit()

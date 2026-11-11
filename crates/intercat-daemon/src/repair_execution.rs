@@ -246,7 +246,7 @@ fn channel_on(run: &Run, client: Client) -> Result<(Port, Runner)> {
 }
 
 async fn update(journal: &Journal, run: &mut Run, event: Event) -> Result<()> {
-    *run = journal.repair_input(run.id).await?.0;
+    *run = journal.repair_source(run.id).await?.0;
     *run = journal
         .repair_transition(Uuid::now_v7(), run.id, run.revision, event)
         .await?;
@@ -277,7 +277,7 @@ async fn stop(journal: &Journal, run: &mut Run, port: &Port, id: Uuid) -> Result
     record_stop(journal, run, id).await
 }
 async fn record_stop(journal: &Journal, run: &mut Run, id: Uuid) -> Result<()> {
-    *run = journal.repair_input(run.id).await?.0;
+    *run = journal.repair_source(run.id).await?.0;
     if let Some(operation) = journal.operation(id).await? {
         if operation["kind"] == "repair.control"
             && operation["payload"]["request"]["id"] == run.id.to_string()
@@ -459,16 +459,16 @@ impl Runner {
         mut self,
         mut hosted: Hosted,
         journal: Journal,
-        workspace: &crate::repair::Workspace,
+        workspace: &crate::run_workspace::Workspace,
         task: Task,
     ) -> Result<Run> {
         if hosted.run_id() != self.port.run {
             return Err("The control handle belongs to another repair Run.".into());
         }
         let prepared = async {
-            let (run, job, settings) = journal.repair_input(hosted.run_id()).await?;
-            workspace.validate(&job, &run.track, &settings)?;
-            let scanner = settings.scanner()?;
+            let (run, source) = journal.repair_source(hosted.run_id()).await?;
+            workspace.validate_source(&source, &run.track)?;
+            let scanner = source.settings().scanner()?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((run, scanner))
         }
         .await;
@@ -537,7 +537,7 @@ impl Runner {
         &mut self,
         io: SessionIo<'_>,
         journal: &Journal,
-        workspace: &crate::repair::Workspace,
+        workspace: &crate::run_workspace::Workspace,
         run: &mut Run,
         scanner: &crate::secret_scan::Scanner,
         mut task: Task,
@@ -601,7 +601,7 @@ impl Runner {
         {
             return Err("The repair start was already admitted.".into());
         }
-        *run = journal.repair_input(run.id).await?.0;
+        *run = journal.repair_source(run.id).await?.0;
         if run.phase == Phase::Stopping
             || self.port.stopped.load(Ordering::Acquire)
             || *task.shutdown.borrow()
@@ -693,7 +693,7 @@ impl Runner {
                 input=self.receiver.recv()=>match input {
                     Some(Input::Stop(id))=>{stop(journal,run,&self.port,id).await?;return Ok(Outcome::Stopped);},
                     Some(Input::Secret{target,reply})=>{
-                        let current=journal.repair_input(run.id).await?.0;
+                        let current=journal.repair_source(run.id).await?.0;
                         let matches=match &target.question {
                             crate::secret_input::Question::Msp{id,revision} => prompts.get(id).is_some_and(|p|p.revision==*revision && p.request.turn_id==target.turn_id.to_string())
                                 && current.prompts.iter().any(|p|p.request.user_input_id==*id&&p.revision==*revision&&p.phase==PromptPhase::Open),
@@ -812,7 +812,7 @@ impl Runner {
                     let id=request["approvalId"].as_str().ok_or("Missing approval ID.")?.to_owned();
                     if self.port.stopped.load(Ordering::Acquire){if quiescing.is_some(){continue;}return Ok(Outcome::Stopped);}
                     if !approval_stages.current(&request){continue;}
-                    let requested=crate::deletion::requested(&request,&workspace.checkout.workdir);
+                    let requested=crate::deletion::requested(&request,&workspace.checkout().workdir);
                     let missing=requested&&deletion.is_none();
                     let review=if missing {Some(crate::policy::Reason{kind:"delete".into(),message:"Deletion snapshot could not be saved. Stop this repair and retry after fixing the workspace.".into()})}else{verdict.review.or_else(||crate::approval::offered(&request,true).is_none().then(||crate::policy::Reason{kind:"unknown".into(),message:"Review this repair action.".into()}))};
                     if let Some(reason)=review {
@@ -828,7 +828,7 @@ impl Runner {
                 },
                 changed=changes.changed()=>{
                     if changed.is_err(){return Err("The repair journal closed.".into());}
-                    let current=journal.repair_input(run.id).await?.0;
+                    let current=journal.repair_source(run.id).await?.0;
                     if current.phase==Phase::Stopping {self.port.interrupt();*run=current;return Ok(Outcome::Stopped);}
                 },
                 _=timer.tick()=>{

@@ -10,7 +10,21 @@ use uuid::Uuid;
 pub struct Request {
     pub op_id: Uuid,
     pub parent_track_id: String,
-    pub turn_id: Uuid,
+    pub point: crate::branch_start::Selection,
+    pub instructions: InstructionMode,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstructionMode {
+    Current,
+    Checkpoint,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstructionSnapshot {
+    pub reference: String,
+    pub sha: String,
+    pub changed: Vec<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,8 +34,10 @@ pub struct Branch {
     pub parent_session_id: String,
     pub session_id: Option<String>,
     pub workspace: Workspace,
-    pub checkpoint: Checkpoint,
+    pub point: crate::branch_start::Point,
     pub phase: Phase,
+    pub instructions: Option<InstructionSnapshot>,
+    pub origin: crate::branch_points::Origin,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -29,11 +45,22 @@ pub enum Phase {
     Preparing,
     AwaitingReceipt,
     Ready,
+    Cancelled,
 }
 pub enum Change {
     Prepare(Request),
-    WorkspaceReady { operation: Uuid, roots: Vec<String> },
-    Received { operation: Uuid, session: String },
+    Instructions {
+        operation: Uuid,
+        snapshot: InstructionSnapshot,
+    },
+    WorkspaceReady {
+        operation: Uuid,
+        roots: Vec<String>,
+    },
+    Received {
+        operation: Uuid,
+        session: String,
+    },
     Activate(Uuid),
 }
 
@@ -52,12 +79,48 @@ fn read(db: &Connection, id: Uuid) -> Result<Option<Branch>> {
     .transpose()
 }
 pub fn snapshot(db: &Connection) -> Result<Vec<Branch>> {
-    let mut query = db.prepare("SELECT record FROM branches ORDER BY rowid")?;
+    let mut query = db.prepare("SELECT record FROM branches WHERE json_extract(record,'$.phase')!='cancelled' ORDER BY rowid")?;
     query
         .query_map([], |r| r.get::<_, String>(0))?
         .map(|s| serde_json::from_str(&s?).map_err(Into::into))
         .collect()
 }
+
+pub(crate) fn initial_instructions(
+    db: &Connection,
+    track: &str,
+) -> Result<Option<InstructionSnapshot>> {
+    let raw = db.query_row(
+        "SELECT record FROM branches WHERE json_extract(record,'$.trackId')=?1 AND json_extract(record,'$.phase')='ready' LIMIT 1",
+        [track], |row| row.get::<_, String>(0)
+    ).optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let branch: Branch = serde_json::from_str(&raw)?;
+    let raw: String = db.query_row(
+        "SELECT record FROM workers WHERE track_id=?1",
+        [track],
+        |row| row.get(0),
+    )?;
+    let worker: WorkerState = serde_json::from_str(&raw)?;
+    let first = match (&branch.point, &worker.checkpoint) {
+        (crate::branch_start::Point::Turn { checkpoint: base }, Some(current)) => {
+            base.turn_id == current.turn_id
+        }
+        (crate::branch_start::Point::Initial { .. }, None) => true,
+        _ => false,
+    };
+    if !first {
+        return Ok(None);
+    }
+    Ok(Some(
+        branch
+            .instructions
+            .ok_or("Branch instructions were not frozen.")?,
+    ))
+}
+
 fn save(tx: &Transaction<'_>, branch: &Branch) -> Result<()> {
     let value = serde_json::to_string(branch)?;
     tx.execute(
@@ -74,6 +137,28 @@ pub fn change(db: &mut Connection, change: Change) -> Result<Branch> {
     let tx = db.transaction()?;
     let branch = match change {
         Change::Prepare(request) => prepare(&tx, request)?,
+        Change::Instructions {
+            operation,
+            snapshot,
+        } => {
+            let mut branch = read(&tx, operation)?.ok_or("Unknown branch.")?;
+            if branch.phase != Phase::Preparing
+                || snapshot.reference != format!("{}-instructions", branch.workspace.reference)
+            {
+                return Err("Invalid branch instruction snapshot.".into());
+            }
+            intercat_git::ObjectId::from_hex(snapshot.sha.as_bytes())?;
+            if branch
+                .instructions
+                .as_ref()
+                .is_some_and(|old| old != &snapshot)
+            {
+                return Err("The branch instructions were already frozen.".into());
+            }
+            branch.instructions = Some(snapshot);
+            save(&tx, &branch)?;
+            branch
+        }
         Change::WorkspaceReady { operation, roots } => workspace_ready(&tx, operation, roots)?,
         Change::Received { operation, session } => received(&tx, operation, &session)?,
         Change::Activate(operation) => activate(&tx, operation)?,
@@ -165,11 +250,7 @@ fn prepare(tx: &Transaction<'_>, request: Request) -> Result<Branch> {
     if before.current.revision > 0 && before.sealed.as_ref() != Some(&before.current) {
         return Err("Confirm the saved fingerprints before branching.".into());
     }
-    let Source {
-        session_id: parent_session_id,
-        checkpoint,
-        workspace: parent,
-    } = source(tx, &request.parent_track_id, request.turn_id)?;
+    let (parent_session_id, point, parent) = crate::branch_start::resolve(tx, &request)?;
     let parent_label: String = tx.query_row(
         "SELECT label FROM tracks WHERE id=?1",
         [&request.parent_track_id],
@@ -199,6 +280,7 @@ fn prepare(tx: &Transaction<'_>, request: Request) -> Result<Branch> {
     )?;
     let track_id = Uuid::new_v5(&request.op_id, b"branch-track").to_string();
     let workspace = Workspace {
+        denied_roots: Vec::new(),
         attachment_roots: Vec::new(),
         track_id: track_id.clone(),
         path: parent
@@ -215,7 +297,7 @@ fn prepare(tx: &Transaction<'_>, request: Request) -> Result<Branch> {
                 .0,
             label
         ),
-        base: checkpoint.sha.clone(),
+        base: point.sha().to_owned(),
         state: "branching".into(),
         error: None,
     };
@@ -231,30 +313,54 @@ fn prepare(tx: &Transaction<'_>, request: Request) -> Result<Branch> {
         "INSERT INTO workspaces VALUES(?1,?2)",
         params![track_id, serde_json::to_string(&workspace)?],
     )?;
-    let point = crate::lineage_store::point(tx, &request.parent_track_id, &checkpoint.sha)?;
-    let mut basis = point.basis();
-    crate::lineage::include(&mut basis.inherits, &point.track, &point.inherited())?;
+    let ancestry = crate::lineage_store::point(tx, &request.parent_track_id, point.sha())?;
+    let mut basis = ancestry.basis();
+    basis.parents =
+        std::collections::BTreeMap::from([(ancestry.track.clone(), ancestry.inherited())]);
+    crate::lineage::include(&mut basis.inherits, &ancestry.track, &ancestry.inherited())?;
     crate::lineage_store::initialize(tx, &track_id, &basis)?;
     crate::attachment_history::freeze(
         tx,
         request.op_id,
         &parent_session_id,
-        Some(&request.turn_id.to_string()),
+        point
+            .checkpoint()
+            .map(|checkpoint| checkpoint.turn_id.to_string())
+            .as_deref(),
     )?;
+    let origin = if let Some(checkpoint) = point.checkpoint() {
+        crate::branch_points::origin(
+            tx,
+            &request.parent_track_id,
+            checkpoint.turn_id,
+            Some(&parent_session_id),
+        )?
+    } else {
+        crate::branch_points::Origin {
+            ended_at: None,
+            timeline_at: None,
+            turn_number: 0,
+        }
+    };
     let branch = Branch {
         request,
         track_id,
         parent_session_id,
         session_id: None,
         workspace,
-        checkpoint,
+        point,
         phase: Phase::Preparing,
+        instructions: None,
+        origin,
     };
     save(tx, &branch)?;
     Ok(branch)
 }
 fn received(tx: &Transaction<'_>, operation: Uuid, session: &str) -> Result<Branch> {
     let mut branch = read(tx, operation)?.ok_or("Unknown branch.")?;
+    if branch.phase == Phase::Cancelled {
+        return Err("This branch preparation was cancelled.".into());
+    }
     Uuid::parse_str(session)?;
     if let Some(saved) = &branch.session_id {
         if saved != session {
@@ -283,6 +389,9 @@ fn received(tx: &Transaction<'_>, operation: Uuid, session: &str) -> Result<Bran
 }
 fn activate(tx: &Transaction<'_>, operation: Uuid) -> Result<Branch> {
     let mut branch = read(tx, operation)?.ok_or("Unknown branch.")?;
+    if branch.phase == Phase::Cancelled {
+        return Err("This branch preparation was cancelled.".into());
+    }
     if branch.phase == Phase::Ready {
         return Ok(branch);
     }
@@ -307,7 +416,7 @@ fn activate(tx: &Transaction<'_>, operation: Uuid) -> Result<Branch> {
         approvals: vec![],
         output: None,
         checkpoint_pending: false,
-        checkpoint: Some(branch.checkpoint.clone()),
+        checkpoint: branch.point.checkpoint().cloned(),
         prompts: vec![],
     };
     branch.workspace.state = "ready".into();
@@ -322,4 +431,71 @@ fn activate(tx: &Transaction<'_>, operation: Uuid) -> Result<Branch> {
     )?;
     save(tx, &branch)?;
     Ok(branch)
+}
+
+/// Retain the cancelled lineage record; no new writer or generic recovery is offered.
+pub(crate) fn cancel(tx: &Transaction<'_>, operation: Uuid) -> Result<()> {
+    let Some(mut branch) = read(tx, operation)? else {
+        return Ok(());
+    };
+    if branch.phase == Phase::Cancelled {
+        return Ok(());
+    }
+    if branch.session_id.is_some() {
+        let catalog = crate::secret_store::catalog(tx)?;
+        if catalog.sealed.as_ref() != Some(&catalog.current) {
+            return Err("Confirm the saved fingerprints before completing cancellation.".into());
+        }
+    }
+    if let Some(raw) = tx
+        .query_row(
+            "SELECT record FROM workers WHERE track_id=?1",
+            [&branch.track_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        let mut worker: WorkerState = serde_json::from_str(&raw)?;
+        if worker.active_turn.is_some()
+            || worker.checkpoint_pending
+            || worker
+                .checkpoint
+                .as_ref()
+                .is_some_and(|point| point.sha != branch.point.sha())
+        {
+            return Err(
+                "The paired branch has work of its own. Review it before cancelling preparation."
+                    .into(),
+            );
+        }
+        worker.phase = "stopped".into();
+        tx.execute(
+            "UPDATE workers SET record=?2 WHERE track_id=?1",
+            params![branch.track_id, serde_json::to_string(&worker)?],
+        )?;
+    }
+    orphan_cancelled_inputs(tx, &branch.track_id)?;
+    branch.workspace.state = "cancelled".into();
+    branch.phase = Phase::Cancelled;
+    tx.execute(
+        "UPDATE workspaces SET record=?2 WHERE track_id=?1",
+        params![branch.track_id, serde_json::to_string(&branch.workspace)?],
+    )?;
+    tx.execute(
+        "UPDATE tracks SET status='stopped' WHERE id=?1",
+        [&branch.track_id],
+    )?;
+    save(tx, &branch)
+}
+pub(crate) fn cancelled_track(db: &Connection, track: &str) -> Result<bool> {
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM branches WHERE json_extract(record,'$.trackId')=?1 AND json_extract(record,'$.phase')='cancelled')",[track],|row|row.get(0))?)
+}
+
+pub(crate) const CANCELLED_DESTINATION: &str =
+    "The paired branch preparation was cancelled. Choose another destination.";
+
+/// Preserve words that were still being read, including a stale locked draft.
+pub(crate) fn orphan_cancelled_inputs(db: &Connection, track: &str) -> Result<()> {
+    db.execute("UPDATE utterances SET state='orphaned',revision=revision+1,reason=?2 WHERE state IN ('staged','reading','placed','held','asked') AND (json_extract(decision,'$.trackId')=?1 OR (decision IS NULL AND (provisional=?1 OR json_extract(target,'$.trackId')=?1)))",params![track,CANCELLED_DESTINATION])?;
+    Ok(())
 }

@@ -13,6 +13,8 @@ When a worker requests an operation such as `git push`, Intercat shows the comma
 
 You can open a completed step to inspect its tool output or file changes. Intercat saves events locally, so the track’s history is available after a worker reconnects. When you are ready to commit, the **Commit** sheet shows the last included step on each track, the proposed changes, and the checks. It lists external actions, such as a push that already ran, separately.
 
+After Commit, **Push** opens a review of the saved commit and its destinations. **Open PR** prepares a description locally for GitHub.com and lets you review the account, branches, and text before creating or updating a pull request. PRs use your selected GitHub CLI (`gh`) login. Multiple folders get separate PRs with related links.
+
 ## How the agents run
 
 The Editor uses Meta’s **Muse Glimmer** on the Mac through MLX to interpret instructions and help choose their destination. A Rust daemon schedules the work, communicates directly with **Muse Code** workers over MSP, and records their events in SQLite. Each worker gets its own Git worktree. Live workers use your Muse sign-in and send requests and project content to Meta.

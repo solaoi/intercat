@@ -16,9 +16,8 @@ use tokio::{
     sync::watch,
 };
 use uuid::Uuid;
-// File fixtures share this test process as their host identity. Serialize their
-// Git children so the restore guard does not observe another fixture's work.
-static FILE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[path = "../src/test_host.rs"]
+mod test_host;
 fn prompt() -> Value {
     json!({"sessionId":"session","userInputId":"prompt","turnId":"turn","itemId":"item","toolCallId":"tool-call","toolName":"request_user_input","viewCursor":"1","questions":[
         {"id":"one","header":"Choice","question":"Choose one","selection":{"mode":"single"},"options":[{"label":"First"},{"label":"Second"}]},
@@ -75,6 +74,7 @@ fn validates_all_questions_exact_labels_counts_and_unicode_lengths() -> Result<(
     Ok(())
 }
 struct Harness {
+    _host: test_host::IdleTestHost,
     _root: tempfile::TempDir,
     journal: Journal,
     port: Port,
@@ -83,6 +83,7 @@ struct Harness {
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<()>>,
     capacity: Arc<intercat_daemon::scheduler::Capacity>,
+    _admission: tokio::sync::SemaphorePermit<'static>,
 }
 
 #[tokio::test]
@@ -537,7 +538,6 @@ async fn a_stale_captured_stop_does_not_interrupt_a_newer_active_turn() -> Resul
 #[tokio::test]
 async fn deletion_permission_waits_for_a_durable_snapshot_and_manual_permission_recaptures()
 -> Result<()> {
-    let _guard = FILE_TEST_LOCK.lock().await;
     let mut h = Harness::build(true, None).await?;
     let path = h._root.path().canonicalize()?.join("worker");
     std::fs::write(path.join("keep"), "first edit\n")?;
@@ -614,11 +614,26 @@ async fn deletion_permission_waits_for_a_durable_snapshot_and_manual_permission_
 async fn approval_policy_is_saved_before_send_and_cannot_bypass_an_unsupported_action() -> Result<()>
 {
     use intercat_daemon::policy::Stops;
-    let mut h = Harness::new().await?;
+    // Stop targets the known active turn, including while the journal is locked.
+    // An idle fixture has no turn to interrupt.
+    let turn = Uuid::now_v7();
+    let mut h = Harness::build(
+        false,
+        Some(intercat_daemon::reconcile::State {
+            resume_turn: Some(turn),
+            ..Default::default()
+        }),
+    )
+    .await?;
+    let active_approval = |id: &str, argv: &[&str]| {
+        let mut value = approval(id, argv);
+        value["turnId"] = json!(turn);
+        value
+    };
     h.journal
         .set_stops(Uuid::now_v7(), Stops::EveryApproval)
         .await?;
-    let first = approval("one", &["node", "--test"]);
+    let first = active_approval("one", &["node", "--test"]);
     h.send(json!({"method":"approval/request","params":first}))
         .await?;
     for _ in 0..100 {
@@ -648,7 +663,10 @@ async fn approval_policy_is_saved_before_send_and_cannot_bypass_an_unsupported_a
         )
         .await
     });
-    let command = h.read().await?;
+    let command = h
+        .read()
+        .await
+        .map_err(|error| format!("first explicit approval: {error}"))?;
     assert_eq!(command["method"], "approval/decide");
     assert_eq!(command["params"]["choiceId"], "yes");
     assert_eq!(h.journal.operation(id).await?.unwrap()["state"], "prepared");
@@ -658,13 +676,16 @@ async fn approval_policy_is_saved_before_send_and_cannot_bypass_an_unsupported_a
     h.journal
         .set_stops(Uuid::now_v7(), Stops::IrreversibleOnly)
         .await?;
-    h.send(json!({"method":"approval/request","params":approval("two",&["node","--test"])}))
+    h.send(json!({"method":"approval/request","params":active_approval("two",&["node","--test"])}))
         .await?;
-    let command = h.read().await?;
+    let command = h
+        .read()
+        .await
+        .map_err(|error| format!("automatic approval: {error}"))?;
     assert_eq!(command["params"]["choiceId"], "yes");
     h.send(json!({"id":command["id"],"result":{"commandId":command["params"]["commandId"],"approvalId":command["params"]["approvalId"],"status":"accepted","terminal":true}})).await?;
 
-    let third = approval("three", &["crontab", "jobs.txt"]);
+    let third = active_approval("three", &["crontab", "jobs.txt"]);
     h.send(json!({"method":"approval/request","params":third}))
         .await?;
     for _ in 0..100 {
@@ -696,7 +717,10 @@ async fn approval_policy_is_saved_before_send_and_cannot_bypass_an_unsupported_a
         )
         .await
     });
-    let command = h.read().await?;
+    let command = h
+        .read()
+        .await
+        .map_err(|error| format!("unsupported-action denial: {error}"))?;
     assert_eq!(command["params"]["choiceId"], "no");
     h.send(json!({"id":command["id"],"result":{"commandId":command["params"]["commandId"],"approvalId":command["params"]["approvalId"],"status":"accepted","terminal":true}})).await?;
     answer.await??;
@@ -711,11 +735,18 @@ async fn approval_policy_is_saved_before_send_and_cannot_bypass_an_unsupported_a
         "every-approval"
     );
     db.execute_batch("BEGIN IMMEDIATE")?;
-    h.send(json!({"method":"approval/request","params":approval("four",&["node","--test"])}))
-        .await?;
+    h.send(
+        json!({"method":"approval/request","params":active_approval("four",&["node","--test"])}),
+    )
+    .await?;
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     h.port.stop(Uuid::now_v7())?;
-    assert_eq!(h.read().await?["method"], "turn/interrupt");
+    assert_eq!(
+        h.read()
+            .await
+            .map_err(|error| format!("Stop with locked journal: {error}"))?["method"],
+        "turn/interrupt"
+    );
     db.execute_batch("COMMIT")?;
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     while let Ok(buffer) =
@@ -736,6 +767,8 @@ impl Harness {
         with_files: bool,
         recovery: Option<intercat_daemon::reconcile::State>,
     ) -> Result<Self> {
+        let admission = test_host::FILE_FIXTURES.acquire().await?;
+        let host = test_host::IdleTestHost::new()?;
         let root = tempfile::tempdir()?;
         let path = if with_files {
             root.path().canonicalize()?.join("worker")
@@ -808,6 +841,7 @@ impl Harness {
         if with_files {
             journal
                 .workspace_result(intercat_daemon::preparation::Workspace {
+                    denied_roots: Vec::new(),
                     attachment_roots: Vec::new(),
                     track_id: track.clone(),
                     path: path.clone(),
@@ -839,7 +873,7 @@ impl Harness {
         let (port, commands) = Port::new(std::sync::Arc::new(
             intercat_daemon::dispatch_control::Gate::new(false),
         ));
-        port.attach(connection.client.clone(), "session".into());
+        port.attach(connection.client.clone(), "session".into(), None);
         let editor = Manager::new(root.path(), &root.path().join("editor.log"))?;
         let capacity = Arc::new(intercat_daemon::scheduler::Capacity::new(4));
         let mut context = Context {
@@ -851,8 +885,11 @@ impl Harness {
         };
         let (stop, mut stopped) = watch::channel(false);
         let record = journal.clone();
-        let identity = process::identity(std::process::id())?;
-        let tracker = Arc::new(Mutex::new(Tracker::new("question-test".into(), identity)?));
+        let identity = host.identity()?;
+        let tracker = Arc::new(Mutex::new(Tracker::new(
+            Uuid::now_v7().to_string(),
+            identity,
+        )?));
         let task = tokio::spawn(async move {
             let mut continuity = execution::Continuity::default();
             let result = execution::run(
@@ -876,6 +913,8 @@ impl Harness {
             settled
         });
         Ok(Self {
+            _admission: admission,
+            _host: host,
             _root: root,
             journal,
             port,
@@ -1031,7 +1070,6 @@ async fn partial_answers_stop_the_prompt_even_while_sqlite_is_locked() -> Result
 #[tokio::test]
 async fn a_persisted_unfinished_restore_holds_new_work_and_reuses_the_same_operation() -> Result<()>
 {
-    let _guard = FILE_TEST_LOCK.lock().await;
     let h = Harness::build(true, None).await?;
     let track = h.state().await?["trackId"].as_str().unwrap().to_owned();
     let workspace = h.journal.workspace(track.clone()).await?;
@@ -1181,7 +1219,6 @@ async fn secret_question(
 #[tokio::test]
 async fn secret_restart_waits_for_cancelled_turn_question_settlement_and_saved_files() -> Result<()>
 {
-    let _guard = FILE_TEST_LOCK.lock().await;
     let turn = Uuid::now_v7();
     let mut h = Harness::build(
         true,

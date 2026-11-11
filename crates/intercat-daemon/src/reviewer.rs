@@ -310,6 +310,7 @@ mod tests {
             let reference = format!("refs/intercat/dummy/checkpoints/{turn}");
             git(&path, &["update-ref", &reference, &sha]);
             let workspace = Workspace {
+                denied_roots: Vec::new(),
                 track_id: track.clone(),
                 path: path.canonicalize()?,
                 reference: "refs/intercat/dummy/tracks/A".into(),

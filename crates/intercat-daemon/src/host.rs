@@ -73,6 +73,7 @@ pub fn prepare_binary(source: &Path, data: &Path) -> Result<PathBuf> {
 }
 
 pub struct Host {
+    directory: PathBuf,
     pub connection: Connection,
     pub nonce: String,
     pub identity: process::Identity,
@@ -116,6 +117,10 @@ impl Profile {
 }
 
 impl Host {
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     /// Untrusted project mode is deliberate: the pinned host ignores hook policy in user settings.
     pub async fn spawn(
         binary: &Path,
@@ -158,7 +163,7 @@ impl Host {
                 filesystem.insert(host_dir.to_string_lossy().into_owned(), json!("deny"));
             }
             for denied in boundary.denied {
-                let denied = denied.canonicalize()?;
+                let denied = crate::physical_path::resolve(denied)?;
                 if workspace.starts_with(&denied) {
                     return Err("The worker workspace overlaps a denied source path.".into());
                 }
@@ -272,6 +277,7 @@ impl Host {
         // monitor terminates a host while its execution task awaits a write.
         let exit = tokio::spawn(async move { child.wait().await });
         Ok(Self {
+            directory: host_dir,
             connection,
             exit,
             nonce,
@@ -283,6 +289,47 @@ impl Host {
             _step_capture: boundary.steps,
         })
     }
+    /// Release an SDK session only after its matching completion receipt.
+    pub async fn release_session(&mut self, session: &str, stop_turn: bool) -> Result<()> {
+        let leave = uuid::Uuid::now_v7().to_string();
+        let accepted = self
+            .connection
+            .client
+            .request(
+                "session/leave",
+                json!({"commandId":leave,"sessionId":session,"stop":stop_turn}),
+            )
+            .await?;
+        if accepted["status"] != "accepted" {
+            return Err("The session could not be released.".into());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while let Some(event) = self.connection.next_event().await {
+                if let crate::msp::Event::Frame(frame) = event {
+                    let p = &frame.frame["params"];
+                    if frame.frame["method"] == "session/leaveCompleted"
+                        && p["commandId"] == leave
+                        && p["sessionId"] == session
+                    {
+                        return if p["outcome"] == "released" {
+                            Ok(())
+                        } else {
+                            Err("Session release failed.".into())
+                        };
+                    }
+                } else {
+                    break;
+                }
+            }
+            Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+                "The host closed before session release.".into(),
+            )
+        })
+        .await
+        .map_err(|_| "Session release timed out.")??;
+        Ok(())
+    }
+
     /// End one transport while retaining ownership of its surviving children.
     /// The next host inherits this tracker's identities and process groups.
     pub async fn retire(mut self) -> Result<Vec<crate::msp::Received>> {

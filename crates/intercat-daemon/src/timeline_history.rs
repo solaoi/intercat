@@ -116,7 +116,7 @@ pub(crate) fn abandon_redo(db: &Connection) -> Result<()> {
     db.execute("UPDATE operations SET payload=json_set(payload,'$.position','abandoned') WHERE kind IN ('timeline.edit','plan.edit') AND json_extract(payload,'$.session')=?1 AND json_extract(payload,'$.position')='undone'", [session(db)?])?;
     Ok(())
 }
-pub(crate) fn advance_lease_revision(db: &Connection, input: &str, before: i64) -> Result<()> {
+pub(crate) fn advance_revision(db: &Connection, input: &str, before: i64) -> Result<()> {
     db.execute("UPDATE operations SET payload=json_set(payload,'$.expectedRevision',?3) WHERE kind='timeline.edit' AND json_extract(payload,'$.session')=?1 AND json_extract(payload,'$.before.input')=?2 AND json_extract(payload,'$.expectedRevision')=?4 AND json_extract(payload,'$.position') IN ('applied','undone')", params![session(db)?, input, before + 1, before])?;
     Ok(())
 }
@@ -210,6 +210,7 @@ fn restore_frame(tx: &Transaction<'_>, frame: &Frame, revision: i64, held: bool)
         crate::inference_store::take_back(tx, &frame.input)?;
     }
     tx.execute("UPDATE utterances SET text=?2,target=?3,selected=?4,state=?5,revision=?6,decision=?7,reason=?8,provisional=?9,question_id=?10,question_revision=?11 WHERE id=?1", params![frame.input,frame.text,frame.target,frame.selected,state,revision,frame.decision,reason,frame.provisional,frame.question,frame.question_revision])?;
+    crate::fresh_words::restore(tx, &frame.input)?;
     crate::review_fix_store::history(tx, &frame.input, state)?;
     crate::start_condition::save(tx, &frame.input, &frame.start_condition)?;
     crate::request_graph::validate(tx)?;

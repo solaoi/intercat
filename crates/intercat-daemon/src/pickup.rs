@@ -99,98 +99,7 @@ fn save(tx: &Transaction<'_>, recovery: &Recovery) -> Result<()> {
     )?;
     Ok(())
 }
-fn local_context(
-    tx: &Transaction<'_>,
-    request: &Request,
-    previous: &WorkerState,
-    key: &crate::secrets::Key,
-) -> Result<Value> {
-    let unfinished = previous.active_turn.map(|t| t.to_string());
-    let item_bytes:i64=tx.query_row("SELECT coalesce(sum(length(i.record)),0) FROM timeline_items i JOIN timeline_clips c ON c.id=i.clip WHERE i.session=?1 AND (json_extract(i.record,'$.kind')='userMessage' OR (json_extract(i.record,'$.kind')='toolCall' AND json_extract(i.record,'$.status')<>'inProgress' AND json_extract(c.record,'$.turnId')=?2))",params![request.session_id,unfinished],|r|r.get(0))?;
-    let clip_bytes:i64=tx.query_row("SELECT coalesce(sum(length(i.summary)),0) FROM timeline_items i WHERE i.clip IN (SELECT id FROM timeline_clips WHERE track=?1 AND json_extract(record,'$.sessionId')=?2 AND json_extract(record,'$.repairRunId') IS NULL ORDER BY ordinal DESC LIMIT 3)",params![request.track_id,request.session_id],|r|r.get(0))?;
-    let question_bytes:i64=tx.query_row("SELECT coalesce(sum(length(record)),0) FROM report_questions WHERE track_id=?1 AND json_extract(record,'$.sessionId')=?2 AND state IN ('open','queued','held')",params![request.track_id,request.session_id],|r|r.get(0))?;
-    if item_bytes
-        + clip_bytes
-        + question_bytes
-        + previous.output.as_ref().map_or(0, |t| t.len() as i64)
-        > crate::handoff::CONTEXT_BYTES as i64
-    {
-        return Err(
-            "The local history exceeds the protected summary input limit. It remains held.".into(),
-        );
-    }
-    let mut clips = Vec::new();
-    let mut query = tx.prepare("SELECT id,record FROM timeline_clips WHERE track=?1 AND json_extract(record,'$.sessionId')=?2 AND json_extract(record,'$.repairRunId') IS NULL ORDER BY ordinal DESC LIMIT 3")?;
-    for row in query.query_map(params![request.track_id, request.session_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })? {
-        let (id, record) = row?;
-        let mut items =
-            tx.prepare("SELECT summary FROM timeline_items WHERE clip=?1 ORDER BY rowid")?;
-        let items = items
-            .query_map([&id], |r| r.get::<_, String>(0))?
-            .map(|r| Ok(serde_json::from_str::<Value>(&r?)?))
-            .collect::<Result<Vec<_>>>()?;
-        clips.push(
-            json!({"address":id,"clip":serde_json::from_str::<Value>(&record)?,"items":items}),
-        );
-    }
-    clips.reverse();
-    let mut query=tx.prepare("SELECT i.record,c.id,c.record FROM timeline_items i JOIN timeline_clips c ON c.id=i.clip WHERE i.session=?1 AND (json_extract(i.record,'$.kind')='userMessage' OR (json_extract(i.record,'$.kind')='toolCall' AND json_extract(i.record,'$.status')<>'inProgress' AND json_extract(c.record,'$.turnId')=?2)) ORDER BY i.rowid")?;
-    let mut instructions = Vec::new();
-    let mut completed_tools = Vec::new();
-    for row in query.query_map(params![request.session_id, unfinished], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })? {
-        let (item, address, clip) = row?;
-        let item: Value = serde_json::from_str(&item)?;
-        if item["kind"] == "userMessage" {
-            instructions.push(json!({"address":address,"message":item}));
-        } else if item["kind"] == "toolCall"
-            && item["status"] != "inProgress"
-            && previous.active_turn.is_some_and(|turn| {
-                serde_json::from_str::<Value>(&clip)
-                    .is_ok_and(|clip| clip["turnId"] == turn.to_string())
-            })
-        {
-            completed_tools.push(json!({"address":address,"tool":item}));
-        }
-    }
-    let title: String = tx.query_row(
-        "SELECT title FROM tracks WHERE id=?1",
-        [&request.track_id],
-        |r| r.get(0),
-    )?;
-    let mut questions=tx.prepare("SELECT record FROM report_questions WHERE track_id=?1 AND json_extract(record,'$.sessionId')=?2 AND state IN ('open','queued','held') ORDER BY rowid")?;
-    let questions = questions
-        .query_map(params![request.track_id, request.session_id], |r| {
-            r.get::<_, String>(0)
-        })?
-        .map(|r| Ok(serde_json::from_str::<Value>(&r?)?))
-        .collect::<Result<Vec<_>>>()?;
-    let mut value = json!({"purpose":title,"instructions":instructions,"lastClips":clips,"unfinishedTurn":previous.active_turn,"completedTools":completed_tools,"lastReport":previous.output,"unresolvedQuestions":questions,"unverified":"The previous turn did not finish. Inspect the current files before continuing. Unanswered questions must remain unresolved until the user answers them."});
-    key.mask(crate::secret_store::read(
-        tx,
-        &request.track_id,
-        &request.session_id,
-    )?)?
-    .redact_value(&mut value)?;
-    if value.get("_intercatTruncated").is_some() {
-        return Err(
-            "A protected history field is too large to summarize without losing evidence.".into(),
-        );
-    }
-    if serde_json::to_vec(&value)?.len() > crate::handoff::CONTEXT_BYTES {
-        return Err(
-            "The local history exceeds the protected summary input limit. It remains held.".into(),
-        );
-    }
-    Ok(value)
-}
+
 fn prepare(tx: &Transaction<'_>, request: Request, key: &crate::secrets::Key) -> Result<Recovery> {
     if request.op_id.get_version_num() != 7 {
         return Err("Recovery needs a new operation ID.".into());
@@ -212,11 +121,24 @@ fn prepare(tx: &Transaction<'_>, request: Request, key: &crate::secrets::Key) ->
         return Err("Confirm the saved fingerprints before file recovery.".into());
     }
     let (previous, workspace) = interrupted(tx, &request)?;
-    let context = local_context(tx, &request, &previous, key)?;
+    let context = crate::handoff_context::capture(
+        tx,
+        &crate::handoff::Identity {
+            track_id: request.track_id.clone(),
+            session_id: request.session_id.clone(),
+        },
+        crate::handoff_context::Boundary::Interrupted,
+        &previous,
+        key,
+    )?;
     let recovery = reserve(tx, request, previous, workspace, context, Phase::Stopping)?;
     Ok(recovery)
 }
 fn interrupted(tx: &Transaction<'_>, request: &Request) -> Result<(WorkerState, Workspace)> {
+    crate::continuation::ensure_writer(tx, &request.track_id)?;
+    if crate::fresh_store::holds(tx, &request.track_id)? {
+        return Err("Cancel Start fresh before picking up this workspace.".into());
+    }
     let mut previous: WorkerState = serde_json::from_str(&tx.query_row(
         "SELECT record FROM workers WHERE track_id=?1",
         [&request.track_id],
@@ -433,7 +355,16 @@ pub fn change(db: &mut Connection, change: Change, key: &crate::secrets::Key) ->
             }
             let mut context_state = recovery.previous.clone();
             context_state.output = current.output;
-            recovery.context = local_context(&tx, &recovery.request, &context_state, key)?;
+            recovery.context = crate::handoff_context::capture(
+                &tx,
+                &crate::handoff::Identity {
+                    track_id: recovery.request.track_id.clone(),
+                    session_id: recovery.request.session_id.clone(),
+                },
+                crate::handoff_context::Boundary::Interrupted,
+                &context_state,
+                key,
+            )?;
             recovery.previous.checkpoint = current.checkpoint;
             crate::attachment_history::freeze(&tx, id, &recovery.request.session_id, None)?;
             recovery.phase = Phase::Capturing;

@@ -41,7 +41,7 @@ fn repair_question(tx: &Transaction<'_>, target: &Target) -> Result<Run> {
     let Owner::Repair { run_id } = target.owner else {
         return Err("Expected a repair destination.".into());
     };
-    let (run, _, _) = crate::repair_run_store::input(tx, run_id)?;
+    let (run, _) = crate::repair_run_store::source(tx, run_id)?;
     let question_matches = match &target.question {
         Question::Report { id, revision } => {
             id == &run_id.to_string()
@@ -106,7 +106,7 @@ pub fn queue_repair(
     let mut run = if let (Owner::Repair { run_id }, Question::Msp { .. }) =
         (&target.owner, &target.question)
     {
-        let (run, _, _) = crate::repair_run_store::input(&tx, *run_id)?;
+        let (run, _) = crate::repair_run_store::source(&tx, *run_id)?;
         if run.phase != Phase::Held
             || run.host.is_some()
             || run.secret_input != Some(target.op_id)

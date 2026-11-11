@@ -4,45 +4,7 @@ use crate::{
     privacy::{Part, View},
 };
 use base64::Engine;
-use std::{
-    ffi::CString,
-    fs::File,
-    io::Read,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{
-            ffi::OsStrExt,
-            fs::{MetadataExt, PermissionsExt},
-        },
-    },
-    path::Path,
-};
-
-fn owned(file: &File, directory: bool) -> Result<()> {
-    let metadata = file.metadata()?;
-    if metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o077 != 0
-        || (directory && !metadata.is_dir())
-        || (!directory && (!metadata.is_file() || metadata.nlink() != 1))
-    {
-        return Err("Unsafe privacy preview input.".into());
-    }
-    Ok(())
-}
-fn open_at(directory: &File, name: &str, flags: i32) -> Result<File> {
-    let name = CString::new(name)?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
+use std::path::Path;
 pub(crate) fn read(root: &Path, id: &str) -> Result<Vec<String>> {
     if id.len() != 11
         || !id.starts_with("view-")
@@ -50,30 +12,7 @@ pub(crate) fn read(root: &Path, id: &str) -> Result<Vec<String>> {
     {
         return Err("Invalid privacy preview identifier.".into());
     }
-    let path = CString::new(root.as_os_str().as_bytes())?;
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let parent = unsafe { File::from_raw_fd(fd) };
-    owned(&parent, true)?;
-    let directory = open_at(&parent, id, libc::O_RDONLY | libc::O_DIRECTORY)?;
-    owned(&directory, true)?;
-    let file = open_at(&directory, "input.json", libc::O_RDONLY | libc::O_NONBLOCK)?;
-    owned(&file, false)?;
-    if file.metadata()?.len() > 16 * 1024 * 1024 {
-        return Err("Privacy preview file is too large.".into());
-    }
-    let mut bytes = Vec::new();
-    file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > 16 * 1024 * 1024 {
-        return Err("Privacy preview file is too large.".into());
-    }
+    let bytes = crate::private_input::read(root, &[id, "input.json"], 16 * 1024 * 1024)?;
     let texts: Vec<String> =
         serde_json::from_slice(&bytes).map_err(|_| "Invalid privacy preview file.")?;
     if texts.len() > 64

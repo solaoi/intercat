@@ -129,7 +129,9 @@ pub(crate) fn combine(repo: &Repository, source: &Source) -> Result<(String, Bas
         .first()
         .ok_or("Missing inherited checkpoint.")?;
     let mut desired = Default::default();
+    let mut parents = crate::lineage::Ancestors::new();
     for point in &source.dependencies.points {
+        crate::lineage::include(&mut parents, &point.track, &point.inherited())?;
         if source.graph.by_sha(&point.track, &point.sha)? != point {
             return Err("The saved dependency checkpoint changed.".into());
         }
@@ -137,14 +139,27 @@ pub(crate) fn combine(repo: &Repository, source: &Source) -> Result<(String, Bas
     }
     let mut covered = Default::default();
     source.graph.incorporate(&mut covered, first)?;
+    let views = crate::lineage::view::merge(
+        source
+            .dependencies
+            .points
+            .iter()
+            .map(|point| point.views.clone()),
+    )?;
     let recipe = Basis {
+        views: views.clone(),
+        parents: parents.clone(),
         base: first.sha.clone(),
         base_inherits: covered,
         inherits: desired.clone(),
     };
-    let tree = match source.graph.baseline(repo, &recipe, &desired)? {
+    let tree = match source.graph.baseline(
+        &mut crate::merge_choices::Merges::new(repo, &[])?,
+        &recipe,
+        &desired,
+    )? {
         Merge::Clean(tree) => tree,
-        Merge::Conflicts(paths) => {
+        Merge::Conflicts { paths, .. } => {
             return Err(crate::inheritance_issue::Blocker::Conflict {
                 paths: paths.iter().map(ToString::to_string).collect(),
                 base: false,
@@ -163,7 +178,9 @@ pub(crate) fn combine(repo: &Repository, source: &Source) -> Result<(String, Bas
     };
     repo.sync_objects(&[head])?;
     let mut basis = first.basis();
+    basis.views = views;
     basis.inherits = desired;
+    basis.parents = parents;
     Ok((head.to_string(), basis))
 }
 
@@ -489,6 +506,159 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn new_inheritance_retains_shared_views_for_later_baselines_and_target_deletions() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        Repository::init_isolated(root.path())?;
+        let repo = Repository::open(root.path())?;
+        let base = repo.empty_starting_point()?;
+        let tree = |files: &[(&str, &str)]| -> Result<intercat_git::ObjectId> {
+            repo.write_tree(
+                &files
+                    .iter()
+                    .map(|(name, text)| Ok((*name, repo.write_blob(text.as_bytes())?)))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
+        let saved = |track: &str,
+                     number: u64,
+                     files: &[(&str, &str)],
+                     parents: &[&Point]|
+         -> Result<Point> {
+            let mut inherits = crate::lineage::Ancestors::new();
+            for parent in parents {
+                for (t, m) in &parent.inherits {
+                    crate::lineage::include(&mut inherits, t, m)?;
+                }
+                crate::lineage::include(&mut inherits, &parent.track, &parent.inherited())?;
+            }
+            Ok(Point {
+                views: vec![],
+                track: track.into(),
+                number,
+                sha: repo
+                    .checkpoint_commit(tree(files)?, base, "Own inheritance context")?
+                    .to_string(),
+                base_at: base.to_string(),
+                base_inherits_at: Default::default(),
+                parents: parents
+                    .iter()
+                    .map(|p| (p.track.clone(), p.inherited()))
+                    .collect(),
+                inherits,
+            })
+        };
+        let a1 = saved("A", 1, &[("shared-a", "A fork")], &[])?;
+        let a3 = saved(
+            "A",
+            3,
+            &[("shared-a", "A fork"), ("retired-a", "A later")],
+            &[],
+        )?;
+        let alt = saved(
+            "A-alt",
+            1,
+            &[("shared-a", "A fork"), ("chosen-a", "A choice")],
+            &[&a1],
+        )?;
+        let b = saved(
+            "B",
+            1,
+            &[
+                ("shared-a", "A fork"),
+                ("retired-a", "A later"),
+                ("shared-b", "B fork"),
+            ],
+            &[&a3],
+        )?;
+        let mut graph = Frozen {
+            points: vec![a1, a3.clone(), alt.clone(), b.clone()],
+            integrated: Default::default(),
+        };
+        let crate::shared_context::Outcome::View(view) = crate::shared_context::project(
+            &repo,
+            &graph,
+            &crate::shared_context::Projection {
+                source: b.clone(),
+                previous: None,
+                from: a3.clone(),
+                onto: alt.clone(),
+                views: vec![],
+            },
+            &[],
+        )?
+        else {
+            panic!("Shared B should normalize cleanly");
+        };
+        let mut child = saved(
+            "B-alt",
+            2,
+            &[
+                ("shared-a", "A fork"),
+                ("chosen-a", "A choice"),
+                ("shared-b", "B fork"),
+                ("chosen-b", "B choice"),
+            ],
+            &[&b],
+        )?;
+        child.views = vec![*view.clone()];
+        child.inherits = view.origin.inherits.clone();
+        crate::lineage::include(&mut child.inherits, "B", &b.inherited())?;
+        child.base_at = view.origin.base.clone();
+        child.base_inherits_at = view.origin.base_inherits.clone();
+        let independent = saved("X", 1, &[("independent", "X own")], &[])?;
+        graph.points.extend([child.clone(), independent.clone()]);
+        let source = Source {
+            dependencies: Dependencies {
+                input: "own context inheritance".into(),
+                track: "C".into(),
+                points: vec![child.clone(), independent.clone()],
+            },
+            graph,
+        };
+        let (head, basis) = combine(&repo, &source)?;
+        assert_eq!(basis.views, child.views);
+        let files = repo.saved_files(head.parse()?)?;
+        assert!(!files.contains_key("retired-a"));
+        assert!(files.contains_key("shared-b"));
+        assert!(files.contains_key("independent"));
+        let mut coverage = crate::lineage::Ancestors::new();
+        source.graph.incorporate(&mut coverage, &child)?;
+        source.graph.incorporate(&mut coverage, &independent)?;
+        let mut merges = crate::merge_choices::Merges::new(&repo, &[])?;
+        let Merge::Clean(baseline) = source.graph.baseline(&mut merges, &basis, &coverage)? else {
+            panic!("C's baseline must retain the projected shared source");
+        };
+        assert!(!repo.tree_files(baseline)?.contains_key("retired-a"));
+        let target = tree(&[
+            ("shared-a", "A fork"),
+            ("chosen-a", "A choice"),
+            ("chosen-b", "B choice"),
+            ("independent", "X own"),
+            ("retired-a", "Own later unrelated file"),
+        ])?;
+        let incoming = tree(&[
+            ("shared-a", "A fork"),
+            ("chosen-a", "A choice"),
+            ("shared-b", "B fork"),
+            ("chosen-b", "B choice"),
+            ("independent", "X own"),
+            ("own-c", "C pending"),
+        ])?;
+        let Merge::Clean(result) = repo.merge_trees(baseline, target, incoming)? else {
+            panic!("A normalized inherited baseline must preserve the later target edit");
+        };
+        let files = repo.tree_files(result)?;
+        assert!(!files.contains_key("shared-b"));
+        assert!(files.contains_key("own-c"));
+        assert_eq!(
+            repo.saved_bytes(&files["retired-a"])?,
+            b"Own later unrelated file"
+        );
+        Ok(())
+    }
+
     fn point(repo: &Repository, root: &str, track: &str, value: &str) -> Result<Point> {
         let blob = repo.write_blob(value.as_bytes())?;
         let tree = repo.write_tree(&[("same.txt", blob)])?;
@@ -496,6 +666,8 @@ mod tests {
             .checkpoint_commit(tree, root.parse()?, track)?
             .to_string();
         Ok(Point {
+            views: Vec::new(),
+            parents: Default::default(),
             track: track.into(),
             number: 1,
             sha,
@@ -645,6 +817,11 @@ mod tests {
                 crate::lineage::include(&mut inherits, &parent.track, &parent.inherited())?;
             }
             Ok(Point {
+                views: Vec::new(),
+                parents: parents
+                    .iter()
+                    .map(|point| (point.track.clone(), point.inherited()))
+                    .collect(),
                 track: track.into(),
                 number,
                 sha,
@@ -673,6 +850,14 @@ mod tests {
         assert!(!files.contains_key("f"));
         assert!(files.contains_key("b") && files.contains_key("c"));
         assert_eq!(basis.inherits["A"], a2.inherited());
+        assert_eq!(
+            basis.parents.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["B", "C"]
+        );
+        assert_eq!(
+            source.graph.inherited_from(&basis.parents, &basis.views)?,
+            basis.inherits
+        );
         Ok(())
     }
 }

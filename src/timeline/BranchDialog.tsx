@@ -1,13 +1,16 @@
 import { useContext, useEffect, useRef, useState } from 'react';
-import type { BranchPoint, BranchRequest, BranchState, LiveTrack } from '../bridge';
-import { AttentionActive } from '../desk/NeedsYou';
-import { usePrivacyLabels } from '../desk/PrivacyText';
+import type { BranchPoint, BranchRequest, BranchState, DaemonStatus, LiveTrack } from '../bridge';
+import { AttentionActive, type AttentionCard } from '../desk/NeedsYou';
+import { PrivacyText, usePrivacyLabels } from '../desk/PrivacyText';
 import './branch.css';
+import type { BranchPreview } from './branchPointLayout';
 
 export interface BranchSelection { operationId: string; trackId: string | null; at: number | null }
 
-export function BranchDialog({ selection, tracks, connected, blockedReason, close, created }: {
+export function BranchDialog({ selection, tracks, sourcePaths, connected, blockedReason, close, created, previewChanged }: {
   selection: BranchSelection; tracks: LiveTrack[]; connected: boolean; blockedReason: string | null;
+  sourcePaths: Record<string, string>;
+  previewChanged: (preview: BranchPreview | null) => void;
   close: () => void; created: (branch: BranchState) => void;
 }) {
   const label = usePrivacyLabels(tracks.map(track => track.title));
@@ -21,9 +24,13 @@ export function BranchDialog({ selection, tracks, connected, blockedReason, clos
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<BranchRequest | null>(null);
+  const [instructions, setInstructions] = useState<BranchRequest['instructions']>('current');
   const mounted = useRef(true);
   const track = tracks.find(track => track.id === trackId);
   const point = points.find(point => point.id === pointId);
+
+  useEffect(() => { previewChanged({ trackId, points, selectedTurnId: point?.turnId ?? null }); }, [previewChanged, trackId, points, point?.turnId]);
+  useEffect(() => () => previewChanged(null), [previewChanged]);
 
   useEffect(() => {
     mounted.current = true;
@@ -34,7 +41,8 @@ export function BranchDialog({ selection, tracks, connected, blockedReason, clos
     if (!query.trackId || !connected) { setLoading(false); return; }
     let disposed = false;
     setLoading(true); setError('');
-    void window.intercat.getBranchPoints({ trackId: query.trackId, before: query.before }).then(page => {
+    void window.intercat.getBranchPoints({ trackId: query.trackId, before: query.before,
+      range: selection.at === null ? null : { start: 0, end: selection.at } }).then(page => {
       if (disposed) return;
       setPoints(previous => query.before === null ? page.points : [...previous, ...page.points.filter(point => !previous.some(old => old.id === point.id))]);
       setBefore(page.before);
@@ -48,8 +56,8 @@ export function BranchDialog({ selection, tracks, connected, blockedReason, clos
   }, [query, connected, selection.at]);
 
   async function branch() {
-    if (!track || !point?.available || !connected || blockedReason || busy) return;
-    const request = pending ?? { opId: selection.operationId, parentTrackId: trackId, turnId: point.turnId };
+    if (!track || !point?.available || !connected || blockedReason || busy || instructions === 'current' && !sourcePaths[trackId]) return;
+    const request = pending ?? { opId: selection.operationId, parentTrackId: trackId, point: {kind: 'turn' as const, turnId: point.turnId}, instructions };
     setPending(request); setBusy(true); setError('');
     try {
       const result = await window.intercat.branchFromCheckpoint(request);
@@ -75,7 +83,7 @@ export function BranchDialog({ selection, tracks, connected, blockedReason, clos
         {points.map(candidate => <label key={candidate.id} className={candidate.available ? '' : 'unavailable'}>
           <input type="radio" name="branch-point" checked={pointId === candidate.id} disabled={!candidate.available} onChange={() => setPoint(candidate.id)} />
           <span><strong>{candidate.endedAt === null ? 'Saved turn · time unavailable' : new Date(candidate.endedAt).toLocaleString()}</strong>
-            <small>End of {track?.label ?? 'this worker'}’s turn · {candidate.checkpoint.slice(0, 10)}{candidate.shellWasRunning ? ' · shell was running' : ''}</small>
+            <small>End of {track?.label ?? 'this worker'}’s turn {candidate.turnNumber} · {candidate.checkpoint.slice(0, 10)}{candidate.shellWasRunning ? ' · shell was running' : ''}</small>
             {!candidate.available && <small>This checkpoint is not available for branching.</small>}
           </span>
         </label>)}
@@ -84,11 +92,15 @@ export function BranchDialog({ selection, tracks, connected, blockedReason, clos
       {loading && <p role="status">Loading saved turns…</p>}
       {!connected && <p>Reconnect to load saved turns.</p>}
       {before !== null && <button disabled={loading || !!pending} onClick={() => setQuery({ trackId, before, attempt: query.attempt + 1 })}>Load older turns</button>}
-      <p className="branch-scope">Covers: tracked, untracked · not: ignored.<br />Uses instructions saved at the checkpoint. Keeps the original track. Effects outside Git stay as they are.</p>
+      <label>Instructions<select aria-label="Branch instructions" value={instructions} disabled={!!pending || busy} onChange={event => setInstructions(event.target.value as BranchRequest['instructions'])}>
+        <option value="current">Current project files</option><option value="checkpoint">As of the checkpoint</option>
+      </select></label>
+      {instructions === 'current' && trackId && <p className="branch-instruction-source">{sourcePaths[trackId] ? <>Current instructions from <PrivacyText text={sourcePaths[trackId]} /></> : 'Project folder unavailable. Reconnect before using current instructions.'}</p>}
+      <p className="branch-scope">Covers: tracked, untracked · not: ignored.<br />{instructions === 'current' ? 'Copies the current instruction files into the branch, including additions, changes and removals.' : 'Uses instructions saved at the checkpoint.'} Keeps the original track. Effects outside Git stay as they are.</p>
       {blockedReason && <p>{blockedReason}</p>}
       {error && <div className="branch-error" role="alert"><p>{error}</p>{!pending && <button disabled={loading} onClick={() => setQuery(previous => ({ ...previous, attempt: previous.attempt + 1 }))}>Retry loading turns</button>}</div>}
     </div>
-    <footer><span>{point ? `Branch from ${point.endedAt === null ? point.checkpoint.slice(0, 10) : new Date(point.endedAt).toLocaleString()}` : 'Choose a saved turn'}</span><button disabled={busy || loading || !connected || !!blockedReason || !track || !point?.available} onClick={() => { void branch(); }}>{busy ? 'Preparing branch…' : pending ? 'Retry branch' : 'Branch from here'}</button></footer>
+    <footer><span>{point ? `Branch from ${point.endedAt === null ? point.checkpoint.slice(0, 10) : new Date(point.endedAt).toLocaleString()} · end of ${track?.label ?? 'this worker'}’s turn ${point.turnNumber}` : 'Choose a saved turn'}</span><button disabled={busy || loading || !connected || !!blockedReason || !track || !point?.available || instructions === 'current' && !sourcePaths[trackId]} onClick={() => { void branch(); }}>{busy ? 'Preparing branch…' : pending ? 'Retry branch' : 'Branch from here'}</button></footer>
   </dialog>;
 }
 
@@ -112,4 +124,18 @@ export function BranchRecovery({ branch, connected, created }: { branch: BranchS
       finally { if (mounted.current) setBusy(false); }
     }}>{busy ? 'Preparing…' : 'Retry branch preparation'}</button></div>
   </div>;
+}
+
+export function branchInstructionCards(status: DaemonStatus): AttentionCard[] {
+  return (status.branches ?? []).filter(branch => branch.phase === 'ready' && branch.instructions?.changed.length
+    && status.workers?.some(worker => worker.trackId === branch.trackId && (branch.point.kind === 'initial' ? !worker.checkpoint : worker.checkpoint?.turnId === branch.point.checkpoint.turnId)))
+    .map(branch => {
+      const label = status.tracks?.find(track => track.id === branch.trackId)?.label;
+      return { id: `branch-instructions-${branch.request.opId}`, version: branch.instructions!.sha,
+      destination: label ? { trackId: branch.trackId, label } : undefined,
+      kind: 'assumption', title: 'instructions updated', content: <div className="desk-card"><div className="desk-copy">
+        <strong>{label && `Worker ${label} · `}instructions updated</strong><p>The branch uses the current project instruction files. These changes will be included after its first turn finishes.</p>
+        <p><PrivacyText text={branch.instructions!.changed.join(' · ')} /></p>
+      </div></div> };
+    });
 }

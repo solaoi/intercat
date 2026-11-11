@@ -141,7 +141,27 @@ async fn all_background_tracks_share_one_request_and_keep_their_own_questions() 
         .into_iter()
         .filter(|value| value["priority"] == "background")
         .collect();
-    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls.len(),
+        1,
+        "priorities={:?}; question kinds={:?}; editor log={}",
+        requests(directory.path())
+            .iter()
+            .map(|call| call["priority"].clone())
+            .collect::<Vec<_>>(),
+        snapshot["reportQuestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|question| question["kind"].clone())
+            .collect::<Vec<_>>(),
+        fs::read_to_string(directory.path().join("editor.log"))
+            .unwrap_or_default()
+            .chars()
+            .take(2000)
+            .collect::<String>()
+    );
+
     assert_eq!(calls[0]["stages"].as_array().unwrap().len(), 9);
     assert_eq!(snapshot["reportQuestions"].as_array().unwrap().len(), 3);
     assert!(

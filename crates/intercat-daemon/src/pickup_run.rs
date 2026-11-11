@@ -87,9 +87,13 @@ pub async fn prepare(
             .checkpoint
             .as_ref()
             .map_or(&recovery.workspace.base, |c| &c.sha);
-        let captured =
-            crate::checkpoint::capture(&recovery.workspace, parent, "Intercat file recovery")
-                .await?;
+        let captured = crate::checkpoint::capture(
+            &recovery.workspace,
+            parent,
+            "Intercat file recovery",
+            journal,
+        )
+        .await?;
         let checkpoint = crate::checkpoint::Checkpoint {
             turn_id: Uuid::new_v5(&recovery.request.op_id, b"recovery-snapshot"),
             sha: captured.sha,
@@ -158,23 +162,26 @@ pub async fn prepare(
             Ok(json!({"address":snapshot.reference,"changes":changes,"unmergedPaths":snapshot.unmerged_paths}))
         }).await??;
         source.context["snapshotChanges"] = changes;
-        let mut summary = crate::handoff_run::run(
+        let summary = crate::handoff_run::run(
             host_memory.clone(),
             journal,
             &config,
             data,
             rpc,
-            &source,
+            &crate::handoff::Source {
+                id: source.request.op_id,
+                identity: crate::handoff::Identity {
+                    track_id: source.request.track_id.clone(),
+                    session_id: source.request.session_id.clone(),
+                },
+                context: source.context,
+            },
             capacity,
+            crate::msp::StartGuard::Shutdown(stopping.clone()),
             stopping.clone(),
         )
         .await?;
         check(&stopping)?;
-        summary
-            .source_addresses
-            .push(recovery.snapshot.as_ref().unwrap().reference.clone());
-        summary.source_addresses.sort();
-        summary.source_addresses.dedup();
         recovery = journal
             .pickup(Change::Summarized(recovery.request.op_id, summary))
             .await?;
@@ -224,7 +231,7 @@ pub async fn prepare(
             journal.intent(&recovery.start_command.to_string(),"session/start",params.clone()).await?;
             let opened=host.connection.client.request("session/start",params).await?;
             if opened["session"]["sessionId"]!=recovery.session_id || opened["session"]["permissionState"]["profileId"]!="intercat-worker" {return Err("The recovery host returned a different session or permission profile.".into());}
-            release_new_session(&mut host,&recovery.session_id).await?;
+            host.release_session(&recovery.session_id, true).await?;
             Ok::<_,Box<dyn std::error::Error+Send+Sync>>(())
             } => result,
             }
@@ -273,44 +280,4 @@ pub async fn verify_snapshot(recovery: &Recovery) -> Result<()> {
         Ok(())
     })
     .await?
-}
-
-pub(crate) async fn release_new_session(host: &mut host::Host, session: &str) -> Result<()> {
-    let leave = Uuid::now_v7().to_string();
-    let accepted = host
-        .connection
-        .client
-        .request(
-            "session/leave",
-            json!({"commandId":leave,"sessionId":session,"stop":true}),
-        )
-        .await?;
-    if accepted["status"] != "accepted" {
-        return Err("The recovery session could not be released.".into());
-    }
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while let Some(event) = host.connection.next_event().await {
-            if let crate::msp::Event::Frame(frame) = event {
-                let p = &frame.frame["params"];
-                if frame.frame["method"] == "session/leaveCompleted"
-                    && p["commandId"] == leave
-                    && p["sessionId"] == session
-                {
-                    return if p["outcome"] == "released" {
-                        Ok(())
-                    } else {
-                        Err("Recovery session release failed.".into())
-                    };
-                }
-            } else {
-                break;
-            }
-        }
-        Err::<(), Box<dyn std::error::Error + Send + Sync>>(
-            "The recovery host closed before session release.".into(),
-        )
-    })
-    .await
-    .map_err(|_| "Recovery session release timed out.")??;
-    Ok(())
 }

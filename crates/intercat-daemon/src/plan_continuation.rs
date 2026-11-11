@@ -35,13 +35,14 @@ pub(crate) fn retry(
     if !retryable(db, plan, item)? {
         return Err("Retry needs a saved failed result and no pending continuation.".into());
     }
+    let destination = crate::continuation::current(db, &item.track_ref)?;
     let input = Uuid::new_v5(&operation, b"retry-plan-item");
     crate::journal::insert_utterance(
         db,
         &input.to_string(),
         "Continue this plan item from its saved work. Address the remaining failure and satisfy its done condition. Keep the language of the original user request in your report; do not switch languages to match these internal retry instructions.",
-        &crate::decision::Target::Lock(item.track_ref.clone()),
-        Some(&item.track_ref),
+        &crate::decision::Target::Lock(destination.clone()),
+        Some(&destination),
         &plan
             .attachments
             .iter()
@@ -71,8 +72,9 @@ pub(crate) fn validate_context(
         .iter()
         .find(|item| item.plan_item_id == context.item_id)
         .ok_or("The plan item is unavailable.")?;
+    let destination = crate::continuation::current(db, &item.track_ref)?;
     if !execute_allowed
-        || !matches!(target, crate::decision::Target::Lock(track) if track == &item.track_ref)
+        || !matches!(target, crate::decision::Target::Lock(track) if track == &destination)
         || !allowed(db, &plan, item)?
     {
         return Err("This request must keep the selected plan item and its worker.".into());
@@ -130,7 +132,7 @@ pub(crate) fn attach(db: &Connection, input: &str, plan_id: Uuid, item_id: Uuid)
         "SELECT json_extract(target,'$.trackId') FROM utterances WHERE id=?1 AND json_extract(target,'$.mode')='lock'",
         [input], |row| row.get(0),
     )?;
-    if track.as_deref() != Some(&item.track_ref) {
+    if track.as_deref() != Some(&crate::continuation::current(db, &item.track_ref)?) {
         return Err("The continuation must keep the plan item's track.".into());
     }
     db.execute(
@@ -192,7 +194,7 @@ pub(crate) fn input_allowed(
          AND json_extract(target,'$.mode')='lock' AND json_extract(target,'$.trackId')=?2
          AND json_extract(decision,'$.trackId')=?2
          AND json_extract(decision,'$.kind') IN ('extend','schedule','trim'))",
-            params![input, item.track_ref],
+            params![input, crate::continuation::current(db, &item.track_ref)?],
             |row| row.get::<_, bool>(0),
         )?)
 }

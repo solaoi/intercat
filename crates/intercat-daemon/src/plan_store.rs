@@ -14,11 +14,12 @@ const AVAILABLE_TRACKS: &str = "SELECT t.id FROM tracks t WHERE t.status<>'lost'
       AND json_extract(w.record,'$.phase') IN ('lost','needs-recovery'))";
 
 pub(crate) fn track_available(db: &Connection, track: &str) -> Result<bool> {
-    Ok(db.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM ({AVAILABLE_TRACKS}) WHERE id=?1)"),
-        [track],
-        |row| row.get(0),
-    )?)
+    Ok(!crate::continuation::closed(db, track)?
+        && db.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM ({AVAILABLE_TRACKS}) WHERE id=?1)"),
+            [track],
+            |row| row.get(0),
+        )?)
 }
 
 pub(crate) fn install(db: &Connection) -> Result<()> {
@@ -51,6 +52,10 @@ pub(crate) fn list(db: &Connection) -> Result<Vec<Plan>> {
 }
 pub(crate) fn context(db: &Connection, excluding: Uuid) -> Result<plans::Context> {
     let mut context = plans::Context::default();
+    for continuation in crate::continuation::list(db)? {
+        let current = crate::continuation::current(db, &continuation.source)?;
+        context.writers.insert(continuation.source, current);
+    }
     context.edges.extend(crate::request_graph::edges(db)?);
     let raw: Option<String> = db
         .query_row(
@@ -773,6 +778,7 @@ pub(crate) fn generated(
             plan.generation.detail = Some("The Planner did not finish within 60 seconds.".into());
         }
     }
+    crate::fresh_words::route_plan(&tx, &mut plan)?;
     save(&tx, &plan, "plan.generated")?;
     tx.commit()?;
     Ok(true)

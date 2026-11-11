@@ -504,6 +504,7 @@ async fn real_glimmer_routes_requests_using_generated_activity_context() -> Resu
                 started["revision"].as_i64().unwrap(),
                 tracks[index].clone(),
                 json!({"sessionId":format!("session-{}",tracks[index]),"commandId":command}),
+                None,
             )
             .await?;
         journal.finish(&command.to_string(), "dispatched").await?;

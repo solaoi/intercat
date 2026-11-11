@@ -165,7 +165,8 @@ async fn a_locked_park_has_no_dispatch_destination_and_survives_stop_all() -> Re
                 id.to_string(),
                 1,
                 track,
-                json!({"sessionId":"session"})
+                json!({"sessionId":"session"}),
+                None,
             )
             .await
             .is_err()

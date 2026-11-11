@@ -72,6 +72,11 @@ pub enum StartGuard {
         paused: Arc<crate::dispatch_control::Gate>,
         pause_epoch: u64,
     },
+    Background {
+        stopping: tokio::sync::watch::Receiver<bool>,
+        paused: Arc<crate::dispatch_control::Gate>,
+        pause_epoch: u64,
+    },
     Stopped(Arc<AtomicBool>),
     Shutdown(tokio::sync::watch::Receiver<bool>),
 }
@@ -93,6 +98,16 @@ impl StartGuard {
                 pause_epoch,
             } => {
                 generation.load(Ordering::Acquire) == *expected
+                    && !paused.paused()
+                    && paused.epoch() == *pause_epoch
+            }
+            Self::Background {
+                stopping,
+                paused,
+                pause_epoch,
+            } => {
+                !*stopping.borrow()
+                    && stopping.has_changed().is_ok()
                     && !paused.paused()
                     && paused.epoch() == *pause_epoch
             }

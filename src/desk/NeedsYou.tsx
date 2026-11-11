@@ -114,6 +114,19 @@ export function NeedsYou({ cards, active = true, returnedAt = 0, canDropFiles = 
   }, [active]);
   useEffect(() => () => { if (releaseTimer.current) clearTimeout(releaseTimer.current); }, []);
   useEffect(() => {
+    // Making the answered card inert can retarget its pointer events before
+    // React sees a leave. Observe the next actual pointer target so that this
+    // stale hover cannot hold an answered card indefinitely.
+    const pointerMoved = (event: PointerEvent) => {
+      if (!pointerInside.current || event.target instanceof Node && region.current?.contains(event.target)) return;
+      pointerInside.current = false;
+      focusInside.current = !!region.current?.contains(document.activeElement);
+      release();
+    };
+    window.addEventListener('pointermove', pointerMoved, true);
+    return () => window.removeEventListener('pointermove', pointerMoved, true);
+  }, []);
+  useEffect(() => {
     const keepFocusedControlVisible = () => {
       const focused = document.activeElement;
       if (focused instanceof HTMLElement && region.current?.contains(focused)) {

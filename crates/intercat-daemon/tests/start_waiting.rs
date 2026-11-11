@@ -107,7 +107,8 @@ async fn sole_waiting_request_keeps_identity_and_uses_the_normal_dispatch_reserv
                 current["id"].as_str().unwrap().into(),
                 2,
                 current["decision"]["trackId"].as_str().unwrap().into(),
-                json!({"commandId":op,"sessionId":"worker","input":[]})
+                json!({"commandId":op,"sessionId":"worker","input":[]}),
+                None,
             )
             .await?,
         Admission::New

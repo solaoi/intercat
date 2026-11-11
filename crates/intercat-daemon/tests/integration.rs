@@ -19,6 +19,339 @@ use uuid::Uuid;
 
 #[path = "support/commit_exclusions.rs"]
 mod exclusions;
+#[path = "support/path_review.rs"]
+mod path_review;
+#[path = "support/push_jobs.rs"]
+mod push_jobs;
+#[path = "support/integration_records.rs"]
+mod records;
+
+#[tokio::test]
+async fn push_review_reopens_the_same_pinned_sha_without_sending_or_saving_url_credentials()
+-> Result<()> {
+    use intercat_daemon::{
+        git_tool::GitTool,
+        push_inspect::Inspector,
+        push_review::{Choice, Request},
+        push_review_service,
+    };
+    use std::sync::Arc;
+    use tokio::sync::watch;
+    let f = Fixture::new(1).await?;
+    let home = f._root.path().join("push-home");
+    fs::create_dir(&home)?;
+    let remote = f._root.path().join("dummy-remote.git");
+    git(
+        f._root.path(),
+        &["init", "--bare", "-q", remote.to_str().unwrap()],
+    );
+    let url = reqwest::Url::from_file_path(&remote)
+        .map_err(|_| "Invalid dummy remote")?
+        .to_string();
+    git(&f.source, &["remote", "add", "origin", &url]);
+    let folder = f.journal.snapshot().await?["project"]["folders"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let request = Request {
+        op_id: Uuid::now_v7(),
+        choices: vec![Choice {
+            folder_id: folder,
+            remote: "origin".into(),
+            target_ref: None,
+            through: None,
+        }],
+    };
+    let inspector = Arc::new(Inspector::new(
+        GitTool::system().await?,
+        home.clone(),
+        home.join(".config"),
+        false,
+    )?);
+    let lfs = Arc::new(intercat_daemon::push_lfs::Tool::open(
+        GitTool::system().await?,
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tools/git-lfs-3.8.1/git-lfs"),
+    )?);
+    let reviews =
+        push_review_service::Service::new(f.journal.clone(), inspector.clone(), lfs.clone());
+    assert!(
+        reviews
+            .open(request.clone(), watch::channel(false).1)
+            .await
+            .is_err()
+    );
+    assert!(f.journal.operation(request.op_id).await?.is_none());
+    fs::write(
+        f.workspaces[0].path.join("file.txt"),
+        "First dummy publication\n",
+    )?;
+    let first = f.save(0, None).await?;
+    let opened = f.open().await?;
+    f.action(Action::Prepare {
+        id: opened.id,
+        revision: opened.revision,
+    })
+    .await?;
+    let checked = finished(&f.journal).await?;
+    assert_eq!(checked.status, Status::Checked, "{:?}", checked.error);
+    f.action(commit_action(&checked)).await?;
+    let committed = finished(&f.journal).await?;
+    assert_eq!(committed.status, Status::Done);
+    let review = reviews
+        .open(request.clone(), watch::channel(false).1)
+        .await?;
+    let sha = review.members[0].target.sha.clone();
+    let reference = format!(
+        "refs/intercat/{}/push-reviews/{}",
+        committed.slug, request.op_id
+    );
+    assert_eq!(sha, committed.candidate.as_ref().unwrap().head);
+    assert_eq!(
+        Repository::open(&f.source)?.reference_target(&reference)?,
+        Some(sha.parse()?)
+    );
+    assert_eq!(
+        f.journal.operation(request.op_id).await?.unwrap()["state"],
+        "complete"
+    );
+    let transport_root = f._root.path().join("push-transport");
+    let transport = intercat_daemon::push_transfer::Snapshot::prepare(
+        &review,
+        &review.members[0].folder.id,
+        &transport_root,
+        &std::sync::atomic::AtomicBool::new(false),
+    )?;
+    assert_eq!(transport.member().target.sha, sha);
+    assert!(transport.commits.contains(&sha));
+    assert!(transport.shallow.is_empty());
+    assert_ne!(
+        Repository::open(&transport.git_directory)?.common_directory()?,
+        Repository::open(&f.source)?.common_directory()?
+    );
+    assert_eq!(
+        intercat_daemon::push_transfer::Snapshot::prepare(
+            &review,
+            &review.members[0].folder.id,
+            &transport_root,
+            &std::sync::atomic::AtomicBool::new(false)
+        )?
+        .commits,
+        transport.commits
+    );
+    let mut foreign = review.clone();
+    foreign.request.op_id = Uuid::now_v7();
+    assert!(
+        intercat_daemon::push_transfer::Snapshot::prepare(
+            &foreign,
+            &foreign.members[0].folder.id,
+            &transport_root,
+            &std::sync::atomic::AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    let in_source = f.source.join("must-not-create");
+    assert!(
+        intercat_daemon::push_transfer::Snapshot::prepare(
+            &review,
+            &review.members[0].folder.id,
+            &in_source,
+            &std::sync::atomic::AtomicBool::new(false)
+        )
+        .is_err()
+    );
+    assert!(!in_source.exists());
+    fs::write(
+        f.workspaces[0].path.join("file.txt"),
+        "Second dummy publication\n",
+    )?;
+    f.save(0, Some(first)).await?;
+    let opened = f.open().await?;
+    f.action(Action::Prepare {
+        id: opened.id,
+        revision: opened.revision,
+    })
+    .await?;
+    let checked = finished(&f.journal).await?;
+    assert_eq!(checked.status, Status::Checked, "{:?}", checked.error);
+    f.action(commit_action(&checked)).await?;
+    let newer = finished(&f.journal).await?;
+    assert_eq!(newer.status, Status::Done);
+    assert_ne!(newer.candidate.as_ref().unwrap().head, sha);
+    let same = reviews
+        .open(request.clone(), watch::channel(false).1)
+        .await?;
+    assert_eq!(serde_json::to_value(&same)?, serde_json::to_value(&review)?);
+    let mut reused = request.clone();
+    reused.choices[0].target_ref = Some("refs/heads/other".into());
+    assert!(reviews.open(reused, watch::channel(false).1).await.is_err());
+    // Recover a confirmation saved before its protecting ref was durable.
+    let db = rusqlite::Connection::open(f._root.path().join("events.sqlite"))?;
+    db.execute(
+        "UPDATE operations SET state='prepared' WHERE id=?1",
+        [request.op_id.to_string()],
+    )?;
+    git(&f.source, &["update-ref", "-d", &reference]);
+    assert_eq!(
+        reviews
+            .open(request.clone(), watch::channel(false).1)
+            .await?
+            .members[0]
+            .target
+            .sha,
+        sha
+    );
+    assert_eq!(
+        Repository::open(&f.source)?.reference_target(&reference)?,
+        Some(sha.parse()?)
+    );
+    assert_eq!(
+        f.journal.operation(request.op_id).await?.unwrap()["state"],
+        "complete"
+    );
+    git(
+        &f.source,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://DUMMY_LOGIN:DUMMY_PASSWORD@example.invalid/repo.git?dummy_access=DUMMY_QUERY",
+        ],
+    );
+    let private = Request {
+        op_id: Uuid::now_v7(),
+        choices: request.choices.clone(),
+    };
+    let private_review = reviews
+        .open(private.clone(), watch::channel(false).1)
+        .await?;
+    let saved = f
+        .journal
+        .operation(private.op_id)
+        .await?
+        .unwrap()
+        .to_string();
+    for value in ["DUMMY_LOGIN", "DUMMY_PASSWORD", "DUMMY_QUERY"] {
+        assert!(!saved.contains(value));
+    }
+    assert_eq!(
+        private_review.members[0].target.destinations[0].display,
+        "https://example.invalid/repo.git"
+    );
+    let mut through = Request {
+        op_id: Uuid::now_v7(),
+        choices: request.choices.clone(),
+    };
+    through.choices[0].through = Some(sha.clone());
+    assert_eq!(
+        reviews
+            .open(through.clone(), watch::channel(false).1)
+            .await?
+            .members[0]
+            .target
+            .sha,
+        sha
+    );
+    through.op_id = Uuid::now_v7();
+    through.choices[0].through = Some(f.head.clone());
+    assert!(
+        reviews
+            .open(through.clone(), watch::channel(false).1)
+            .await
+            .is_err()
+    );
+    assert!(f.journal.operation(through.op_id).await?.is_none());
+    assert!(
+        Repository::open(&remote)?
+            .reference_target(&review.members[0].target.target_ref)?
+            .is_none()
+    );
+    fs::create_dir_all(home.join(".ssh"))?;
+    let ssh_config = home.join(".ssh/config");
+    fs::write(
+        &ssh_config,
+        "Host dummy-review-alias\n HostName 127.0.0.1\n Port 22222\n User dummy-review-user\n IdentityAgent none\n",
+    )?;
+    git(
+        &f.source,
+        &[
+            "config",
+            "remote.origin.url",
+            "ssh://dummy-review-alias/private/dummy.git",
+        ],
+    );
+    let ssh_request = Request {
+        op_id: Uuid::now_v7(),
+        choices: request.choices.clone(),
+    };
+    let ssh_review = reviews
+        .open(ssh_request.clone(), watch::channel(false).1)
+        .await?;
+    assert_eq!(ssh_review.members[0].ssh.len(), 1);
+    assert_eq!(ssh_review.members[0].ssh[0].host, "127.0.0.1");
+    assert_eq!(ssh_review.members[0].ssh[0].port, 22222);
+    assert!(
+        !f.journal
+            .operation(ssh_request.op_id)
+            .await?
+            .unwrap()
+            .to_string()
+            .contains("dummy-review-user")
+    );
+    fs::write(
+        &ssh_config,
+        "Host dummy-review-alias\n HostName 127.0.0.2\n Port 33333\n User dummy-review-user\n IdentityAgent none\n",
+    )?;
+    assert_eq!(
+        serde_json::to_value(
+            reviews
+                .open(ssh_request.clone(), watch::channel(false).1)
+                .await?
+        )?,
+        serde_json::to_value(&ssh_review)?
+    );
+    let changed = reviews
+        .open(
+            Request {
+                op_id: Uuid::now_v7(),
+                choices: request.choices.clone(),
+            },
+            watch::channel(false).1,
+        )
+        .await?;
+    assert_eq!(changed.members[0].ssh[0].host, "127.0.0.2");
+    assert_eq!(changed.members[0].ssh[0].port, 33333);
+    f.source_unchanged()?;
+    drop(db);
+    drop(reviews);
+    f.service.shutdown().await;
+    let Fixture {
+        _root,
+        source: _,
+        journal,
+        service,
+        project_secrets: _,
+        workspaces: _,
+        index: _,
+        head: _,
+    } = f;
+    drop(service);
+    drop(journal);
+    let journal = Journal::open(
+        _root.path().join("events.sqlite"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await?;
+    let reviews = push_review_service::Service::new(journal, inspector, lfs);
+    assert_eq!(
+        serde_json::to_value(reviews.open(ssh_request, watch::channel(false).1).await?)?,
+        serde_json::to_value(ssh_review)?
+    );
+    assert_eq!(
+        serde_json::to_value(reviews.open(request, watch::channel(false).1).await?)?,
+        serde_json::to_value(review)?
+    );
+    Ok(())
+}
 
 fn inherit_dummy_checkpoint(
     f: &Fixture,
@@ -44,6 +377,7 @@ fn inherit_dummy_checkpoint(
         include(&mut basis.inherits, track, mark)?;
     }
     include(&mut basis.inherits, &point.track, &point.inherited())?;
+    include(&mut basis.parents, &point.track, &point.inherited())?;
     db.execute(
         "UPDATE track_lineage SET record=?2 WHERE track=?1",
         rusqlite::params![f.workspaces[child].track_id, serde_json::to_string(&basis)?],
@@ -51,12 +385,10 @@ fn inherit_dummy_checkpoint(
     Ok(())
 }
 
-fn record_simulated_integration(
-    f: &Fixture,
-    tracks: &[intercat_daemon::integration::Track],
-) -> Result<()> {
+fn record_simulated_integration(f: &Fixture, job: &Job, head: ObjectId) -> Result<()> {
     let db = rusqlite::Connection::open(f._root.path().join("events.sqlite"))?;
-    for track in tracks {
+    let mut coverage = job.plan.as_ref().unwrap().coverage.clone().unwrap();
+    for track in &job.tracks {
         let Some(checkpoint) = &track.checkpoint else {
             continue;
         };
@@ -66,9 +398,11 @@ fn record_simulated_integration(
             |row| row.get(0),
         )?;
         let point: intercat_daemon::lineage::Point = serde_json::from_str(&raw)?;
+        job.lineage.incorporate(&mut coverage, &point)?;
         let mut basis = track.basis.clone();
         basis.base = point.sha.clone();
         basis.base_inherits = point.inherits.clone();
+        intercat_daemon::lineage::include(&mut basis.base_inherits, &track.id, &point.inherited())?;
         db.execute(
             "UPDATE track_lineage SET record=?2 WHERE track=?1",
             rusqlite::params![track.id, serde_json::to_string(&basis)?],
@@ -78,6 +412,14 @@ fn record_simulated_integration(
             rusqlite::params![track.id, serde_json::to_string(&point.inherited())?],
         )?;
     }
+    db.execute(
+        "INSERT INTO published_lineage VALUES(?1,?2,?3)",
+        rusqlite::params![
+            job.plan.as_ref().unwrap().target_ref,
+            head.to_string(),
+            serde_json::to_string(&coverage)?
+        ],
+    )?;
     Ok(())
 }
 
@@ -90,10 +432,10 @@ async fn commit_cannot_capture_half_of_an_inherited_checkpoint_update() -> Resul
     let operation = Uuid::now_v7().to_string();
     db.execute(
         "INSERT INTO operations VALUES(?1,'workspace.apply-inheritance',?2,'dispatched')",
-        rusqlite::params![operation,json!({"operation":operation,"dependencies":{"track":f.workspaces[0].track_id,"input":Uuid::now_v7(),"points":[]},"revision":1,"requestDigest":"dummy","session":"dummy","workspace":f.workspaces[0],"previous":null,"before":checkpoint.sha,"after":checkpoint.sha,"beforeBasis":{"base":f.workspaces[0].base,"baseInherits":{},"inherits":{}},"basis":{"base":f.workspaces[0].base,"baseInherits":{},"inherits":{}},"checkpointTurn":Uuid::now_v7(),"expectedBase":null}).to_string()],
+        rusqlite::params![operation,json!({"operation":operation,"dependencies":{"track":f.workspaces[0].track_id,"input":Uuid::now_v7(),"points":[]},"revision":1,"requestDigest":"dummy","session":"dummy","workspace":f.workspaces[0],"previous":null,"before":checkpoint.sha,"after":checkpoint.sha,"beforeBasis":{"views":[],"parents":{},"base":f.workspaces[0].base,"baseInherits":{},"inherits":{}},"basis":{"views":[],"parents":{},"base":f.workspaces[0].base,"baseInherits":{},"inherits":{}},"checkpointTurn":Uuid::now_v7(),"expectedBase":null}).to_string()],
     )?;
     let error = f.open().await.unwrap_err();
-    assert!(error.to_string().contains("inherited file update"));
+    assert!(error.to_string().contains("saved file update"));
     db.execute(
         "UPDATE operations SET state='complete' WHERE id=?1",
         [operation],
@@ -202,8 +544,10 @@ fn selected_edit(job: &Job, text: &str) -> intercat_daemon::repair_run::Request 
         .unwrap();
     Request {
         op_id: Uuid::now_v7(),
-        job_id: job.id,
-        revision: job.revision,
+        owner: intercat_daemon::repair_run::Owner::Commit {
+            id: job.id,
+            revision: job.revision,
+        },
         track: commit.track.clone(),
         purpose: Purpose::Edit {
             text: text.into(),
@@ -259,7 +603,7 @@ async fn repair_with_saved_deletion(
         .path()
         .join("integration")
         .join(input.id.to_string());
-    let source = parent.join(input.candidate.as_ref().unwrap().generation.to_string());
+    let source = input.candidate.as_ref().unwrap().workspace.clone();
     let workspace = repair::Workspace::prepare(
         &input,
         &source,
@@ -526,7 +870,7 @@ async fn selected_edit_rebuilds_checked_and_previously_repaired_candidates() -> 
             .path()
             .join("integration")
             .join(input.id.to_string());
-        let source = parent.join(input.candidate.as_ref().unwrap().generation.to_string());
+        let source = input.candidate.as_ref().unwrap().workspace.clone();
         let workspace = repair::Workspace::prepare(
             &input,
             &source,
@@ -571,7 +915,7 @@ async fn selected_edit_rebuilds_checked_and_previously_repaired_candidates() -> 
         let done = repair_application::apply(
             &f.journal,
             &captured,
-            std::sync::Arc::new(workspace),
+            std::sync::Arc::new(intercat_daemon::run_workspace::Workspace::Fix(workspace)),
             source,
             parent.join(input.revision.to_string()),
             f._root.path().join("integration/downloads"),
@@ -579,7 +923,7 @@ async fn selected_edit_rebuilds_checked_and_previously_repaired_candidates() -> 
         )
         .await?;
         assert_eq!(done.phase, Phase::Done);
-        checked = serde_json::from_value(f.journal.snapshot().await?["integration"].clone())?;
+        checked = serde_json::from_value(f.journal.snapshot().await?["integrations"][0].clone())?;
         assert_eq!(checked.status, Status::Checked);
         let candidate = checked.candidate.as_ref().unwrap();
         assert_eq!(candidate.commits.len(), 1);
@@ -626,7 +970,10 @@ async fn selected_edit_rejects_stale_forged_missing_lines_and_secrets_before_dis
         std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
     );
     let mut stale = selected_edit(&checked, "Change this line.");
-    stale.revision += 1;
+    stale.owner = intercat_daemon::repair_run::Owner::Commit {
+        id: checked.id,
+        revision: checked.revision + 1,
+    };
     assert!(runtime.service.start(stale).await.is_err());
     for field in ["tree", "object", "path", "lines"] {
         let mut forged = selected_edit(&checked, "Change this line.");
@@ -721,7 +1068,9 @@ async fn keep_secret_resumes_the_exact_candidate_without_rerunning_hooks() -> Re
         .diff(integration::DiffRequest {
             id: blocked.id,
             revision: blocked.revision,
-            track: pending.track.clone(),
+            owner: integration::DiffOwner::Worker {
+                track: pending.track.clone(),
+            },
             path: "fixture.txt".into(),
         })
         .await?;
@@ -733,7 +1082,9 @@ async fn keep_secret_resumes_the_exact_candidate_without_rerunning_hooks() -> Re
             .diff(integration::DiffRequest {
                 id: blocked.id,
                 revision: blocked.revision,
-                track: pending.track.clone(),
+                owner: integration::DiffOwner::Worker {
+                    track: pending.track.clone()
+                },
                 path: "../outside".into()
             })
             .await
@@ -763,7 +1114,7 @@ async fn keep_secret_resumes_the_exact_candidate_without_rerunning_hooks() -> Re
     let candidate = resumed.candidate.as_ref().unwrap();
     assert_eq!(candidate.commits[0].sha, pending.sha);
     assert_eq!(candidate.tree, pending.tree);
-    assert_eq!(candidate.generation, opened.revision);
+    assert_eq!(candidate.build_revision, opened.revision);
     assert!(
         f.action(Action::KeepSecret {
             id: blocked.id,
@@ -930,23 +1281,22 @@ async fn unchanged_saved_tracks_advance_their_boundary_without_inventing_commits
 }
 
 #[tokio::test]
-async fn an_lfs_pointer_cannot_be_published_without_its_validated_object() -> Result<()> {
+async fn missing_lfs_payload_is_rejected_before_checkpoint_ref_publication() -> Result<()> {
     let f = Fixture::new(1).await?;
     fs::write(
         f.workspaces[0].path.join("asset.dat"),
         "version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 123\n",
     )?;
-    f.save(0, None).await?;
-    let job = checked(&f).await?;
-    f.action(commit_action(&job)).await?;
-    let failed = finished(&f.journal).await?;
-    assert_eq!(failed.status, Status::Failed);
-    assert!(failed.error.unwrap().contains("LFS"));
+    let error = f.save(0, None).await.unwrap_err();
+    assert!(
+        matches!(error.downcast_ref(), Some(intercat_daemon::lfs_store::Problem::Missing { path }) if path == "asset.dat")
+    );
     assert!(
         Repository::open(&f.source)?
-            .reference_target(&job.plan.as_ref().unwrap().target_ref)?
+            .reference_target(&format!("{}-checkpoint", f.workspaces[0].reference))?
             .is_none()
     );
+    f.source_unchanged()?;
     f.service.shutdown().await;
     Ok(())
 }
@@ -987,8 +1337,10 @@ async fn begin_test_repair(f: &Fixture, job: &Job) -> Result<intercat_daemon::re
     f.journal
         .repair_start(intercat_daemon::repair_run::Request {
             op_id: Uuid::now_v7(),
-            job_id: job.id,
-            revision: job.revision,
+            owner: intercat_daemon::repair_run::Owner::Commit {
+                id: job.id,
+                revision: job.revision,
+            },
             track: job.tracks[0].id.clone(),
             purpose: intercat_daemon::repair_run::Purpose::Check,
         })
@@ -1027,7 +1379,7 @@ async fn refresh_repair_waits_for_stop_and_atomically_replaces_the_candidate_onc
     let request = RefreshRequest {
         op_id: Uuid::now_v7(),
         job_id: failed.id,
-        revision: run.job_revision,
+        revision: run.owner.revision(),
         repair_id: run.id,
     };
     let mut stale = request.clone();
@@ -1070,7 +1422,7 @@ async fn refresh_repair_waits_for_stop_and_atomically_replaces_the_candidate_onc
         .repair_finish_refresh(request.op_id)
         .await?
         .unwrap();
-    assert_eq!(refreshed.revision, run.job_revision + 1);
+    assert_eq!(refreshed.revision, run.owner.revision() + 1);
     assert_eq!(
         refreshed.tracks[0].checkpoint.as_ref().unwrap().sha,
         fresh.sha
@@ -1104,7 +1456,8 @@ async fn refresh_repair_waits_for_stop_and_atomically_replaces_the_candidate_onc
             .await?
             .is_none()
     );
-    let current: Job = serde_json::from_value(f.journal.snapshot().await?["integration"].clone())?;
+    let current: Job =
+        serde_json::from_value(f.journal.snapshot().await?["integrations"][0].clone())?;
     assert_eq!(current.revision, refreshed.revision);
     f.source_unchanged()?;
     f.service.shutdown().await;
@@ -1120,7 +1473,7 @@ async fn refresh_repair_recovery_preserves_edits_when_capture_fails() -> Result<
     let request = RefreshRequest {
         op_id: Uuid::now_v7(),
         job_id: failed.id,
-        revision: run.job_revision,
+        revision: run.owner.revision(),
         repair_id: run.id,
     };
     let held = f.journal.repair_refresh(request.clone()).await?;
@@ -1189,7 +1542,7 @@ async fn refresh_repair_background_driver_finishes_without_an_open_window() -> R
         .repair_refresh(RefreshRequest {
             op_id: operation,
             job_id: failed.id,
-            revision: run.job_revision,
+            revision: run.owner.revision(),
             repair_id: run.id,
         })
         .await?;
@@ -1224,8 +1577,8 @@ async fn refresh_repair_background_driver_finishes_without_an_open_window() -> R
     let result = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let job: Job =
-                serde_json::from_value(reopened.snapshot().await?["integration"].clone())?;
-            if job.revision > run.job_revision && job.status == Status::Checked {
+                serde_json::from_value(reopened.snapshot().await?["integrations"][0].clone())?;
+            if job.revision > run.owner.revision() && job.status == Status::Checked {
                 break Ok::<_, Box<dyn std::error::Error + Send + Sync>>(job);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1261,7 +1614,7 @@ async fn interrupted_refresh_does_not_replace_a_newer_review() -> Result<()> {
         .repair_refresh(RefreshRequest {
             op_id: operation,
             job_id: failed.id,
-            revision: run.job_revision,
+            revision: run.owner.revision(),
             repair_id: run.id,
         })
         .await?;
@@ -1277,7 +1630,8 @@ async fn interrupted_refresh_does_not_replace_a_newer_review() -> Result<()> {
         })
         .await?;
     assert!(f.journal.repair_finish_refresh(operation).await?.is_none());
-    let current: Job = serde_json::from_value(f.journal.snapshot().await?["integration"].clone())?;
+    let current: Job =
+        serde_json::from_value(f.journal.snapshot().await?["integrations"][0].clone())?;
     assert_eq!(current.revision, newer.revision);
     assert!(f.journal.snapshot().await?["repairRuns"][0]["refresh"].is_null());
     f.service.shutdown().await;
@@ -1352,15 +1706,15 @@ async fn real_refresh_stops_the_prepared_repair_before_rebuilding() -> Result<()
             .refresh(RefreshRequest {
                 op_id: Uuid::now_v7(),
                 job_id: failed.id,
-                revision: ready.job_revision,
+                revision: ready.owner.revision(),
                 repair_id: ready.id,
             })
             .await?;
         let refreshed = tokio::time::timeout(Duration::from_secs(40), async {
             loop {
                 let job: Job =
-                    serde_json::from_value(f.journal.snapshot().await?["integration"].clone())?;
-                if job.revision > ready.job_revision && job.status == Status::Checked {
+                    serde_json::from_value(f.journal.snapshot().await?["integrations"][0].clone())?;
+                if job.revision > ready.owner.revision() && job.status == Status::Checked {
                     break Ok::<_, Box<dyn std::error::Error + Send + Sync>>(job);
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1508,6 +1862,76 @@ async fn local_dependency_checkpoint_passes_check_and_commit_but_stale_locks_hol
 }
 
 #[tokio::test]
+async fn sparse_worker_changes_pass_check_and_commit_with_unexpanded_files_intact() -> Result<()> {
+    for sparse_index in [false, true] {
+        let f = Fixture::new(1).await?;
+        let workspace = &f.workspaces[0].path;
+        for name in [
+            "inside/file.txt",
+            "outside/changed.txt",
+            "outside/retained.txt",
+        ] {
+            let path = workspace.join(name);
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(path, "before\n")?;
+        }
+        git(workspace, &["add", "-A"]);
+        git(
+            workspace,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "Worker baseline",
+            ],
+        );
+        git(
+            workspace,
+            &[
+                "sparse-checkout",
+                "init",
+                "--cone",
+                if sparse_index {
+                    "--sparse-index"
+                } else {
+                    "--no-sparse-index"
+                },
+            ],
+        );
+        git(workspace, &["sparse-checkout", "set", "inside"]);
+        assert!(!workspace.join("outside/retained.txt").exists());
+        fs::create_dir_all(workspace.join("outside"))?;
+        fs::write(workspace.join("outside/changed.txt"), "changed outside\n")?;
+        fs::write(workspace.join("inside/file.txt"), "changed inside\n")?;
+        let index = workspace.join(git(workspace, &["rev-parse", "--git-path", "index"]));
+        let before = fs::read(&index)?;
+        f.save(0, None).await?;
+        let reviewed = checked(&f).await?;
+        let candidate = reviewed.candidate.as_ref().unwrap();
+        let head = candidate.head.clone();
+        f.action(commit_action(&reviewed)).await?;
+        let done = finished(&f.journal).await?;
+        assert_eq!(done.status, Status::Done, "{:?}", done.error);
+        for (path, expected) in [
+            ("inside/file.txt", "changed inside"),
+            ("outside/changed.txt", "changed outside"),
+            ("outside/retained.txt", "before"),
+        ] {
+            assert_eq!(
+                git(&f.source, &["show", &format!("{head}:{path}")]),
+                expected
+            );
+        }
+        assert_eq!(fs::read(&index)?, before);
+        f.source_unchanged()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn publishes_reviewed_commits_and_advances_only_the_integrated_tracks() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new(2).await?;
@@ -1533,6 +1957,25 @@ async fn publishes_reviewed_commits_and_advances_only_the_integrated_tracks() ->
     );
     let done = finished(&f.journal).await?;
     assert_eq!(done.status, Status::Done, "{:?}", done.error);
+    let db = rusqlite::Connection::open(f._root.path().join("events.sqlite"))?;
+    let target = &built.plan.as_ref().unwrap().target_ref;
+    let published = || -> Result<(String, intercat_daemon::lineage::Ancestors)> {
+        let (head, raw): (String, String) = db.query_row(
+            "SELECT head,coverage FROM published_lineage WHERE reference=?1",
+            [target],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((head, serde_json::from_str(&raw)?))
+    };
+    let (head, coverage) = published()?;
+    assert_eq!(head, candidate.head);
+    assert_eq!(coverage.len(), 2);
+    assert_eq!(coverage[&built.tracks[0].id].sha, a.sha);
+    assert_eq!(coverage[&built.tracks[1].id].sha, b.sha);
+    db.execute(
+        "INSERT INTO published_lineage VALUES('refs/heads/intercat/another-folder',?1,'{}')",
+        [&f.head],
+    )?;
     let repo = Repository::open(&f.source)?;
     assert_eq!(
         repo.reference_target(&built.plan.as_ref().unwrap().target_ref)?,
@@ -1579,8 +2022,42 @@ async fn publishes_reviewed_commits_and_advances_only_the_integrated_tracks() ->
         ),
         "B one"
     );
+    // A mismatched metadata head is detected before creating a publication
+    // intent or changing the real session branch.
+    db.execute(
+        "UPDATE published_lineage SET head=?2 WHERE reference=?1",
+        rusqlite::params![target, f.head],
+    )?;
+    let publications: i64 = db.query_row(
+        "SELECT count(*) FROM operations WHERE kind='integration.publish'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(f.action(commit_action(&next)).await.is_err());
+    assert_eq!(
+        repo.reference_target(target)?,
+        Some(candidate.head.parse()?)
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM operations WHERE kind='integration.publish'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        publications
+    );
+    db.execute(
+        "UPDATE published_lineage SET head=?2 WHERE reference=?1",
+        rusqlite::params![target, candidate.head],
+    )?;
     f.action(commit_action(&next)).await?;
     assert_eq!(finished(&f.journal).await?.status, Status::Done);
+    let (head, coverage) = published()?;
+    assert_eq!(head, next.candidate.as_ref().unwrap().head);
+    assert_eq!(coverage.len(), 2);
+    assert_eq!(coverage[&built.tracks[0].id].number, 2);
+    assert_eq!(coverage[&built.tracks[1].id].sha, b.sha);
+    assert_eq!(db.query_row("SELECT head FROM published_lineage WHERE reference='refs/heads/intercat/another-folder'", [], |row| row.get::<_,String>(0))?, f.head);
     assert!(
         repo.reference_target(&format!("refs/intercat/{}/integration/A/2", built.slug))?
             .is_some()
@@ -1805,7 +2282,7 @@ async fn two_clients_cannot_refresh_while_a_saved_commit_waits_to_publish() -> R
                     .is_err()
             );
             assert_eq!(
-                f.journal.snapshot().await?["integration"]["status"],
+                f.journal.snapshot().await?["integrations"][0]["status"],
                 "committing"
             );
         }
@@ -1867,7 +2344,7 @@ async fn recovery_completes_every_durable_ref_prefix_without_rebuilding_commits(
         .await?;
         let service = Service::new(reopened.clone(), f._root.path().join("resume"));
         service.recover().await?;
-        let done: Job = serde_json::from_value(reopened.snapshot().await?["integration"].clone())?;
+        let done = finished(&reopened).await?;
         assert_eq!(
             done.status,
             Status::Done,
@@ -1917,7 +2394,7 @@ async fn recovery_keeps_descendant_branches_and_waits_for_foreign_track_refs() -
     .await?;
     let service = Service::new(reopened.clone(), f._root.path().join("resume"));
     service.recover().await?;
-    let blocked: Job = serde_json::from_value(reopened.snapshot().await?["integration"].clone())?;
+    let blocked = finished(&reopened).await?;
     assert_eq!(blocked.status, Status::CommitBlocked);
     assert!(
         service
@@ -2020,6 +2497,125 @@ struct Fixture {
     workspaces: Vec<Workspace>,
     index: Vec<u8>,
     head: String,
+}
+
+#[tokio::test]
+async fn lfs_checkpoint_reaches_a_scanned_commit_and_missing_payload_cannot_be_published()
+-> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for missing in [false, true] {
+        let f = Fixture::new(1).await?;
+        let environment = f.source.join(".env.test");
+        fs::write(
+            &environment,
+            "DEMO_TOKEN=agent-created-unrelated-check-value-29\n",
+        )?;
+        f.journal
+            .change_check_environment(intercat_daemon::check_environment::Change {
+                op_id: Uuid::now_v7(),
+                revision: 0,
+                file: Some(environment),
+            })
+            .await?;
+        let tool = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.tools/git-lfs-3.8.1/git-lfs")
+            .canonicalize()?;
+        for (field, command) in [
+            ("clean", "clean -- %f"),
+            ("smudge", "smudge -- %f"),
+            ("process", "filter-process"),
+        ] {
+            git(
+                &f.source,
+                &[
+                    "config",
+                    &format!("filter.lfs.{field}"),
+                    &format!("'{}' {command}", tool.display()),
+                ],
+            );
+        }
+        git(&f.source, &["config", "filter.lfs.required", "true"]);
+        git(
+            &f.source,
+            &["config", "lfs.storage", "../../dummy-lfs-storage"],
+        );
+        let worker = &f.workspaces[0].path;
+        fs::write(worker.join(".gitattributes"), "*.lfs filter=lfs -text\n")?;
+        let bytes = b"agent-created integration LFS text\n";
+        fs::write(worker.join("asset.lfs"), bytes)?;
+        // A local Check hook confirms that materialization supplied the body,
+        // rather than the Git pointer. No command connects to a server.
+        fs::create_dir(worker.join(".dummy-hooks"))?;
+        fs::write(
+            worker.join(".dummy-hooks/pre-commit"),
+            "#!/bin/sh\ntest \"$(cat asset.lfs)\" = 'agent-created integration LFS text'\n",
+        )?;
+        fs::set_permissions(
+            worker.join(".dummy-hooks/pre-commit"),
+            fs::Permissions::from_mode(0o755),
+        )?;
+        git(&f.source, &["config", "core.hooksPath", ".dummy-hooks"]);
+        let checkpoint = f.save(0, None).await?;
+        let opened = f.open().await?;
+        f.action(Action::Prepare {
+            id: opened.id,
+            revision: opened.revision,
+        })
+        .await?;
+        let checked = finished(&f.journal).await?;
+        assert_eq!(checked.status, Status::Checked, "{:?}", checked.error);
+        let candidate = checked.candidate.as_ref().unwrap();
+        assert_eq!(candidate.commits.len(), 1);
+        assert_eq!(candidate.secret_scans.len(), 1);
+        assert!(candidate.secret_scans[0].findings.is_empty());
+        assert_eq!(
+            candidate.secret_scans[0].binding.value_fingerprints.len(),
+            1
+        );
+        let repository = Repository::open(&f.source)?;
+        let entries = repository.lfs_entries(repository.tree_id(candidate.head.parse()?)?)?;
+        assert_eq!(entries.len(), 1);
+        let store = f._root.path().canonicalize()?.join("dummy-lfs-storage");
+        let pointer = &entries[0].pointer;
+        let object = store
+            .join("objects")
+            .join(&pointer.oid()[..2])
+            .join(&pointer.oid()[2..4])
+            .join(pointer.oid());
+        assert_eq!(fs::read(&object)?, bytes);
+        if missing {
+            fs::remove_file(&object)?;
+        }
+        f.action(commit_action(&checked)).await?;
+        let result = finished(&f.journal).await?;
+        if missing {
+            assert_ne!(result.status, Status::Done);
+            assert!(
+                result.error.as_deref().is_some_and(
+                    |error| error.contains("LFS object missing") && error.contains("asset.lfs")
+                ),
+                "{result:?}"
+            );
+            assert!(
+                repository
+                    .reference_target(&format!("refs/heads/intercat/{}", result.slug))?
+                    .is_none()
+            );
+        } else {
+            assert_eq!(result.status, Status::Done, "{:?}", result.error);
+            assert_eq!(
+                repository.reference_target(&format!("refs/heads/intercat/{}", result.slug))?,
+                Some(candidate.head.parse()?)
+            );
+        }
+        assert_eq!(
+            repository.reference_target(&checkpoint.reference)?,
+            Some(checkpoint.sha.parse()?)
+        );
+        f.source_unchanged()?;
+        f.service.shutdown().await;
+    }
+    Ok(())
 }
 impl Fixture {
     async fn new(count: usize) -> Result<Self> {
@@ -2203,7 +2799,7 @@ async fn freezes_saved_turns_across_windows_and_refresh_is_explicit() -> Result<
         second.sha
     );
     assert_eq!(
-        f.journal.snapshot().await?["integration"]["finishedSinceOpen"],
+        f.journal.snapshot().await?["integrations"][0]["finishedSinceOpen"],
         1
     );
     let refreshed = f
@@ -2218,7 +2814,7 @@ async fn freezes_saved_turns_across_windows_and_refresh_is_explicit() -> Result<
         second.sha
     );
     assert_eq!(
-        f.journal.snapshot().await?["integration"]["finishedSinceOpen"],
+        f.journal.snapshot().await?["integrations"][0]["finishedSinceOpen"],
         0
     );
     assert!(
@@ -2228,6 +2824,1087 @@ async fn freezes_saved_turns_across_windows_and_refresh_is_explicit() -> Result<
             .is_err()
     );
     f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn conflicted_candidate_saves_only_the_prefix_for_an_isolated_merge_run() -> Result<()> {
+    let f = Fixture::new(3).await?;
+    for (index, text) in ["worker A\n", "worker B\n"].into_iter().enumerate() {
+        fs::write(f.workspaces[index].path.join("file.txt"), text)?;
+        f.save(index, None).await?;
+    }
+    fs::write(f.workspaces[2].path.join("third.txt"), "worker C\n")?;
+    f.save(2, None).await?;
+    let opened = f.open().await?;
+    assert_eq!(opened.status, Status::MergeConflict);
+    let frozen = opened.tracks[1].checkpoint.as_ref().unwrap().sha.clone();
+    fs::write(
+        f.workspaces[1].path.join("file.txt"),
+        "later unsaved B work\n",
+    )?;
+    f.action(Action::Prepare {
+        id: opened.id,
+        revision: opened.revision,
+    })
+    .await?;
+    let partial = finished(&f.journal).await?;
+    assert_eq!(partial.status, Status::Failed, "{:?}", partial.error);
+    let candidate = partial.candidate.as_ref().unwrap();
+    assert_eq!(candidate.state, intercat_daemon::candidate::State::Conflict);
+    assert_eq!(
+        candidate.failed_track.as_deref(),
+        Some(f.workspaces[1].track_id.as_str())
+    );
+    assert_eq!(candidate.commits.len(), 1);
+    assert_eq!(candidate.commits[0].track, f.workspaces[0].track_id);
+    assert!(candidate.check.is_none());
+    assert!(partial.plan.as_ref().unwrap().tree.is_none());
+    assert_eq!(partial.tracks[1].checkpoint.as_ref().unwrap().sha, frozen);
+    let repository = Repository::open(candidate.workspace.join("repo"))?;
+    let files = repository.tree_files(candidate.tree.parse()?)?;
+    assert_eq!(repository.saved_bytes(&files["file.txt"])?, b"worker A\n");
+    assert!(!files.contains_key("third.txt"));
+    let settings = f
+        .journal
+        .integration_settings(partial.id, partial.revision)
+        .await?
+        .unwrap();
+    let marker = Uuid::now_v7();
+    let root = f._root.path().join("isolated-merge");
+    let workspace = intercat_daemon::merge_resolution::Workspace::prepare(
+        &partial,
+        &candidate.workspace,
+        &root,
+        &f.workspaces[1].track_id,
+        &settings,
+        marker,
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    let repository = Repository::open(&workspace.files.checkout.workdir)?;
+    assert_eq!(repository.unmerged_paths()?, ["file.txt"]);
+    assert!(Repository::worktree_source(&workspace.files.checkout.workdir, None).is_err());
+    let conflicted = fs::read_to_string(workspace.files.checkout.workdir.join("file.txt"))?;
+    assert!(conflicted.contains(&format!("Intercat target {marker}")));
+    assert!(conflicted.contains("worker A"));
+    assert!(conflicted.contains("worker B"));
+    assert!(!conflicted.contains("later unsaved"));
+    assert!(
+        workspace
+            .finish(&partial, &settings, tokio::sync::watch::channel(false).1)
+            .await
+            .is_err()
+    );
+    let workspace = intercat_daemon::merge_resolution::Workspace::resume(
+        &partial,
+        &candidate.workspace,
+        &root,
+        &f.workspaces[1].track_id,
+        &settings,
+        marker,
+    )
+    .await?;
+    assert_eq!(
+        fs::read_to_string(workspace.files.checkout.workdir.join("file.txt"))?,
+        conflicted
+    );
+    let staged = workspace
+        .files
+        .checkout
+        .git(
+            &["add".into(), "--".into(), "file.txt".into()],
+            true,
+            tokio::sync::watch::channel(false).1,
+        )
+        .await?;
+    assert!(staged.success());
+    assert!(
+        workspace
+            .finish(&partial, &settings, tokio::sync::watch::channel(false).1)
+            .await
+            .is_err()
+    );
+    fs::write(
+        workspace.files.checkout.workdir.join("file.txt"),
+        "worker A and B resolved\n",
+    )?;
+    let resolved = workspace
+        .finish(&partial, &settings, tokio::sync::watch::channel(false).1)
+        .await?;
+    resolved.validate(&partial, &settings)?;
+    assert_eq!(resolved.basis.checkpoint, frozen);
+    assert_eq!(resolved.basis.prefix[0].sha, candidate.commits[0].sha);
+    let captured =
+        Repository::open(&workspace.files.checkout.workdir)?.tree_files(resolved.tree.parse()?)?;
+    assert_eq!(
+        Repository::open(&workspace.files.checkout.workdir)?.saved_bytes(&captured["file.txt"])?,
+        b"worker A and B resolved\n"
+    );
+    assert!(
+        Repository::open(&f.source)?
+            .tree_files(resolved.tree.parse()?)
+            .is_err()
+    );
+    let rebuilt = workspace
+        .rebuild(
+            &partial,
+            &resolved,
+            &f._root.path().join("resolved-candidate"),
+            &f._root.path().join("merge-downloads"),
+            &settings,
+            tokio::sync::watch::channel(false).1,
+        )
+        .await?;
+    assert_eq!(
+        rebuilt.state,
+        intercat_daemon::candidate::State::Checked,
+        "{:?}",
+        rebuilt.reason
+    );
+    assert_eq!(rebuilt.commits.len(), 3);
+    assert_eq!(rebuilt.commits[0].sha, candidate.commits[0].sha);
+    assert_eq!(rebuilt.commits[1].track, f.workspaces[1].track_id);
+    assert_eq!(rebuilt.commits[1].tree, resolved.tree);
+    assert_eq!(rebuilt.commits[2].track, f.workspaces[2].track_id);
+    let final_files = Repository::open(&f.source)?.tree_files(rebuilt.tree.parse()?)?;
+    assert!(final_files.contains_key("third.txt"));
+    assert_eq!(
+        Repository::open(&f.source)?.saved_bytes(&final_files["file.txt"])?,
+        b"worker A and B resolved\n"
+    );
+    let incoming_files = Repository::open(&f.source)?.saved_files(frozen.parse()?)?;
+    assert!(
+        Repository::open(rebuilt.workspace.join("repo"))?
+            .saved_bytes(&incoming_files["file.txt"])
+            .is_err()
+    );
+    use intercat_daemon::repair_run::{
+        Control, Event, Failure, Outcome as RunOutcome, Phase, Purpose, Request, Run,
+    };
+    let automatic = intercat_daemon::merge_resolution::automatic_request(&partial)?.unwrap();
+    let mut run = f
+        .journal
+        .repair_start(Request {
+            op_id: Uuid::now_v7(),
+            owner: intercat_daemon::repair_run::Owner::Commit {
+                id: partial.id,
+                revision: partial.revision,
+            },
+            track: f.workspaces[1].track_id.clone(),
+            purpose: Purpose::Merge,
+        })
+        .await?;
+    let (_, input, settings) = f.journal.repair_input(run.id).await?;
+    assert_eq!(
+        intercat_daemon::merge_resolution::automatic_request(&input)?
+            .unwrap()
+            .op_id,
+        automatic.op_id
+    );
+    assert_eq!(
+        f.journal.operation(automatic.op_id).await?.unwrap()["kind"],
+        "merge.trigger"
+    );
+    async fn complete(journal: &Journal, mut run: Run) -> Result<Run> {
+        let command = Uuid::now_v7();
+        for event in [
+            Event::Prepare,
+            Event::WorkspaceReady,
+            Event::HostStarted {
+                host: intercat_daemon::process::Identity {
+                    pid: 42,
+                    started_seconds: 1,
+                    started_micros: 1,
+                },
+                nonce: Uuid::now_v7(),
+                secret_revision: Some(0),
+            },
+            Event::SessionReady {
+                session: "dummy-merge-session".into(),
+            },
+            Event::ReserveStart { command },
+            Event::Started {
+                command,
+                turn: Uuid::now_v7(),
+            },
+            Event::HostClosed {
+                outcome: RunOutcome::Completed,
+            },
+        ] {
+            if matches!(event, Event::WorkspaceReady) && run.workspace_ready {
+                continue;
+            }
+            run = journal
+                .repair_transition(Uuid::now_v7(), run.id, run.revision, event)
+                .await?;
+        }
+        Ok(run)
+    }
+    let run_workspace = intercat_daemon::run_workspace::Workspace::prepare(
+        &input,
+        &candidate.workspace,
+        &f._root.path().join("merge-run"),
+        &run,
+        &settings,
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    let run_workspace = std::sync::Arc::new(run_workspace);
+    run = complete(&f.journal, run).await?;
+    let failed = intercat_daemon::repair_application::apply(
+        &f.journal,
+        &run,
+        run_workspace.clone(),
+        candidate.workspace.clone(),
+        f._root.path().join("unresolved-merge"),
+        f._root.path().join("merge-downloads"),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    assert_eq!(failed.phase, Phase::Failed);
+    assert_eq!(failed.failure, Some(Failure::Capture));
+    assert!(
+        !Repository::open(&run_workspace.checkout().workdir)?
+            .unmerged_paths()?
+            .is_empty()
+    );
+    run = f
+        .journal
+        .repair_control(intercat_daemon::repair_run::Command {
+            op_id: Uuid::now_v7(),
+            id: failed.id,
+            revision: failed.revision,
+            action: Control::Resume,
+        })
+        .await?;
+    assert_eq!(run.session, failed.session);
+    fs::write(
+        run_workspace.checkout().workdir.join("file.txt"),
+        "worker A and B resolved\n",
+    )?;
+    assert!(
+        run_workspace
+            .checkout()
+            .git(
+                &["add".into(), "--".into(), "file.txt".into()],
+                true,
+                tokio::sync::watch::channel(false).1
+            )
+            .await?
+            .success()
+    );
+    run = complete(&f.journal, run).await?;
+    let done = intercat_daemon::repair_application::apply(
+        &f.journal,
+        &run,
+        run_workspace,
+        candidate.workspace.clone(),
+        f._root.path().join("admitted-merge"),
+        f._root.path().join("merge-downloads"),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    assert_eq!(done.phase, Phase::Done);
+    let admitted: Job =
+        serde_json::from_value(f.journal.snapshot().await?["integrations"][0].clone())?;
+    assert_eq!(admitted.status, Status::Checked, "{:?}", admitted.error);
+    assert!(admitted.plan.as_ref().unwrap().tree.is_some());
+    assert!(
+        admitted
+            .plan
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .all(|row| row.conflicts.is_empty())
+    );
+    f.action(commit_action(&admitted)).await?;
+    assert_eq!(finished(&f.journal).await?.status, Status::Done);
+    assert_eq!(
+        fs::read_to_string(f.workspaces[1].path.join("file.txt"))?,
+        "later unsaved B work\n"
+    );
+    f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn merged_api_repair_keeps_prefix_and_moves_the_fix_to_its_required_later_commit()
+-> Result<()> {
+    use intercat_daemon::{
+        check_run::CheckCommand,
+        check_settings::Change,
+        repair_run::{Event, Outcome, Phase, Purpose, Request},
+    };
+    let f = Fixture::new(3).await?;
+    fs::write(f.workspaces[0].path.join("api.txt"), "newCall\n")?;
+    f.save(0, None).await?;
+    fs::write(f.workspaces[1].path.join("caller.txt"), "oldCall\n")?;
+    f.save(1, None).await?;
+    fs::write(f.workspaces[2].path.join("third.txt"), "C only\n")?;
+    f.save(2, None).await?;
+    let project = f.journal.snapshot().await?["project"]["folders"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.journal
+        .change_check_settings(Change {
+            op_id: Uuid::now_v7(),
+            revision: 0,
+            folder: project,
+            command: CheckCommand::Run("test \"$(cat api.txt)\" = \"$(cat caller.txt)\"".into()),
+            history: false,
+        })
+        .await?;
+    let opened = f.open().await?;
+    f.action(Action::Prepare {
+        id: opened.id,
+        revision: opened.revision,
+    })
+    .await?;
+    let failed = finished(&f.journal).await?;
+    let original = failed.candidate.as_ref().unwrap();
+    assert_eq!(
+        original.state,
+        intercat_daemon::candidate::State::CheckFailed
+    );
+    assert_eq!(original.check.as_ref().unwrap().code, Some(1));
+    assert_eq!(original.commits.len(), 3);
+    fs::write(
+        f.workspaces[1].path.join("caller.txt"),
+        "B's later unsaved work\n",
+    )?;
+    let mut run = f
+        .journal
+        .repair_start(Request {
+            op_id: Uuid::now_v7(),
+            owner: intercat_daemon::repair_run::Owner::Commit {
+                id: failed.id,
+                revision: failed.revision,
+            },
+            track: f.workspaces[0].track_id.clone(),
+            purpose: Purpose::Check,
+        })
+        .await?;
+    let (_, input, settings) = f.journal.repair_input(run.id).await?;
+    let workspace = std::sync::Arc::new(
+        intercat_daemon::run_workspace::Workspace::prepare(
+            &input,
+            &original.workspace,
+            &f._root.path().join("api-fix"),
+            &run,
+            &settings,
+            tokio::sync::watch::channel(false).1,
+        )
+        .await?,
+    );
+    for (path, text) in [
+        ("api.txt", "newCall\n"),
+        ("caller.txt", "oldCall\n"),
+        ("third.txt", "C only\n"),
+    ] {
+        assert_eq!(
+            fs::read_to_string(workspace.checkout().workdir.join(path))?,
+            text
+        );
+    }
+    let source_read = workspace
+        .checkout()
+        .run_check(
+            &format!(
+                "cat '{}'",
+                f.workspaces[1].path.join("caller.txt").display()
+            ),
+            &std::collections::BTreeMap::new(),
+            tokio::sync::watch::channel(false).1,
+            Duration::from_secs(5),
+        )
+        .await?;
+    assert!(!source_read.success());
+    assert!(source_read.stdout.is_empty());
+    fs::write(workspace.checkout().workdir.join("caller.txt"), "newCall\n")?;
+    let command = Uuid::now_v7();
+    // This fixture supplies protocol metadata only. Native host/turn/Stop
+    // behavior is separately verified with the free echo provider.
+    for event in [
+        Event::Prepare,
+        Event::WorkspaceReady,
+        Event::HostStarted {
+            host: intercat_daemon::process::Identity {
+                pid: 42,
+                started_seconds: 1,
+                started_micros: 1,
+            },
+            nonce: Uuid::now_v7(),
+            secret_revision: Some(0),
+        },
+        Event::SessionReady {
+            session: "dummy-api-fix".into(),
+        },
+        Event::ReserveStart { command },
+        Event::Started {
+            command,
+            turn: Uuid::now_v7(),
+        },
+        Event::HostClosed {
+            outcome: Outcome::Completed,
+        },
+    ] {
+        run = f
+            .journal
+            .repair_transition(Uuid::now_v7(), run.id, run.revision, event)
+            .await?;
+    }
+    assert_eq!(run.phase, Phase::Captured);
+    let done = intercat_daemon::repair_application::apply(
+        &f.journal,
+        &run,
+        workspace,
+        original.workspace.clone(),
+        f._root.path().join("api-fixed-candidate"),
+        f._root.path().join("downloads"),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    assert_eq!(done.phase, Phase::Done);
+    let job: Job = serde_json::from_value(f.journal.snapshot().await?["integrations"][0].clone())?;
+    assert_eq!(job.status, Status::Checked, "{:?}", job.error);
+    let candidate = job.candidate.as_ref().unwrap();
+    let repair = candidate.repair.as_ref().unwrap();
+    assert_eq!(repair.requested_track, f.workspaces[0].track_id);
+    assert_eq!(repair.applied_track, f.workspaces[1].track_id);
+    assert_eq!(candidate.commits[0].sha, original.commits[0].sha);
+    assert_ne!(candidate.commits[1].sha, original.commits[1].sha);
+    assert_ne!(candidate.commits[2].sha, original.commits[2].sha);
+    let repository = Repository::open(candidate.workspace.join("repo"))?;
+    let b = repository.tree_files(candidate.commits[1].tree.parse()?)?;
+    assert_eq!(repository.saved_bytes(&b["caller.txt"])?, b"newCall\n");
+    assert!(!b.contains_key("third.txt"));
+    let final_files = repository.tree_files(candidate.tree.parse()?)?;
+    assert_eq!(
+        repository.saved_bytes(&final_files["third.txt"])?,
+        b"C only\n"
+    );
+    assert_eq!(candidate.check.as_ref().unwrap().code, Some(0));
+    assert_eq!(
+        job.fixes.keys().collect::<Vec<_>>(),
+        vec![&f.workspaces[1].track_id]
+    );
+    assert_eq!(
+        job.fixes[&f.workspaces[1].track_id]
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["caller.txt".to_owned()]
+    );
+    f.action(commit_action(&job)).await?;
+    assert_eq!(finished(&f.journal).await?.status, Status::Done);
+    assert_eq!(
+        fs::read_to_string(f.workspaces[1].path.join("caller.txt"))?,
+        "B's later unsaved work\n"
+    );
+    // A later Commit in this folder is the realignment target, even though
+    // the pending fix belongs to B in the preceding Commit.
+    fs::write(
+        f.workspaces[2].path.join("third-next.txt"),
+        "C later change\n",
+    )?;
+    f.save(2, job.tracks[2].checkpoint.clone()).await?;
+    let later = f
+        .action(Action::Open {
+            tracks: Some(vec![f.workspaces[2].track_id.clone()]),
+        })
+        .await?;
+    f.action(Action::Prepare {
+        id: later.id,
+        revision: later.revision,
+    })
+    .await?;
+    let checked_later = finished(&f.journal).await?;
+    assert_eq!(checked_later.status, Status::Checked);
+    f.action(commit_action(&checked_later)).await?;
+    let latest = finished(&f.journal).await?;
+    assert_eq!(latest.status, Status::Done);
+    // Attach a dummy idle SDK identity without starting a host or a model.
+    f.journal
+        .worker_state(intercat_daemon::runtime::WorkerState {
+            track_id: f.workspaces[1].track_id.clone(),
+            phase: "ready".into(),
+            session_id: Some("dummy-followup-session".into()),
+            identity: None,
+            secret_revision: Some(0),
+            detail: None,
+            active_turn: None,
+            approvals: vec![],
+            prompts: vec![],
+            output: None,
+            checkpoint_pending: false,
+            checkpoint: job.tracks[1].checkpoint.clone(),
+        })
+        .await?;
+    let proposal = f.journal.snapshot().await?["proposal"].clone();
+    assert_eq!(proposal["kind"], "integration-fix");
+    assert_eq!(proposal["trackId"], f.workspaces[1].track_id);
+    assert_eq!(proposal["source"]["jobId"], latest.id.to_string());
+    assert_eq!(proposal["source"]["fixJobId"], job.id.to_string());
+    let command = intercat_daemon::proposals::Command {
+        op_id: Uuid::now_v7(),
+        proposal_id: serde_json::from_value(proposal["id"].clone())?,
+        action: intercat_daemon::proposals::Action::Realign,
+    };
+    let response = f.journal.answer_proposal(command.clone()).await?;
+    assert_eq!(response["realignment"]["phase"], "queued");
+    assert_eq!(f.journal.answer_proposal(command).await?, response);
+    assert_eq!(
+        f.journal.snapshot().await?["realignments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let next_proposal = f.journal.snapshot().await?["proposal"].clone();
+    assert_ne!(
+        next_proposal["id"], proposal["id"],
+        "An answered realignment must not be offered again."
+    );
+    assert_eq!(
+        fs::read_to_string(f.workspaces[1].path.join("caller.txt"))?,
+        "B's later unsaved work\n"
+    );
+    f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn manual_merge_keeps_held_files_and_only_checks_explicit_frozen_choices() -> Result<()> {
+    use intercat_daemon::{
+        merge_manual::{Apply, Edit},
+        repair_run::{Command as RunCommand, Control, Event, Phase, Purpose, Request},
+    };
+    let f = Fixture::new(3).await?;
+    for (index, text) in ["A の変更\n", "B の変更\n"].into_iter().enumerate() {
+        fs::write(f.workspaces[index].path.join("file.txt"), text)?;
+        f.save(index, None).await?;
+    }
+    fs::write(f.workspaces[2].path.join("third.txt"), "later C\n")?;
+    f.save(2, None).await?;
+    let opened = f.open().await?;
+    f.action(Action::Prepare {
+        id: opened.id,
+        revision: opened.revision,
+    })
+    .await?;
+    let failed = finished(&f.journal).await?;
+    let prefix = failed.candidate.as_ref().unwrap().commits[0].sha.clone();
+    let mut run = f
+        .journal
+        .repair_start(Request {
+            op_id: Uuid::now_v7(),
+            owner: intercat_daemon::repair_run::Owner::Commit {
+                id: failed.id,
+                revision: failed.revision,
+            },
+            track: f.workspaces[1].track_id.clone(),
+            purpose: Purpose::Merge,
+        })
+        .await?;
+    run = f
+        .journal
+        .repair_control(RunCommand {
+            op_id: Uuid::now_v7(),
+            id: run.id,
+            revision: run.revision,
+            action: Control::Stop,
+        })
+        .await?;
+    run = f
+        .journal
+        .repair_transition(Uuid::now_v7(), run.id, run.revision, Event::BeginManual)
+        .await?;
+    let (_, job, settings) = f.journal.repair_input(run.id).await?;
+    let root = f._root.path().join(format!("manual-{}", run.id));
+    let workspace = intercat_daemon::merge_resolution::Workspace::prepare(
+        &job,
+        &job.candidate.as_ref().unwrap().workspace,
+        &root,
+        &run.track,
+        &settings,
+        run.id,
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    run = f
+        .journal
+        .repair_transition(Uuid::now_v7(), run.id, run.revision, Event::WorkspaceReady)
+        .await?;
+    let view = intercat_daemon::merge_editor::view(&workspace.files, &run, None)?;
+    assert_eq!(view.paths, ["file.txt"]);
+    assert_eq!(
+        intercat_daemon::merge_manual::hunks(view.file.text.as_ref().unwrap(), run.id)?.len(),
+        1
+    );
+    assert_eq!(
+        view.file.sides.target.as_ref().unwrap().text.as_deref(),
+        Some("A の変更\n")
+    );
+    assert_eq!(
+        view.file.sides.incoming.as_ref().unwrap().text.as_deref(),
+        Some("B の変更\n")
+    );
+    let held = fs::read(workspace.files.checkout.workdir.join("file.txt"))?;
+    let held_index = fs::read(workspace.files.checkout.workdir.join(".git/index"))?;
+    let mut request = Apply {
+        op_id: Uuid::now_v7(),
+        id: run.id,
+        revision: run.revision,
+        files: vec![Edit::Text {
+            path: "file.txt".into(),
+            version: view.file.version.clone(),
+            text: view.file.text.clone().unwrap(),
+        }],
+    };
+    assert!(
+        intercat_daemon::merge_editor::save(&workspace.files, &request).is_err(),
+        "own markers cannot be submitted"
+    );
+    request.files = vec![Edit::Text {
+        path: "file.txt".into(),
+        version: "stale".into(),
+        text: "人が選んだ解決\n".into(),
+    }];
+    assert!(intercat_daemon::merge_editor::save(&workspace.files, &request).is_err());
+    request.files = vec![Edit::Text {
+        path: "file.txt".into(),
+        version: view.file.version,
+        text: "人が選んだ解決\n".into(),
+    }];
+    let saved = intercat_daemon::merge_editor::save(&workspace.files, &request)?;
+    assert_eq!(
+        saved.sha,
+        intercat_daemon::merge_editor::save(&workspace.files, &request)?.sha
+    );
+    let cleanup = intercat_daemon::run_processes::Remaining {
+        nonce: request.op_id,
+        host: None,
+        directory: f._root.path().join("dummy-host"),
+        workspace: workspace.files.checkout.workdir.clone(),
+        label: "B".into(),
+        session_name: "Dummy".into(),
+        created_at: 1,
+        revision: 0,
+        state: intercat_daemon::run_processes::State::Cleaning,
+        error: None,
+    };
+    run = f
+        .journal
+        .repair_transition(
+            request.op_id,
+            run.id,
+            run.revision,
+            Event::CaptureManual {
+                snapshot: saved.clone(),
+                cleanup: Box::new(cleanup),
+            },
+        )
+        .await?;
+    assert_eq!(run.phase, Phase::Captured);
+    assert!(run.host.is_none());
+    let candidate_root = job.candidate.as_ref().unwrap().workspace.clone();
+    let done = intercat_daemon::repair_application::apply(
+        &f.journal,
+        &run,
+        std::sync::Arc::new(intercat_daemon::run_workspace::Workspace::Merge(workspace)),
+        candidate_root,
+        f._root.path().join("manual-rebuilt"),
+        f._root.path().join("downloads"),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    assert_eq!(done.phase, Phase::Done);
+    let admitted: Job =
+        serde_json::from_value(f.journal.snapshot().await?["integrations"][0].clone())?;
+    let candidate = admitted.candidate.as_ref().unwrap();
+    assert_eq!(admitted.status, Status::Checked, "{:?}", admitted.error);
+    assert_eq!(candidate.commits.len(), 3);
+    assert_eq!(candidate.commits[0].sha, prefix);
+    let repo = Repository::open(candidate.workspace.join("repo"))?;
+    let files = repo.tree_files(candidate.tree.parse()?)?;
+    assert_eq!(
+        repo.saved_bytes(&files["file.txt"])?,
+        "人が選んだ解決\n".as_bytes()
+    );
+    assert_eq!(repo.saved_bytes(&files["third.txt"])?, b"later C\n");
+    assert_eq!(fs::read(root.join("repo/file.txt"))?, held);
+    assert_eq!(fs::read(root.join("repo/.git/index"))?, held_index);
+    let db = rusqlite::Connection::open(f._root.path().join("events.sqlite"))?;
+    for (table, column) in [
+        ("events", "payload"),
+        ("operations", "payload"),
+        ("repair_runs", "record"),
+    ] {
+        let sql = format!("SELECT count(*) FROM {table} WHERE instr({column},'人が選んだ解決')>0");
+        assert_eq!(db.query_row(&sql, [], |row| row.get::<_, i64>(0))?, 0);
+    }
+    f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn manual_merge_runtime_converts_filters_lfs_binary_and_deletion_without_a_model()
+-> Result<()> {
+    use intercat_daemon::{
+        merge_manual::{Apply, Begin, Edit, Read, Side},
+        repair_run::{Phase, Purpose, Request},
+    };
+    async fn keep_binary(f: &Fixture, job: Job) -> Result<Job> {
+        let candidate = job.candidate.as_ref().expect("binary review candidate");
+        assert_eq!(job.status, Status::Failed);
+        assert_eq!(
+            candidate.state,
+            intercat_daemon::candidate::State::SecretFound
+        );
+        assert!(candidate.check.is_none());
+        let finding = candidate
+            .secret_scans
+            .last()
+            .unwrap()
+            .findings
+            .iter()
+            .find(|item| {
+                item.path == "file.txt"
+                    && item.rule == intercat_daemon::secret_scan::BINARY_REVIEW_RULE
+            })
+            .expect("binary coverage review for this commit");
+        f.action(Action::KeepSecret {
+            id: job.id,
+            revision: job.revision,
+            finding: finding.id.clone(),
+        })
+        .await?;
+        finished(&f.journal).await
+    }
+    for kind in ["filter", "lfs", "lfs-binary", "binary", "deletion"] {
+        let f = Fixture::new(2).await?;
+        match kind {
+            "filter" => {
+                git(
+                    &f.source,
+                    &["config", "filter.fixture.clean", "sed s/WORK:/GIT:/g"],
+                );
+                git(
+                    &f.source,
+                    &["config", "filter.fixture.smudge", "sed s/GIT:/WORK:/g"],
+                );
+                git(&f.source, &["config", "filter.fixture.required", "true"]);
+            }
+            "lfs" | "lfs-binary" => {
+                let tool = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.tools/git-lfs-3.8.1/git-lfs")
+                    .canonicalize()?;
+                for (field, command) in [
+                    ("clean", "clean -- %f"),
+                    ("smudge", "smudge -- %f"),
+                    ("process", "filter-process"),
+                ] {
+                    git(
+                        &f.source,
+                        &[
+                            "config",
+                            &format!("filter.lfs.{field}"),
+                            &format!("'{}' {command}", tool.display()),
+                        ],
+                    );
+                }
+                git(&f.source, &["config", "filter.lfs.required", "true"]);
+                git(
+                    &f.source,
+                    &["config", "lfs.storage", "../../dummy-merge-lfs"],
+                );
+            }
+            _ => {}
+        }
+        for (index, word) in ["A", "B"].into_iter().enumerate() {
+            let worker = &f.workspaces[index].path;
+            match kind {
+                "filter" => {
+                    fs::write(worker.join(".gitattributes"), "file.txt filter=fixture\n")?;
+                    fs::write(worker.join("file.txt"), format!("WORK:{word}\n"))?;
+                }
+                "lfs" | "lfs-binary" => {
+                    fs::write(worker.join(".gitattributes"), "file.txt filter=lfs -text\n")?;
+                    if kind == "lfs-binary" {
+                        fs::write(worker.join("file.txt"), [0, word.as_bytes()[0], 0, 255])?;
+                    } else {
+                        fs::write(worker.join("file.txt"), format!("LFS {word}\n"))?;
+                    }
+                }
+                "binary" => fs::write(worker.join("file.txt"), [0, word.as_bytes()[0], 0, 255])?,
+                "deletion" if index == 1 => fs::remove_file(worker.join("file.txt"))?,
+                _ => fs::write(worker.join("file.txt"), format!("{word}\n"))?,
+            }
+            f.save(index, None).await?;
+        }
+        let opened = f.open().await?;
+        f.action(Action::Prepare {
+            id: opened.id,
+            revision: opened.revision,
+        })
+        .await?;
+        let mut failed = finished(&f.journal).await?;
+        if kind == "binary" {
+            failed = keep_binary(&f, failed).await?;
+        }
+        assert!(failed.candidate.is_some(), "{kind}: {:?}", failed.error);
+        assert_eq!(
+            failed.candidate.as_ref().unwrap().state,
+            intercat_daemon::candidate::State::Conflict,
+            "{kind}: {:?}",
+            failed.error
+        );
+        let prefix = failed.candidate.as_ref().unwrap().commits[0].sha.clone();
+        let data = f._root.path().join("data");
+        fs::create_dir_all(&data)?;
+        let runtime = intercat_daemon::repair_service::Runtime::start(
+            intercat_daemon::host_memory::Pool::new(),
+            f.journal.clone(),
+            f._root.path().join("integration"),
+            data,
+            f._root.path().join("rpc"),
+            std::sync::Arc::new(intercat_daemon::scheduler::Capacity::new(0)),
+            f.service.clone(),
+            f.project_secrets.clone(),
+            std::sync::Arc::new(intercat_daemon::dispatch_control::Gate::new(false)),
+        );
+        assert!(f.journal.worker_config().await?.is_none());
+        let request = Request {
+            op_id: Uuid::now_v7(),
+            owner: intercat_daemon::repair_run::Owner::Commit {
+                id: failed.id,
+                revision: failed.revision,
+            },
+            track: f.workspaces[1].track_id.clone(),
+            purpose: Purpose::Merge,
+        };
+        let mut run = runtime.service.start_manual(request.clone()).await?;
+        assert_eq!(run.phase, Phase::Manual);
+        assert!(run.workspace_ready);
+        assert!(run.session.is_none());
+        assert_eq!(
+            runtime.service.start_manual(request).await?.revision,
+            run.revision
+        );
+        let read = Read {
+            id: run.id,
+            revision: run.revision,
+            path: Some("file.txt".into()),
+        };
+        let view = runtime.service.read_manual(read).await?;
+        if kind == "binary" {
+            assert!(view.file.text.is_none());
+            assert!(view.file.sides.target.as_ref().unwrap().text.is_none());
+            assert!(view.file.sides.incoming.as_ref().unwrap().text.is_none());
+        }
+        let edit = if kind == "filter" {
+            assert_eq!(
+                view.file.sides.target.as_ref().unwrap().text.as_deref(),
+                Some("WORK:A\n")
+            );
+            assert_eq!(
+                view.file.sides.incoming.as_ref().unwrap().text.as_deref(),
+                Some("WORK:B\n")
+            );
+            assert!(!view.file.text.as_ref().unwrap().contains("GIT:"));
+            let path = runtime
+                .service
+                .open_manual(intercat_daemon::merge_manual::Open {
+                    op_id: Uuid::now_v7(),
+                    id: run.id,
+                    revision: run.revision,
+                    path: "file.txt".into(),
+                })
+                .await?;
+            assert_eq!(fs::read_to_string(path)?, view.file.text.clone().unwrap());
+            run = f.journal.repair_input(run.id).await?.0;
+            assert!(run.external_editor);
+            assert!(
+                runtime
+                    .service
+                    .apply_manual(Apply {
+                        op_id: Uuid::now_v7(),
+                        id: run.id,
+                        revision: run.revision,
+                        files: vec![Edit::Text {
+                            path: "file.txt".into(),
+                            version: view.file.version.clone(),
+                            text: "WORK:human\n".into()
+                        }]
+                    })
+                    .await
+                    .is_err()
+            );
+            run = runtime
+                .service
+                .return_manual(Begin {
+                    op_id: Uuid::now_v7(),
+                    id: run.id,
+                    revision: run.revision,
+                })
+                .await?;
+            Edit::Text {
+                path: "file.txt".into(),
+                version: view.file.version,
+                text: "WORK:human\n".into(),
+            }
+        } else {
+            if kind == "lfs" {
+                assert_eq!(
+                    view.file.sides.target.as_ref().unwrap().text.as_deref(),
+                    Some("LFS A\n")
+                );
+                assert_eq!(
+                    view.file.sides.incoming.as_ref().unwrap().text.as_deref(),
+                    Some("LFS B\n")
+                );
+                assert!(
+                    !view
+                        .file
+                        .text
+                        .as_ref()
+                        .unwrap()
+                        .contains("version https://git-lfs")
+                );
+            }
+            Edit::Side {
+                path: "file.txt".into(),
+                version: view.file.version,
+                side: Side::Incoming,
+            }
+        };
+        let apply = Apply {
+            op_id: Uuid::now_v7(),
+            id: run.id,
+            revision: run.revision,
+            files: vec![edit],
+        };
+        let uploaded = if kind == "filter" {
+            use std::os::unix::fs::PermissionsExt;
+            let parent = f._root.path().join("data/merge-inputs");
+            fs::create_dir(&parent)?;
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
+            let input = format!("{}-ABC123", apply.op_id);
+            let directory = parent.join(&input);
+            fs::create_dir(&directory)?;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+            let bytes = serde_json::to_vec(&apply)?;
+            let path = directory.join("input.json");
+            fs::write(&path, &bytes)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            let uploaded = intercat_daemon::merge_transport::Uploaded {
+                op_id: apply.op_id,
+                id: apply.id,
+                revision: apply.revision,
+                digest: intercat_daemon::merge_editor::digest(&bytes),
+                input,
+            };
+            runtime.service.apply_uploaded(uploaded.clone()).await?;
+            fs::remove_dir_all(directory)?;
+            Some(uploaded)
+        } else {
+            runtime.service.apply_manual(apply.clone()).await?;
+            None
+        };
+        let mut admitted = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let snapshot = f.journal.snapshot().await?;
+                let run: intercat_daemon::repair_run::Run = serde_json::from_value(
+                    snapshot["repairRuns"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|item| item["id"] == run.id.to_string())
+                        .unwrap()
+                        .clone(),
+                )?;
+                if run.phase == Phase::Done {
+                    let job: Job = serde_json::from_value(snapshot["integrations"][0].clone())?;
+                    break Ok::<_, Box<dyn std::error::Error + Send + Sync>>(job);
+                }
+                assert!(
+                    !matches!(run.phase, Phase::Failed | Phase::NeedsRecovery),
+                    "{kind}: {snapshot}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+        if kind == "binary" {
+            admitted = keep_binary(&f, admitted).await?;
+        }
+        assert_eq!(
+            admitted.status,
+            Status::Checked,
+            "{kind}: {:?}",
+            admitted.error
+        );
+        let candidate = admitted.candidate.as_ref().unwrap();
+        assert_eq!(candidate.commits[0].sha, prefix);
+        let repo = Repository::open(candidate.workspace.join("repo"))?;
+        let files = repo.tree_files(candidate.tree.parse()?)?;
+        match kind {
+            "filter" => assert_eq!(repo.saved_bytes(&files["file.txt"])?, b"GIT:human\n"),
+            "lfs" => assert_eq!(
+                fs::read(candidate.workspace.join("repo/file.txt"))?,
+                b"LFS B\n"
+            ),
+            "lfs-binary" => {
+                assert_eq!(
+                    fs::read(candidate.workspace.join("repo/file.txt"))?,
+                    [0, b'B', 0, 255]
+                );
+                assert!(
+                    candidate
+                        .secret_scans
+                        .iter()
+                        .any(|scan| scan.unscanned_lfs.iter().any(|path| path == "file.txt"))
+                );
+            }
+            "binary" => assert_eq!(repo.saved_bytes(&files["file.txt"])?, [0, b'B', 0, 255]),
+            "deletion" => assert!(!files.contains_key("file.txt")),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            runtime.service.apply_manual(apply).await?.phase,
+            Phase::Done,
+            "lost acknowledgement remains replayable"
+        );
+        if let Some(uploaded) = uploaded {
+            assert_eq!(
+                runtime.service.apply_uploaded(uploaded).await?.phase,
+                Phase::Done,
+                "a replay does not need the deleted upload file"
+            );
+        }
+        if kind == "binary" {
+            f.action(Action::Commit {
+                id: admitted.id,
+                revision: admitted.revision,
+                head: candidate.head.clone(),
+                tree: candidate.tree.clone(),
+                settings_hash: candidate.settings_hash.clone(),
+            })
+            .await?;
+            assert_eq!(finished(&f.journal).await?.status, Status::Done);
+            let published = Repository::open(&f.source)?;
+            let files = published.tree_files(candidate.tree.parse()?)?;
+            assert_eq!(
+                published.saved_bytes(&files["file.txt"])?,
+                [0, b'B', 0, 255]
+            );
+        }
+        runtime.shutdown().await;
+        f.source_unchanged()?;
+    }
     Ok(())
 }
 
@@ -2303,7 +3980,7 @@ async fn selection_retains_frozen_refs_and_refresh_reads_the_new_boundaries() ->
         repo.compare_and_swap(reference, None, next)?;
         repo.sync_ref(reference)?;
     }
-    record_simulated_integration(&f, &opened.tracks)?;
+    record_simulated_integration(&f, &opened, advanced)?;
     let selected = f
         .action(Action::Select {
             id: opened.id,
@@ -2385,7 +4062,7 @@ async fn commands_are_idempotent_and_stale_windows_cannot_discard_or_select() ->
         })
         .await?;
     assert_eq!(dropped.status, Status::Discarded);
-    assert!(f.journal.snapshot().await?["integration"].is_null());
+    assert!(f.journal.snapshot().await?["integrations"][0].is_null());
     assert_ne!(f.open().await?.id, opened.id);
     assert_eq!(
         Repository::open(&f.source)?.reference_target(&opened.plan.unwrap().target_ref)?,
@@ -2485,7 +4162,7 @@ async fn a_second_integration_only_carries_new_work_and_keeps_other_tracks_chang
             repo.sync_ref(reference)?;
         }
     }
-    record_simulated_integration(&f, &first.tracks)?;
+    record_simulated_integration(&f, &first, committed)?;
     f.action(Action::Discard {
         id: first.id,
         revision: first.revision,
@@ -2634,7 +4311,7 @@ async fn authenticated_rpc_clients_share_the_job_and_reject_stale_actions() -> R
     assert_eq!(built.status, Status::Checked, "{:?}", built.error);
     let status = call(&mut two, "system.status", json!({})).await?;
     assert_eq!(
-        status["result"]["integration"]["candidate"]["head"],
+        status["result"]["integrations"][0]["candidate"]["head"],
         built.candidate.as_ref().unwrap().head
     );
     let candidate = built.candidate.as_ref().unwrap();
@@ -2658,7 +4335,7 @@ async fn finished(journal: &Journal) -> Result<Job> {
     tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let job: Job =
-                serde_json::from_value(journal.snapshot().await?["integration"].clone())?;
+                serde_json::from_value(journal.snapshot().await?["integrations"][0].clone())?;
             if !matches!(
                 job.status,
                 Status::Building | Status::Staging | Status::Committing
@@ -2754,7 +4431,7 @@ async fn builds_and_persists_a_candidate_without_rerunning_hooks_or_exposing_pri
     )
     .await?;
     assert_eq!(
-        reopened.snapshot().await?["integration"]["candidate"]["head"],
+        reopened.snapshot().await?["integrations"][0]["candidate"]["head"],
         candidate.head
     );
     f.action(Action::Discard {
@@ -2787,18 +4464,24 @@ async fn refresh_cancels_and_awaits_the_check_but_a_stale_request_does_not() -> 
         revision: opened.revision,
     })
     .await?;
-    let pid_path = f
+    let parent = f
         ._root
         .path()
         .join("integration")
-        .join(opened.id.to_string())
-        .join(opened.revision.to_string())
-        .join("repo/.check-pid");
+        .join(opened.id.to_string());
     let pid: u32 = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Ok(text) = fs::read_to_string(&pid_path)
-                && let Ok(pid) = text.trim().parse()
-            {
+            let pid = fs::read_dir(&parent)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok())
+                .find_map(|entry| {
+                    fs::read_to_string(entry.path().join("repo/.check-pid"))
+                        .ok()
+                        .and_then(|text| text.trim().parse().ok())
+                });
+            if let Some(pid) = pid {
                 break pid;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2857,7 +4540,7 @@ async fn an_interrupted_build_waits_for_explicit_prepare_and_uses_a_new_revision
     )
     .await?;
     let interrupted: Job =
-        serde_json::from_value(reopened.snapshot().await?["integration"].clone())?;
+        serde_json::from_value(reopened.snapshot().await?["integrations"][0].clone())?;
     assert_eq!(interrupted.status, Status::Failed);
     assert!(interrupted.candidate.is_none());
     let service = Service::new(
@@ -2987,7 +4670,7 @@ async fn secret_scan_is_persisted_without_its_value_and_cannot_become_checked_on
     )
     .await?;
     let snapshot = reopened.snapshot().await?;
-    let persisted: Job = serde_json::from_value(snapshot["integration"].clone())?;
+    let persisted: Job = serde_json::from_value(snapshot["integrations"][0].clone())?;
     assert_eq!(persisted.status, Status::Failed);
     assert_eq!(
         persisted.candidate.unwrap().secret_scans,
@@ -3055,7 +4738,7 @@ async fn commit_assumptions_follow_frozen_clips_and_are_kept_only_for_published_
     }
     recorded_assumption(&f, 0, Uuid::now_v7(), "still-running").await?;
     let checked = checked_assumptions(&f).await?;
-    let view = f.journal.snapshot().await?["integration"].clone();
+    let view = f.journal.snapshot().await?["integrations"][0].clone();
     assert_eq!(
         view["assumptions"]
             .as_array()
@@ -3172,7 +4855,7 @@ async fn late_or_changed_assumptions_require_a_new_review_and_keep_rolls_back_wi
     let old = checked_assumptions(&f).await?;
     recorded_assumption(&f, 0, saved.turn_id, "late").await?;
     assert_eq!(
-        f.journal.snapshot().await?["integration"]["assumptionsChanged"],
+        f.journal.snapshot().await?["integrations"][0]["assumptionsChanged"],
         true
     );
     let candidate = old.candidate.as_ref().unwrap();
@@ -3232,7 +4915,7 @@ async fn late_or_changed_assumptions_require_a_new_review_and_keep_rolls_back_wi
     )
     .await?;
     assert_eq!(
-        reopened.snapshot().await?["integration"]["assumptions"][0]["state"],
+        reopened.snapshot().await?["integrations"][0]["assumptions"][0]["state"],
         "kept"
     );
     let other = &kept.assumptions[1].assumption;
@@ -3245,7 +4928,7 @@ async fn late_or_changed_assumptions_require_a_new_review_and_keep_rolls_back_wi
         })
         .await?;
     assert_eq!(
-        f.journal.snapshot().await?["integration"]["assumptionsChanged"],
+        f.journal.snapshot().await?["integrations"][0]["assumptionsChanged"],
         true
     );
     f.service.shutdown().await;
@@ -3266,8 +4949,10 @@ async fn changing_a_commit_assumption_repairs_the_reviewed_tree_without_refresh(
     let assumption = &checked.assumptions[0].assumption;
     let request = Request {
         op_id: Uuid::now_v7(),
-        job_id: checked.id,
-        revision: checked.revision,
+        owner: intercat_daemon::repair_run::Owner::Commit {
+            id: checked.id,
+            revision: checked.revision,
+        },
         track: assumption.track_id.clone(),
         purpose: Purpose::Assumption {
             id: assumption.id.parse()?,
@@ -3310,7 +4995,7 @@ async fn changing_a_commit_assumption_repairs_the_reviewed_tree_without_refresh(
         .path()
         .join("integration")
         .join(input.id.to_string());
-    let source = parent.join(input.candidate.as_ref().unwrap().generation.to_string());
+    let source = input.candidate.as_ref().unwrap().workspace.clone();
     let workspace = repair::Workspace::prepare(
         &input,
         &source,
@@ -3355,7 +5040,7 @@ async fn changing_a_commit_assumption_repairs_the_reviewed_tree_without_refresh(
     let done = repair_application::apply(
         &f.journal,
         &captured,
-        std::sync::Arc::new(workspace),
+        std::sync::Arc::new(intercat_daemon::run_workspace::Workspace::Fix(workspace)),
         source,
         parent.join(input.revision.to_string()),
         f._root.path().join("integration/downloads"),
@@ -3417,7 +5102,7 @@ async fn commit_waits_for_assumption_reading_and_can_retry_an_exhausted_extracti
         .await??;
     let checked = checked_assumptions(&f).await?;
     assert_eq!(
-        f.journal.snapshot().await?["integration"]["assumptionsPending"],
+        f.journal.snapshot().await?["integrations"][0]["assumptionsPending"],
         1
     );
     let candidate = checked.candidate.as_ref().unwrap();
@@ -3439,7 +5124,7 @@ async fn commit_waits_for_assumption_reading_and_can_retry_an_exhausted_extracti
             .await?;
     }
     assert_eq!(
-        f.journal.snapshot().await?["integration"]["assumptionsFailed"],
+        f.journal.snapshot().await?["integrations"][0]["assumptionsFailed"],
         1
     );
     let retry = f
@@ -3510,7 +5195,7 @@ async fn check_environment_selection_is_frozen_and_recheck_keeps_the_saved_track
         2
     );
     assert_eq!(
-        f.journal.snapshot().await?["integration"]["settingsChanged"],
+        f.journal.snapshot().await?["integrations"][0]["settingsChanged"],
         true
     );
     assert_eq!(
@@ -3552,7 +5237,7 @@ async fn check_environment_selection_is_frozen_and_recheck_keeps_the_saved_track
     );
     assert_eq!(f.service.command(request).await?.revision, updated.revision);
     assert_eq!(
-        f.journal.snapshot().await?["integration"]["settingsChanged"],
+        f.journal.snapshot().await?["integrations"][0]["settingsChanged"],
         false
     );
     f.service.shutdown().await;
@@ -3653,7 +5338,7 @@ async fn commit_order_proposal_freezes_inputs_and_replays_the_confirmed_order() 
     assert_eq!(reopened.revision, ordered.revision);
     assert_eq!(reopened.tracks[0].id, reverse[0]);
     assert_eq!(
-        f.journal.snapshot().await?["integration"]["orderReview"]["confirmed"],
+        f.journal.snapshot().await?["integrations"][0]["orderReview"]["confirmed"],
         true
     );
     f.action(Action::Prepare {
@@ -3817,9 +5502,9 @@ async fn commit_order_write_failure_keeps_the_job_unmerged_and_can_retry() -> Re
     };
     assert!(f.service.command(request.clone()).await.is_err());
     let snapshot = f.journal.snapshot().await?;
-    assert_eq!(snapshot["integration"]["status"], "preparing");
-    assert!(snapshot["integration"]["plan"]["tree"].is_null());
-    assert!(snapshot["integration"]["candidate"].is_null());
+    assert_eq!(snapshot["integrations"][0]["status"], "preparing");
+    assert!(snapshot["integrations"][0]["plan"]["tree"].is_null());
+    assert!(snapshot["integrations"][0]["candidate"].is_null());
     db.execute_batch("DROP TRIGGER fail_order;")?;
     let proposed = f.service.command(request).await?;
     assert_eq!(proposed.status, Status::Ordering);
@@ -3842,11 +5527,275 @@ async fn commit_order_write_failure_keeps_the_job_unmerged_and_can_retry() -> Re
     db.execute_batch("CREATE TRIGGER fail_order BEFORE INSERT ON integration_order_reviews BEGIN SELECT RAISE(ABORT,'order storage full'); END;")?;
     assert!(f.service.command(confirm.clone()).await.is_err());
     assert_eq!(
-        f.journal.snapshot().await?["integration"]["revision"],
+        f.journal.snapshot().await?["integrations"][0]["revision"],
         proposed.revision
     );
     db.execute_batch("DROP TRIGGER fail_order;")?;
     assert_eq!(f.service.command(confirm).await?.status, Status::Open);
     f.source_unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn check_choices_are_frozen_and_recheck_preserves_hooked_commits() -> Result<()> {
+    use intercat_daemon::{check_run::CheckCommand, check_settings::Change};
+    let f = Fixture::new(1).await?;
+    // A changing hook makes a rebuild observably different from re-checking.
+    let hook = f.source.join(".git/hooks/pre-commit");
+    fs::write(
+        &hook,
+        "#!/bin/sh\ndate +%s%N > hook-result.txt\ngit add hook-result.txt\n",
+    )?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+    let checked = checked_for_edit(&f).await?;
+    let original = checked.candidate.as_ref().unwrap();
+    let request = Change {
+        op_id: Uuid::now_v7(),
+        revision: 0,
+        folder: checked.project.id.clone(),
+        command: CheckCommand::Run("exit 23".into()),
+        history: false,
+    };
+    let setting = f.journal.change_check_settings(request.clone()).await?;
+    assert_eq!(
+        f.journal.change_check_settings(request).await?.revision,
+        setting.revision
+    );
+    assert_eq!(
+        f.journal.snapshot().await?["integrations"][0]["settingsChanged"],
+        true
+    );
+    assert!(matches!(
+        f.journal
+            .integration_settings(checked.id, checked.revision)
+            .await?
+            .unwrap()
+            .command,
+        CheckCommand::Auto
+    ));
+    let starting = f
+        .service
+        .command(IntegrationCommand {
+            op_id: Uuid::now_v7(),
+            action: Action::Recheck {
+                id: checked.id,
+                revision: checked.revision,
+            },
+        })
+        .await?;
+    assert_eq!(starting.candidate.as_ref().unwrap().head, original.head);
+    assert!(starting.candidate.as_ref().unwrap().check.is_none());
+    let rechecked = finished(&f.journal).await?;
+    let current = rechecked.candidate.as_ref().unwrap();
+    assert_eq!(rechecked.status, Status::Failed);
+    assert_eq!(current.head, original.head);
+    assert_eq!(current.tree, original.tree);
+    assert_eq!(
+        current
+            .commits
+            .iter()
+            .map(|commit| &commit.sha)
+            .collect::<Vec<_>>(),
+        original
+            .commits
+            .iter()
+            .map(|commit| &commit.sha)
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(current.workspace, original.workspace);
+    assert_eq!(current.check.as_ref().unwrap().code, Some(23));
+    assert_ne!(current.settings_hash, original.settings_hash);
+    assert_eq!(
+        f.journal.snapshot().await?["integrations"][0]["settingsChanged"],
+        false
+    );
+    assert!(
+        f.journal
+            .change_check_settings(Change {
+                op_id: Uuid::now_v7(),
+                revision: 0,
+                folder: checked.project.id,
+                command: CheckCommand::Auto,
+                history: true
+            })
+            .await
+            .is_err()
+    );
+    f.service.shutdown().await;
+    let reopened = Journal::open(
+        f._root.path().join("events.sqlite"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await?;
+    assert_eq!(reopened.check_settings().await?.revision, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recheck_rescans_the_same_commits_with_new_values_and_keeps_only_reviewed_findings()
+-> Result<()> {
+    use intercat_daemon::{candidate::State, check_environment::Change};
+    let f = Fixture::new(1).await?;
+    fs::write(
+        f.workspaces[0].path.join("file.txt"),
+        "agent-created-dummy-value-4839\n",
+    )?;
+    f.save(0, None).await?;
+    let opened = f.open().await?;
+    f.action(Action::Prepare {
+        id: opened.id,
+        revision: opened.revision,
+    })
+    .await?;
+    let checked = finished(&f.journal).await?;
+    assert_eq!(checked.status, Status::Checked);
+    let file = f.source.join(".env.test");
+    fs::write(&file, "CHECK_TOKEN=agent-created-dummy-value-4839\n")?;
+    f.journal
+        .change_check_environment(Change {
+            op_id: Uuid::now_v7(),
+            revision: 0,
+            file: Some(file),
+        })
+        .await?;
+    f.action(Action::Recheck {
+        id: checked.id,
+        revision: checked.revision,
+    })
+    .await?;
+    let blocked = finished(&f.journal).await?;
+    assert_eq!(
+        blocked.candidate.as_ref().unwrap().state,
+        State::SecretFound
+    );
+    assert_eq!(
+        blocked.candidate.as_ref().unwrap().head,
+        checked.candidate.as_ref().unwrap().head
+    );
+    let finding = blocked
+        .candidate
+        .as_ref()
+        .unwrap()
+        .secret_scans
+        .last()
+        .unwrap()
+        .findings[0]
+        .id
+        .clone();
+    let removal = f
+        .journal
+        .repair_start(intercat_daemon::repair_run::Request {
+            op_id: Uuid::now_v7(),
+            owner: intercat_daemon::repair_run::Owner::Commit {
+                id: blocked.id,
+                revision: blocked.revision,
+            },
+            track: blocked.tracks[0].id.clone(),
+            purpose: intercat_daemon::repair_run::Purpose::RemoveSecret {
+                finding: finding.clone(),
+            },
+        })
+        .await?;
+    assert_eq!(removal.phase, intercat_daemon::repair_run::Phase::Queued);
+    f.journal
+        .repair_control(intercat_daemon::repair_run::Command {
+            op_id: Uuid::now_v7(),
+            id: removal.id,
+            revision: removal.revision,
+            action: intercat_daemon::repair_run::Control::Discard,
+        })
+        .await?;
+    let blocked = f.journal.repair_input(removal.id).await?.1;
+    f.action(Action::KeepSecret {
+        id: blocked.id,
+        revision: blocked.revision,
+        finding: finding.clone(),
+    })
+    .await?;
+    let accepted = finished(&f.journal).await?;
+    assert_eq!(accepted.status, Status::Checked, "{:?}", accepted.error);
+    assert!(accepted.kept_secrets.contains(&finding));
+    assert_eq!(
+        accepted.candidate.as_ref().unwrap().head,
+        checked.candidate.as_ref().unwrap().head
+    );
+    f.action(commit_action(&accepted)).await?;
+    assert_eq!(finished(&f.journal).await?.status, Status::Done);
+    f.service.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_required_check_waits_for_a_choice_and_rechecks_the_same_candidate() -> Result<()> {
+    use intercat_daemon::{candidate::State, check_run::CheckCommand, check_settings::Change};
+    let f = Fixture::new(1).await?;
+    git(&f.source, &["tag", "dummy-version"]);
+    let checked = checked_for_edit(&f).await?;
+    f.journal
+        .change_check_settings(Change {
+            op_id: Uuid::now_v7(),
+            revision: 0,
+            folder: checked.project.id.clone(),
+            command: CheckCommand::Run("git describe --tags".into()),
+            history: false,
+        })
+        .await?;
+    f.action(Action::Recheck {
+        id: checked.id,
+        revision: checked.revision,
+    })
+    .await?;
+    let question = finished(&f.journal).await?;
+    assert_eq!(
+        question.candidate.as_ref().unwrap().state,
+        State::HistoryRequired
+    );
+    let failure = f
+        .action(Action::TreatCheckAsFailure {
+            id: question.id,
+            revision: question.revision,
+        })
+        .await?;
+    assert_eq!(
+        failure.candidate.as_ref().unwrap().state,
+        State::CheckFailed
+    );
+    f.journal
+        .change_check_settings(Change {
+            op_id: Uuid::now_v7(),
+            revision: 1,
+            folder: checked.project.id.clone(),
+            command: CheckCommand::Run("git describe --tags".into()),
+            history: true,
+        })
+        .await?;
+    f.action(Action::Recheck {
+        id: failure.id,
+        revision: failure.revision,
+    })
+    .await?;
+    let current = finished(&f.journal).await?;
+    assert_eq!(current.status, Status::Checked, "{:?}", current.error);
+    assert!(
+        current
+            .candidate
+            .as_ref()
+            .unwrap()
+            .check
+            .as_ref()
+            .unwrap()
+            .stdout
+            .contains("dummy-version")
+    );
+    assert_eq!(
+        current.candidate.as_ref().unwrap().head,
+        checked.candidate.as_ref().unwrap().head
+    );
+    assert_ne!(
+        current.candidate.as_ref().unwrap().workspace,
+        checked.candidate.as_ref().unwrap().workspace
+    );
+    f.service.shutdown().await;
     Ok(())
 }

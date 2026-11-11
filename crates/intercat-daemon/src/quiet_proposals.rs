@@ -55,7 +55,7 @@ fn activity(db: &Connection) -> Result<i64> {
     // do not extend the quiet interval. Draft edits and actual work do.
     Ok(db.query_row("SELECT coalesce(max(seq),0) FROM events WHERE
         kind GLOB 'utterance.*' OR kind GLOB 'draft.*' OR kind GLOB 'integration.*'
-        OR kind GLOB 'history.*' OR kind='worker.state' OR kind='proposal.answered'
+        OR kind GLOB 'history.*' OR kind GLOB 'commit.group.*' OR kind='worker.state' OR kind='proposal.answered'
         OR (kind='msp.applied' AND (json_extract(payload,'$.method') GLOB 'item/*' OR json_extract(payload,'$.method') GLOB 'turn/*'))",
         [], |row|row.get(0))?)
 }

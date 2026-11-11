@@ -34,6 +34,7 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, WorkerState)> {
         .to_owned();
     journal
         .workspace_result(intercat_daemon::preparation::Workspace {
+            denied_roots: Vec::new(),
             track_id: track.clone(),
             path: root.path().join("worker"),
             reference: "refs/intercat/test/tracks/A".into(),
@@ -153,7 +154,8 @@ async fn correction_waits_for_its_exact_checkpoint_and_a_wrong_session_cannot_di
                 id.clone(),
                 1,
                 worker.track_id.clone(),
-                json!({"sessionId":"session"})
+                json!({"sessionId":"session"}),
+                None,
             )
             .await
             .is_err()
@@ -205,7 +207,8 @@ async fn correction_waits_for_its_exact_checkpoint_and_a_wrong_session_cannot_di
                 id.clone(),
                 1,
                 worker.track_id.clone(),
-                json!({"sessionId":"other"})
+                json!({"sessionId":"other"}),
+                None,
             )
             .await
             .is_err()
@@ -218,6 +221,7 @@ async fn correction_waits_for_its_exact_checkpoint_and_a_wrong_session_cannot_di
             1,
             worker.track_id.clone(),
             json!({"commandId":operation,"sessionId":"session"}),
+            None,
         )
         .await?;
     journal.try_msp(worker.track_id, "session".into(), intercat_daemon::clock::Stamp::now(), json!({"method":"item/updated","params":{"sessionId":"session","turnId":operation,"item":{"itemId":"correction-received","turnId":operation,"kind":"userMessage","commandId":operation,"revision":1,"status":"completed"}}}), None, None)?.await??;
@@ -322,7 +326,7 @@ async fn execution_interrupts_only_the_captured_turn_without_a_running_editor() 
         let (port, commands) = intercat_daemon::execution::Port::new(std::sync::Arc::new(
             intercat_daemon::dispatch_control::Gate::new(false),
         ));
-        port.attach(connection.client.clone(), "session".into());
+        port.attach(connection.client.clone(), "session".into(), None);
         let mut context = intercat_daemon::execution::Context {
             project_secrets: Default::default(),
             port,
@@ -411,7 +415,7 @@ async fn a_queued_start_of_a_held_correction_cannot_override_a_newer_stop() -> R
         ));
         port.stop(Uuid::now_v7())?;
         let _ = commands.try_recv()?;
-        port.attach(connection.client.clone(), "session".into());
+        port.attach(connection.client.clone(), "session".into(), None);
         let start_id = Uuid::now_v7();
         let start_port = port.clone();
         let start = tokio::spawn(async move { start_port.start(start_id).await });

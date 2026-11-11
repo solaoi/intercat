@@ -17,6 +17,179 @@ fn git(path: &std::path::Path, args: &[&str]) -> String {
 }
 
 #[tokio::test]
+async fn sparse_project_selection_and_worker_preparation_preserve_the_human_checkout()
+-> intercat_daemon::Result<()> {
+    use intercat_daemon::{
+        checkpoint,
+        decision::{Decision, Kind, Outcome},
+        preparation::{Preparation, Workspace},
+    };
+    use std::{fs, time::Duration};
+    for mode in ["cone", "non-cone", "sparse-index", "split-index"] {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source");
+        fs::create_dir(&source)?;
+        git(&source, &["init", "-q", "-b", "main"]);
+        for name in [
+            "inside/file.txt",
+            "outside/changed.txt",
+            "outside/retained.txt",
+        ] {
+            let path = source.join(name);
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(path, "before\n")?;
+        }
+        git(&source, &["add", "-A"]);
+        git(
+            &source,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "Sparse project baseline",
+            ],
+        );
+        if mode == "non-cone" {
+            git(&source, &["sparse-checkout", "init", "--no-cone"]);
+            git(
+                &source,
+                &["sparse-checkout", "set", "--no-cone", "/inside/"],
+            );
+        } else {
+            git(
+                &source,
+                &[
+                    "sparse-checkout",
+                    "init",
+                    "--cone",
+                    if mode == "sparse-index" {
+                        "--sparse-index"
+                    } else {
+                        "--no-sparse-index"
+                    },
+                ],
+            );
+            git(&source, &["sparse-checkout", "set", "inside"]);
+        }
+        if mode == "split-index" {
+            git(&source, &["config", "core.splitIndex", "true"]);
+            git(&source, &["update-index", "--split-index"]);
+        }
+        let human_index = fs::read(source.join(".git/index"))?;
+        let human_head = git(&source, &["rev-parse", "HEAD"]);
+        assert!(!source.join("outside/retained.txt").exists());
+        let journal = Journal::open(
+            root.path().join("events.sqlite"),
+            intercat_daemon::secrets::Key::new([7; 32]),
+        )
+        .await?;
+        let project = intercat_daemon::project::inspect(
+            uuid::Uuid::now_v7(),
+            "Generated sparse project".into(),
+            vec![source.clone()],
+        )
+        .await?;
+        journal
+            .configure_project(uuid::Uuid::now_v7(), project)
+            .await?;
+        journal
+            .stage_utterance(
+                uuid::Uuid::now_v7(),
+                "Dummy sparse request".into(),
+                Target::New,
+                None,
+                vec![],
+            )
+            .await?;
+        let input = journal.claim_input().await?.unwrap();
+        journal
+            .apply_input(
+                input.id,
+                input.revision,
+                Outcome::Classified(Decision {
+                    kind: Kind::Fork,
+                    track_id: None,
+                    boundary: Some("when-told".into()),
+                    command: None,
+                    confidence: 1.,
+                    inference_ms: 1.,
+                    timed_out: false,
+                    scores: serde_json::json!({}),
+                }),
+            )
+            .await?;
+        let preparation = Preparation::start(&root.path().join("workspaces"), journal.clone())?;
+        let prepared = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let status = journal.snapshot().await?;
+                if let Some(workspace) = status["workspaces"].as_array().unwrap().first() {
+                    if workspace["state"] == "failed" {
+                        return Err(
+                            format!("{mode}: worker preparation failed: {workspace}").into()
+                        );
+                    }
+                    if workspace["state"] == "ready" {
+                        return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                            serde_json::from_value::<Workspace>(workspace.clone())?,
+                        );
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        preparation.shutdown().await;
+        let workspace = prepared??;
+        fs::create_dir_all(workspace.path.join("outside"))?;
+        fs::write(workspace.path.join("outside/changed.txt"), "changed\n")?;
+        let point = checkpoint::save(
+            workspace.clone(),
+            uuid::Uuid::now_v7(),
+            None,
+            false,
+            journal,
+        )
+        .await?;
+        assert_eq!(
+            git(
+                &workspace.path,
+                &["show", &format!("{}:outside/changed.txt", point.sha)]
+            ),
+            "changed"
+        );
+        assert_eq!(
+            git(
+                &workspace.path,
+                &["show", &format!("{}:outside/retained.txt", point.sha)]
+            ),
+            "before"
+        );
+        assert_eq!(
+            fs::read(source.join(".git/index"))?,
+            human_index,
+            "{mode}: human index"
+        );
+        assert_eq!(
+            git(&source, &["rev-parse", "HEAD"]),
+            human_head,
+            "{mode}: human HEAD"
+        );
+        assert!(
+            !source.join("outside/retained.txt").exists(),
+            "{mode}: human sparse state"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("inside/file.txt"))?,
+            "before\n"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn project_and_initial_session_survive_replay_without_changing_the_starting_point() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("events.sqlite");

@@ -24,6 +24,7 @@ use std::{
 use uuid::Uuid;
 
 struct Fixture {
+    host: crate::test_host::IdleTestHost,
     root: tempfile::TempDir,
     source: std::path::PathBuf,
     journal: Journal,
@@ -32,6 +33,7 @@ struct Fixture {
     points: Vec<Option<Checkpoint>>,
     original_index: Vec<u8>,
     original_head: String,
+    _admission: tokio::sync::SemaphorePermit<'static>,
 }
 
 fn git(path: &Path, arguments: &[&str]) -> Result<String> {
@@ -50,6 +52,8 @@ fn git(path: &Path, arguments: &[&str]) -> Result<String> {
 
 impl Fixture {
     async fn new(count: usize) -> Result<Self> {
+        let admission = crate::test_host::FILE_FIXTURES.acquire().await?;
+        let host = crate::test_host::IdleTestHost::new()?;
         let root = tempfile::tempdir_in("/private/tmp")?;
         let source = root.path().join("source");
         fs::create_dir(&source)?;
@@ -172,6 +176,8 @@ impl Fixture {
         let workspaces = prepared??;
         let service = Service::new(journal.clone(), root.path().join("integration"));
         let value = Self {
+            _admission: admission,
+            host,
             root,
             source,
             journal,
@@ -276,7 +282,7 @@ impl Fixture {
         let revision = self.journal.read_utterance(id.to_string()).await?["revision"]
             .as_i64()
             .unwrap();
-        let identity = crate::process::identity(std::process::id())?;
+        let identity = self.host.identity()?;
         let index_path = gix::open(&self.workspaces[index].path)?
             .git_dir()
             .join("index");
@@ -348,7 +354,7 @@ impl Fixture {
     async fn settled(&self) -> Result<Job> {
         tokio::time::timeout(Duration::from_secs(120), async {
             loop {
-                let value = self.journal.snapshot().await?["integration"].clone();
+                let value = self.journal.snapshot().await?["integrations"][0].clone();
                 let job: Job = serde_json::from_value(value)?;
                 if !matches!(
                     job.status,

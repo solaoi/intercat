@@ -62,6 +62,7 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, Receipt)> {
     )?;
     original
         .workspace_result(Workspace {
+            denied_roots: Vec::new(),
             attachment_roots: Vec::new(),
             track_id: "track".into(),
             path: project.clone(),
@@ -721,6 +722,7 @@ async fn referenced_fixture(
             input.revision,
             "track".into(),
             json!({"commandId":command,"sessionId":"session","input":[]}),
+            None,
         )
         .await?;
     journal.try_msp("track".into(),"session".into(),intercat_daemon::clock::Stamp { epoch_ms:1,mono_ms:1,boot_id:"fixture".into(),timeline_ms:1 },json!({"method":"turn/started","params":{"commandId":command,"sessionId":"session","turnId":command}}),None,None)?.await??;

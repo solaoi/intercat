@@ -80,8 +80,52 @@ async fn multiple_project_folders_are_authenticated_and_replayed_without_reinspe
         .await["error"]["code"],
         -32001
     );
+    assert_eq!(
+        call(
+            &mut client(&socket).await,
+            "project.selection",
+            json!({"paths":paths})
+        )
+        .await["error"]["code"],
+        -32001
+    );
     let mut stream = client(&socket).await;
     call(&mut stream, "rpc.authenticate", json!({"token":token})).await;
+    std::fs::create_dir(paths[0].join("src")).unwrap();
+    std::fs::create_dir(paths[0].join("ignored")).unwrap();
+    std::fs::write(paths[0].join(".git/info/exclude"), "ignored/\n").unwrap();
+    let duplicate = call(
+        &mut stream,
+        "project.selection",
+        json!({"paths":[paths[0],paths[0].join("src"),paths[1]]}),
+    )
+    .await;
+    assert_eq!(duplicate["result"]["kind"], "duplicate");
+    assert_eq!(
+        duplicate["result"]["roots"],
+        json!([
+            paths[0].canonicalize().unwrap(),
+            paths[1].canonicalize().unwrap()
+        ])
+    );
+    assert_eq!(
+        call(
+            &mut stream,
+            "project.selection",
+            json!({"paths":paths,"root":"/not-selected"})
+        )
+        .await["error"]["code"],
+        -32602
+    );
+    let ignored = call(
+        &mut stream,
+        "project.selection",
+        json!({"paths":[paths[0].join("ignored")]}),
+    )
+    .await;
+    assert_eq!(ignored["result"]["kind"], "ignored");
+    assert_eq!(call(&mut stream,"project.configure",json!({"opId":uuid::Uuid::now_v7(),"name":"Dummy rejected folder","paths":[paths[0].join("ignored")]})).await["error"]["code"],-32004);
+    assert!(call(&mut stream, "system.status", json!({})).await["result"]["project"].is_null());
     let first = call(&mut stream, "project.configure", request.clone()).await;
     assert_eq!(first["result"]["folders"].as_array().unwrap().len(), 2);
     assert_eq!(first["result"]["id"], request["opId"]);
@@ -109,6 +153,17 @@ async fn multiple_project_folders_are_authenticated_and_replayed_without_reinspe
         .unwrap();
     assert_eq!(secret_id.len(), 64);
     assert!(secret_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let checks = call(&mut stream, "checks.get", json!({})).await;
+    assert_eq!(checks["result"]["setting"]["revision"], 0);
+    let folder = first["result"]["folders"][0]["id"].as_str().unwrap();
+    let change = json!({"opId":uuid::Uuid::now_v7(),"revision":0,"folder":folder,"command":{"mode":"run","command":"printf own-dummy-check"},"history":true});
+    let saved = call(&mut stream, "checks.change", change.clone()).await;
+    assert_eq!(saved["result"]["folders"][folder]["history"], true);
+    assert_eq!(
+        call(&mut stream, "checks.change", change).await["result"],
+        saved["result"]
+    );
+    assert!(call(&mut stream, "checks.change", json!({"opId":uuid::Uuid::now_v7(),"revision":1,"folder":folder,"command":{"mode":"auto","unknown":true},"history":false})).await["error"].is_object());
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
 }
@@ -772,7 +827,20 @@ async fn timeline_windows_are_authenticated_and_do_not_depend_on_status_clip_lim
     let mut stream = client(&path).await;
     call(&mut stream, "rpc.authenticate", json!({"token":token})).await;
     let first = call(&mut stream, "timeline.window", request.clone()).await;
-    assert_eq!(call(&mut stream,"branch.prepare",json!({"opId":uuid::Uuid::now_v7(),"parentTrackId":"track","turnId":uuid::Uuid::now_v7()})).await["error"]["code"],-32002);
+    assert_eq!(
+        call(
+            &mut stream,
+            "branch.prepare",
+            json!({
+                "opId": uuid::Uuid::now_v7(),
+                "parentTrackId": "track",
+                "point": {"kind": "turn", "turnId": uuid::Uuid::now_v7()},
+                "instructions": "current"
+            }),
+        )
+        .await["error"]["code"],
+        -32002
+    );
     assert_eq!(first["result"]["clips"].as_array().unwrap().len(), 1);
     assert_eq!(first["result"]["marks"].as_array().unwrap().len(), 1);
     assert!(
@@ -825,6 +893,7 @@ async fn correction_resume_requires_authentication_and_stays_held_without_its_wo
     .unwrap();
     journal
         .workspace_result(intercat_daemon::preparation::Workspace {
+            denied_roots: Vec::new(),
             track_id: "track".into(),
             path: root.path().join("worker"),
             reference: "refs/intercat/test/tracks/A".into(),
@@ -979,6 +1048,7 @@ async fn file_recovery_cancellation_is_authenticated_durable_and_idempotent() {
     fs::write(workspace.join("kept.txt"), "unfinished dummy edit").unwrap();
     journal
         .workspace_result(intercat_daemon::preparation::Workspace {
+            denied_roots: Vec::new(),
             attachment_roots: Vec::new(),
             track_id: "track".into(),
             path: workspace.clone(),
@@ -1059,6 +1129,122 @@ async fn file_recovery_cancellation_is_authenticated_durable_and_idempotent() {
     assert_eq!(status["workers"][0]["sessionId"], "old-session");
     assert_eq!(status["workers"][0]["phase"], "after-connection-loss");
     assert_eq!(db.query_row("SELECT COUNT(*) FROM operations WHERE kind='worker.pickup.cancel' AND state='complete'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn realignment_routes_require_authentication_and_refuse_unknown_scope_before_effects() {
+    let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+    let _lock = DaemonLock::acquire(directory.path()).unwrap().unwrap();
+    let journal = Journal::open(
+        directory.path().join("events.sqlite"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await
+    .unwrap();
+    let token = "45".repeat(32);
+    let server = Server::bind(
+        directory.path(),
+        Token::parse(&token).unwrap(),
+        journal.clone(),
+        intercat_daemon::editor::Manager::new(
+            directory.path(),
+            &directory.path().join("editor.log"),
+        )
+        .unwrap(),
+        &directory.path().join("workspaces"),
+    )
+    .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.serve(async {
+        let _ = stopped.await;
+    }));
+    let socket = directory.path().join("rpc.sock");
+    let request = json!({"opId":uuid::Uuid::now_v7(),"trackId":uuid::Uuid::now_v7(),"source":{"kind":"commit","jobId":uuid::Uuid::now_v7(),"revision":1}});
+    assert_eq!(
+        call(
+            &mut client(&socket).await,
+            "realign.request",
+            request.clone()
+        )
+        .await["error"]["code"],
+        -32001
+    );
+    let mut stream = client(&socket).await;
+    call(&mut stream, "rpc.authenticate", json!({"token":token})).await;
+    let mut invalid = request.clone();
+    invalid["path"] = json!(directory.path().join("dummy-not-a-workspace"));
+    assert_eq!(
+        call(&mut stream, "realign.request", invalid).await["error"]["code"],
+        -32602
+    );
+    assert_eq!(
+        call(&mut stream, "realign.request", request).await["error"]["code"],
+        -32005
+    );
+    let control = json!({"opId":uuid::Uuid::now_v7(),"id":uuid::Uuid::now_v7(),"revision":1,"action":{"kind":"stopProcesses"}});
+    assert_eq!(
+        call(&mut stream, "realign.control", control.clone()).await["error"]["code"],
+        -32005
+    );
+    let mut invalid = control;
+    invalid["action"] = json!({"kind":"stopProcesses","pid":99999});
+    assert_eq!(
+        call(&mut stream, "realign.control", invalid).await["error"]["code"],
+        -32602
+    );
+    for (route, request) in [
+        (
+            "commit.group.open",
+            json!({"opId":uuid::Uuid::now_v7(),"tracks":null}),
+        ),
+        (
+            "commit.group.commit",
+            json!({"opId":uuid::Uuid::now_v7(),"id":uuid::Uuid::now_v7(),"revision":1,"targets":[]}),
+        ),
+        (
+            "commit.group.discard",
+            json!({"opId":uuid::Uuid::now_v7(),"id":uuid::Uuid::now_v7(),"revision":1}),
+        ),
+    ] {
+        assert_eq!(
+            call(&mut client(&socket).await, route, request.clone()).await["error"]["code"],
+            -32001
+        );
+        let mut extra = request.clone();
+        extra["path"] = json!(directory.path().join("dummy-rejected-path"));
+        assert_eq!(
+            call(&mut stream, route, extra).await["error"]["code"],
+            -32602
+        );
+        assert_eq!(
+            call(&mut stream, route, request).await["error"]["code"],
+            -32005
+        );
+    }
+    let target = json!({"jobId":uuid::Uuid::now_v7(),"revision":1,"head":"a".repeat(40),"tree":"b".repeat(40),"settingsHash":"c".repeat(64),"path":"/dummy/rejected"});
+    assert_eq!(call(&mut stream,"commit.group.commit",json!({"opId":uuid::Uuid::now_v7(),"id":uuid::Uuid::now_v7(),"revision":1,"targets":[target]})).await["error"]["code"],-32602);
+    assert_eq!(
+        call(
+            &mut stream,
+            "commit.group.open",
+            json!({"opId":uuid::Uuid::now_v7(),"tracks":vec!["dummy";257]})
+        )
+        .await["error"]["code"],
+        -32602
+    );
+    let snapshot = journal.snapshot().await.unwrap();
+    assert!(snapshot["commitGroups"].as_array().unwrap().is_empty());
+    assert!(snapshot["realignments"].as_array().unwrap().is_empty());
+    assert!(
+        snapshot["pendingRealignments"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let db = rusqlite::Connection::open(directory.path().join("events.sqlite")).unwrap();
+    assert_eq!(db.query_row("SELECT count(*) FROM operations WHERE kind IN ('realign.request','realign.stop','workspace.realign','turn.start','commit.group.open','commit.group.commit','commit.group.discard','integration.publish')",[],|row|row.get::<_,i64>(0)).unwrap(),0);
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
 }

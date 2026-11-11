@@ -15,6 +15,7 @@ pub(crate) struct Boundary {
     pub tracker: Arc<Mutex<crate::process::Tracker>>,
     pub identity: crate::process::Identity,
 }
+#[derive(Clone)]
 pub(crate) enum Guard {
     Work(crate::msp::StartGuard),
     Recovery {
@@ -41,13 +42,13 @@ impl Guard {
     }
 }
 impl Boundary {
-    async fn idle(&self) -> Result<()> {
+    pub(crate) async fn idle(&self) -> Result<()> {
         if !self.guard.current() {
             return Err(crate::journal::StartSuperseded.into());
         }
         self.scan().await
     }
-    async fn scan(&self) -> Result<()> {
+    pub(crate) async fn scan(&self) -> Result<()> {
         let tracker = self.tracker.clone();
         let scan = tokio::task::spawn_blocking(move || tracker.lock().unwrap().refresh()).await??;
         if scan
@@ -117,17 +118,33 @@ pub(crate) fn merge_update(
     basis: &crate::lineage::Basis,
 ) -> Result<(String, crate::lineage::Basis)> {
     let mut inherited = basis.inherits.clone();
+    let mut parents = basis.parents.clone();
     for point in &source.dependencies.points {
+        crate::lineage::include(&mut parents, &point.track, &point.inherited())?;
         source.graph.incorporate(&mut inherited, point)?;
     }
     let recipe = crate::lineage::Basis {
+        views: crate::lineage::view::merge(
+            std::iter::once(basis.views.clone()).chain(
+                source
+                    .dependencies
+                    .points
+                    .iter()
+                    .map(|point| point.views.clone()),
+            ),
+        )?,
+        parents: parents.clone(),
         base: before.into(),
         base_inherits: basis.inherits.clone(),
         inherits: inherited.clone(),
     };
-    let tree = match source.graph.baseline(repo, &recipe, &inherited)? {
+    let tree = match source.graph.baseline(
+        &mut crate::merge_choices::Merges::new(repo, &[])?,
+        &recipe,
+        &inherited,
+    )? {
         Merge::Clean(tree) => tree,
-        Merge::Conflicts(paths) => {
+        Merge::Conflicts { paths, .. } => {
             return Err(crate::inheritance_issue::Blocker::Conflict {
                 paths: paths.iter().map(ToString::to_string).collect(),
                 base: false,
@@ -136,6 +153,7 @@ pub(crate) fn merge_update(
         }
     };
     let mut next = basis.clone();
+    next.views = recipe.views.clone();
     for point in &source.dependencies.points {
         let Some(old) = basis.inherits.get(&point.track) else {
             // First inheritance brings only the parent's contribution. Its
@@ -155,7 +173,7 @@ pub(crate) fn merge_update(
             repo.tree_id(point.base_at.parse()?)?,
         )? {
             Merge::Clean(tree) => tree,
-            Merge::Conflicts(paths) => {
+            Merge::Conflicts { paths, .. } => {
                 return Err(crate::inheritance_issue::Blocker::Conflict {
                     paths: paths.iter().map(ToString::to_string).collect(),
                     base: true,
@@ -173,6 +191,7 @@ pub(crate) fn merge_update(
         }
     }
     next.inherits = inherited;
+    next.parents = parents;
     let after = repo.checkpoint_commit(tree, before.parse()?, "Apply inherited files")?;
     repo.sync_objects(&[after, next.base.parse()?])?;
     Ok((after.to_string(), next))
@@ -205,7 +224,8 @@ pub(crate) async fn prepare(
             .map(|p| p.sha.as_str())
             .unwrap_or(&workspace.base);
         let before =
-            crate::checkpoint::capture(&workspace, parent, "Before inherited files").await?;
+            crate::checkpoint::capture(&workspace, parent, "Before inherited files", journal)
+                .await?;
         if !before.unmerged_paths.is_empty() {
             return Err(crate::inheritance_issue::Blocker::Conflict {
                 paths: before.unmerged_paths,
@@ -360,9 +380,13 @@ async fn finish_files(
             .await?
             .ok_or("Missing inherited file operation.")?;
         if operation["state"] == "prepared" {
-            let observed =
-                crate::checkpoint::capture(&workspace, &app.before, "Verify inheritance boundary")
-                    .await?;
+            let observed = crate::checkpoint::capture(
+                &workspace,
+                &app.before,
+                "Verify inheritance boundary",
+                journal,
+            )
+            .await?;
             let path = workspace.path.clone();
             let expected = app.before.clone();
             let actual = observed.sha;
@@ -380,17 +404,14 @@ async fn finish_files(
                 .finish(&app.operation.to_string(), "dispatched")
                 .await?;
         }
-        boundary.idle().await?;
-        let path = workspace.path.clone();
         let before = app.before.parse()?;
         let after = app.after.parse()?;
+        let files = crate::workspace_transition::prepare(&workspace, before, after).await?;
+        boundary.idle().await?;
+        let path = workspace.path.clone();
         // Once writing begins, finish this bounded file operation. Stop still
         // invalidates turn/start, and a crash resumes only known before/after paths.
-        tokio::task::spawn_blocking(move || {
-            let repo = Repository::open(&path)?;
-            crate::tree_transition::apply(&path, repo.tree_id(before)?, repo.tree_id(after)?)
-        })
-        .await??;
+        tokio::task::spawn_blocking(move || files.apply(&path)).await??;
         boundary.scan().await?;
         let parent = app
             .previous
@@ -398,7 +419,8 @@ async fn finish_files(
             .map(|p| p.sha.as_str())
             .unwrap_or(&workspace.base);
         let saved =
-            crate::checkpoint::capture(&workspace, parent, "Inherited files checkpoint").await?;
+            crate::checkpoint::capture(&workspace, parent, "Inherited files checkpoint", journal)
+                .await?;
         let path = workspace.path.clone();
         let before = app.before.clone();
         let after = app.after.clone();
@@ -427,6 +449,7 @@ async fn finish_files(
             .change_inheritance(Change::Checkpoint {
                 operation: app.operation,
                 checkpoint,
+                lfs_directory: saved.lfs_directory,
             })
             .await?;
     }
@@ -577,6 +600,8 @@ mod tests {
         )?;
         let before = commit(&repo, empty, &[("c", "child")])?;
         let point = crate::lineage::Point {
+            views: Vec::new(),
+            parents: Default::default(),
             track: "A".into(),
             number: 1,
             sha: parent.to_string(),
@@ -604,6 +629,8 @@ mod tests {
         let empty = repo.empty_starting_point()?;
         let first = commit(&repo, empty, &[("a", "parent")])?;
         let old = crate::lineage::Point {
+            views: Vec::new(),
+            parents: Default::default(),
             track: "A".into(),
             number: 1,
             sha: first.to_string(),
@@ -619,6 +646,8 @@ mod tests {
             &[("a", "parent"), ("g", "update"), ("x", "other track")],
         )?;
         let next = crate::lineage::Point {
+            views: Vec::new(),
+            parents: Default::default(),
             track: "A".into(),
             number: 2,
             sha: updated.to_string(),
@@ -628,6 +657,7 @@ mod tests {
         };
         let mut basis = crate::lineage::Basis::root(empty.to_string());
         basis.inherits.insert("A".into(), old.inherited());
+        basis.parents.insert("A".into(), old.inherited());
         let mut source = source(vec![old, next.clone()], next.clone());
         let (after, basis) = merge_update(&repo, &source, &before.to_string(), &basis)?;
         assert_eq!(
@@ -636,6 +666,8 @@ mod tests {
         );
         assert_eq!(basis.inherits["A"], next.inherited());
         let child = crate::lineage::Point {
+            views: Vec::new(),
+            parents: basis.parents.clone(),
             track: "child".into(),
             number: 1,
             sha: after.clone(),
@@ -645,14 +677,15 @@ mod tests {
         };
         source.graph.points.push(child.clone());
         source.graph.integrated.insert("A".into(), next.inherited());
-        let base =
-            match source
-                .graph
-                .track_baseline(&repo, &child, &basis, &source.graph.integrated)?
-            {
-                Merge::Clean(tree) => tree,
-                _ => return Err("Unexpected baseline conflict".into()),
-            };
+        let base = match source.graph.track_baseline(
+            &mut crate::merge_choices::Merges::new(&repo, &[])?,
+            &child,
+            &basis,
+            &source.graph.integrated,
+        )? {
+            Merge::Clean(tree) => tree,
+            _ => return Err("Unexpected baseline conflict".into()),
+        };
         let deleted = commit(&repo, updated, &[("a", "parent"), ("g", "update")])?;
         let merged =
             match repo.merge_trees(base, repo.tree_id(deleted)?, repo.tree_id(after.parse()?)?)? {
@@ -681,6 +714,8 @@ mod tests {
             &[("x", "theirs\n"), ("a", "parent"), ("c", "child")],
         )?;
         let old = crate::lineage::Point {
+            views: Vec::new(),
+            parents: Default::default(),
             track: "A".into(),
             number: 1,
             sha: first.to_string(),
@@ -689,6 +724,8 @@ mod tests {
             inherits: Default::default(),
         };
         let next = crate::lineage::Point {
+            views: Vec::new(),
+            parents: Default::default(),
             track: "A".into(),
             number: 2,
             sha: updated.to_string(),
@@ -698,6 +735,7 @@ mod tests {
         };
         let mut basis = crate::lineage::Basis::root(mine.to_string());
         basis.inherits.insert("A".into(), old.inherited());
+        basis.parents.insert("A".into(), old.inherited());
         let error = merge_update(
             &repo,
             &source(vec![old, next.clone()], next),
@@ -712,6 +750,7 @@ mod tests {
     #[tokio::test]
     async fn existing_workspace_resumes_a_partial_update_after_the_request_is_taken_back()
     -> Result<()> {
+        let host = crate::test_host::IdleTestHost::new()?;
         let root = tempfile::tempdir_in("/private/tmp")?;
         let path = root.path().join("worker");
         std::fs::create_dir(&path)?;
@@ -752,6 +791,7 @@ mod tests {
         let word = journal.read_utterance(input.to_string()).await?;
         let track = word["decision"]["trackId"].as_str().unwrap().to_owned();
         let workspace = Workspace {
+            denied_roots: Vec::new(),
             track_id: track.clone(),
             path: path.clone(),
             reference: "refs/intercat/test/tracks/B".into(),
@@ -834,9 +874,9 @@ mod tests {
             ))),
             tracker: Arc::new(Mutex::new(crate::process::Tracker::new(
                 Uuid::now_v7().to_string(),
-                crate::process::identity(std::process::id())?,
+                host.identity()?,
             )?)),
-            identity: crate::process::identity(std::process::id())?,
+            identity: host.identity()?,
         };
         let applied = prepare(
             &journal,
@@ -889,7 +929,7 @@ mod tests {
             [input.to_string()],
         )?;
         let make_boundary = || -> Result<Boundary> {
-            let identity = crate::process::identity(std::process::id())?;
+            let identity = host.identity()?;
             Ok(Boundary {
                 guard: Guard::Work(crate::msp::StartGuard::Stopped(Arc::new(
                     std::sync::atomic::AtomicBool::new(false),
@@ -1018,6 +1058,7 @@ mod tests {
             &workspace,
             &worker.checkpoint.as_ref().unwrap().sha,
             "Before interrupted update",
+            &journal,
         )
         .await?;
         let (after, basis) = merge_update(&repo, &context.source, &before.sha, &context.basis)?;
@@ -1066,7 +1107,7 @@ mod tests {
         let stop = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let gate = Arc::new(crate::dispatch_control::Gate::new(true));
         let recovery_boundary = |expected| -> Result<Boundary> {
-            let identity = crate::process::identity(std::process::id())?;
+            let identity = host.identity()?;
             Ok(Boundary {
                 guard: Guard::Recovery {
                     generation: stop.clone(),
@@ -1115,12 +1156,26 @@ mod tests {
         std::fs::remove_file(path.join("external.txt"))?;
         // Exercise the actual worker control loop over an empty MSP transport.
         // Recovery must finish files without emitting any model command.
-        let mut background = tokio::process::Command::new("/bin/sleep")
-            .arg("30")
+        let mut control_host = tokio::process::Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                "import subprocess,time\np=subprocess.Popen(['/bin/sleep','30'])\nprint(p.pid,flush=True)\np.wait()\ntime.sleep(30)\n",
+            ])
+            .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
-        let background_identity =
-            crate::process::identity(background.id().ok_or("Missing dummy process")?)?;
+        let identity =
+            crate::process::identity(control_host.id().ok_or("Missing recovery control host")?)?;
+        use tokio::io::AsyncBufReadExt;
+        let mut output = tokio::io::BufReader::new(
+            control_host
+                .stdout
+                .take()
+                .ok_or("Missing recovery host output")?,
+        );
+        let mut child = String::new();
+        output.read_line(&mut child).await?;
+        let background_identity = crate::process::identity(child.trim().parse()?)?;
         journal
             .change_inheritance(Change::RecoveryFailure {
                 operation: application.operation,
@@ -1133,7 +1188,7 @@ mod tests {
         let (write, requests) = tokio::io::duplex(4096);
         let mut connection = crate::msp::Connection::new(read, write);
         let (port, commands) = crate::execution::Port::new(gate.clone());
-        port.attach(connection.client.clone(), "dummy-session".into());
+        port.attach(connection.client.clone(), "dummy-session".into(), None);
         let mut context = crate::execution::Context {
             project_secrets: Default::default(),
             port: port.clone(),
@@ -1142,7 +1197,6 @@ mod tests {
             capacity: Arc::new(crate::scheduler::Capacity::new(1)),
         };
         let (stop_run, mut stopping) = tokio::sync::watch::channel(false);
-        let identity = crate::process::identity(std::process::id())?;
         let tracker = Arc::new(Mutex::new(crate::process::Tracker::new(
             Uuid::now_v7().to_string(),
             identity,
@@ -1151,7 +1205,7 @@ mod tests {
         let runner = crate::execution::run(
             crate::execution::WorkerIo {
                 connection: &mut connection,
-                tracker,
+                tracker: tracker.clone(),
                 identity,
                 recovery: None,
                 continuity: &mut continuity,
@@ -1196,14 +1250,23 @@ mod tests {
             stop_run.send(true)?;
             result
         };
-        let (ran, controlled) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             tokio::join!(runner, controller)
         })
-        .await?;
-        ran?;
-        controlled?;
-        continuity.settle().await?;
-        let _ = background.wait().await;
+        .await;
+        let result: Result<()> = async {
+            let (ran, controlled) = joined?;
+            ran?;
+            controlled?;
+            continuity.settle().await?;
+            Ok(())
+        }
+        .await;
+        let _ = control_host.kill().await;
+        let _ = control_host.wait().await;
+        tokio::task::spawn_blocking(move || tracker.lock().unwrap().stop_confirmed()).await??;
+        result?;
+        assert!(crate::process::is_alive(host.identity()?));
         assert_eq!(
             std::fs::read_to_string(path.join("parent.txt"))?,
             "updated parent\n"

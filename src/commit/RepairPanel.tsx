@@ -17,7 +17,10 @@ export function RepairPanel({ waitingForMemory, run, label, preview, secretInput
   const waiting = run.phase === 'held' && !!run.session && !!run.turn && run.output?.split('\n').some(line => line.trimStart().startsWith('Waiting for you:'));
   const stopping = run.phase === 'stopping';
   const refreshing = !!run.refresh && !run.refresh.error;
-  const title = `${label} · for the commit`;
+  const realign=run.owner.kind==='realign',shared=run.owner.kind==='shared',restore=run.owner.kind==='restore';
+  const title = `${label} · ${restore?'for Restore':shared?'shared checkpoint':realign?'for realignment':'for the commit'}`;
+  const merge = run.purpose.kind === 'merge';
+  const noun = merge ? 'merge' : 'repair';
   async function action(operation: () => Promise<unknown>) {
     setBusy(true); setError('');
     try { await operation(); await changed(); }
@@ -54,12 +57,12 @@ export function RepairPanel({ waitingForMemory, run, label, preview, secretInput
       await changed();
     } finally { setBusy(false); }
   }
-  const state = { queued: 'Waiting for a worker', preparing: 'Preparing repair', running: 'Repairing', stopping: 'Stopping', held: 'Repair held', captured: 'Preparing Check', applying: 'Checking the repair', done: 'Repair finished', failed: 'Repair needs attention', 'needs-recovery': 'Repair needs recovery', discarded: 'Repair discarded' }[run.phase];
+  const state = (realign||shared||restore)&&run.phase==='captured'?'Saving resolution':restore&&run.phase==='applying'?'Saving Restore resolution':shared&&run.phase==='applying'?'Saving shared resolution':realign&&run.phase==='applying'?'Saving realignment merge':merge ? { queued: 'Waiting for a worker', preparing: 'Preparing merge', running: 'Resolving conflicts', stopping: 'Stopping', held: 'Merge held', manual: 'Resolving by hand', captured: 'Preparing Check', applying: 'Checking the merge', done: 'Merge finished', failed: 'Merge needs attention', 'needs-recovery': 'Merge needs recovery', discarded: 'Merge discarded' }[run.phase] : { queued: 'Waiting for a worker', preparing: 'Preparing repair', running: 'Repairing', stopping: 'Stopping', held: 'Repair held', manual: 'Resolving by hand', captured: 'Preparing Check', applying: 'Checking the repair', done: 'Repair finished', failed: 'Repair needs attention', 'needs-recovery': 'Repair needs recovery', discarded: 'Repair discarded' }[run.phase];
   return <section className="commit-repair" aria-label={title}>
     <header><strong>{title}</strong><span role="status">{run.restoring ? 'Restoring saved files' : refreshing ? 'Stopping repair and refreshing' : waitingForMemory ? 'queued · waiting for memory' : state}</span><div>
-      {(['queued', 'preparing', 'running', 'stopping'].includes(run.phase) || preparing || busy) && <button disabled={stopping} onClick={() => { void stop(); }}>Stop repair</button>}
-      {run.phase === 'held' && <button disabled={busy || preparing || refreshing || !!run.restoring} onClick={() => { void control('resume'); }}>Resume repair</button>}
-      {['queued', 'held', 'captured', 'failed'].includes(run.phase) && <button disabled={busy || refreshing || !!run.restoring} onClick={() => { void control('discard'); }}>Discard repair</button>}
+      {(['queued', 'preparing', 'running', 'stopping'].includes(run.phase) || preparing || busy) && <button disabled={stopping} onClick={() => { void stop(); }}>Stop {noun}</button>}
+      {!merge && run.phase === 'held' && <button disabled={busy || preparing || refreshing || !!run.restoring} onClick={() => { void control('resume'); }}>Resume repair</button>}
+      {!merge && ['queued', 'held', 'captured', 'failed'].includes(run.phase) && <button disabled={busy || refreshing || !!run.restoring} onClick={() => { void control('discard'); }}>Discard {noun}</button>}
     </div></header>
     <div className="commit-repair-body">
       {run.prompts.map(prompt => <QuestionCard pendingSecret={preparing} provideSecret={(prompt,entry) => provideSecret(entry,prompt)} key={`${prompt.request.userInputId}:${prompt.revision}`} stopping={stopping} prompt={prompt} label={title} respond={respond} />)}

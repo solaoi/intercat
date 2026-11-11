@@ -16,12 +16,13 @@ use std::{
 use tokio::sync::watch;
 
 pub const VERSION: &str = "8.30.1";
+pub const BINARY_REVIEW_RULE: &str = "binary-pattern-scan-incomplete";
 const INPUT_LIMIT: usize = 64 * 1024 * 1024;
 const FINDING_LIMIT: usize = 2048;
 pub(crate) const CONFIG: &str = include_str!("../rules/gitleaks-8.30.1.toml");
 pub fn ruleset() -> String {
     format!(
-        "gitleaks-{VERSION}/{};config={};input-v1",
+        "gitleaks-{VERSION}/{};config={};input-v2-lfs",
         binary_hash(),
         digest(CONFIG.as_bytes())
     )
@@ -38,6 +39,16 @@ fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn value_fingerprints(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|value| digest(value.as_bytes()))
         .collect()
 }
 fn verify(path: &Path) -> Result<()> {
@@ -141,12 +152,30 @@ pub struct Finding {
 pub struct Scan {
     pub binding: Binding,
     pub findings: Vec<Finding>,
+    pub unscanned_lfs: Vec<String>,
 }
 impl Scan {
     pub fn accepted(&self, kept: &std::collections::BTreeSet<String>) -> bool {
         self.findings
             .iter()
             .all(|finding| kept.contains(&finding.id))
+    }
+    pub(crate) fn review_reason(
+        &self,
+        kept: &std::collections::BTreeSet<String>,
+        secret_reason: &'static str,
+    ) -> Option<&'static str> {
+        if self.accepted(kept) {
+            None
+        } else if self
+            .findings
+            .iter()
+            .any(|finding| finding.rule != BINARY_REVIEW_RULE && !kept.contains(&finding.id))
+        {
+            Some(secret_reason)
+        } else {
+            Some("Binary pattern scan incomplete · review before committing.")
+        }
     }
     pub fn fingerprint(&self) -> Result<String> {
         Ok(digest(&serde_json::to_vec(self)?))
@@ -184,6 +213,11 @@ struct Detected {
     redacted_match: String,
     #[serde(rename = "RuleID")]
     rule: String,
+}
+
+enum CommitScope {
+    Candidate(ObjectId),
+    Push,
 }
 
 pub struct Scanner {
@@ -244,7 +278,7 @@ impl Scanner {
         for parent in root.ancestors() {
             profile.push_str(&format!("(allow file-read* (literal {}))", quote(parent)?));
         }
-        let mut command = command::gated_command("/usr/bin/sandbox-exec");
+        let mut command = command::gated_command("/usr/bin/sandbox-exec", None);
         command
             .args(["-p", &profile])
             .arg(&executable)
@@ -371,32 +405,76 @@ impl Scanner {
         repository: &Repository,
         parent: ObjectId,
         commit: ObjectId,
+        lfs_storage: &Path,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Scan> {
+        self.scan_commit(
+            repository,
+            commit,
+            CommitScope::Candidate(parent),
+            lfs_storage,
+            cancel,
+        )
+        .await
+    }
+
+    /// Inspect every newly transmitted commit, including roots and merge
+    /// commits. The caller chooses the range from the remote's advertised refs.
+    pub async fn push_commit(
+        &self,
+        repository: &Repository,
+        commit: ObjectId,
+        lfs_storage: &Path,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Scan> {
+        self.scan_commit(repository, commit, CommitScope::Push, lfs_storage, cancel)
+            .await
+    }
+
+    async fn scan_commit(
+        &self,
+        repository: &Repository,
+        commit: ObjectId,
+        scope: CommitScope,
+        lfs_storage: &Path,
         cancel: watch::Receiver<bool>,
     ) -> Result<Scan> {
         let details = repository.commit_details(commit)?;
-        if details.parents != vec![parent] {
-            return Err("Secret scan requires the exact candidate parent.".into());
-        }
-        let parent_tree = repository.tree_id(parent)?;
-        let before = repository.tree_files(parent_tree)?;
-        let after = repository.tree_files(details.tree)?;
+        let parent_tree = match scope {
+            CommitScope::Candidate(parent) => {
+                if details.parents != vec![parent] {
+                    return Err("Secret scan requires the exact candidate parent.".into());
+                }
+                repository.tree_id(parent)?
+            }
+            CommitScope::Push => match details.parents.first() {
+                Some(parent) => repository.tree_id(*parent)?,
+                None => repository.write_tree(&[])?,
+            },
+        };
+        let files = |tree| {
+            if matches!(scope, CommitScope::Push) {
+                repository.push_tree_files(tree)
+            } else {
+                repository.tree_files(tree)
+            }
+        };
+        let before = files(parent_tree)?;
+        let after = files(details.tree)?;
         let binding = Binding {
             commit: commit.to_string(),
             parent_tree: parent_tree.to_string(),
             tree: details.tree.to_string(),
             message_hash: digest(details.message.as_bytes()),
             ruleset: self.ruleset(),
-            value_fingerprints: self
-                .values
-                .iter()
-                .map(|value| digest(value.as_bytes()))
-                .collect(),
+            value_fingerprints: value_fingerprints(&self.values),
         };
         let mut fragments = vec![Fragment::all(
             "commit-message.txt".into(),
             details.message.into_bytes(),
         )];
         let mut findings = Vec::new();
+        let mut unscanned_lfs = Vec::new();
         let mut input_bytes = fragments[0].bytes.len() as u64;
         for (path, file) in &after {
             if before
@@ -418,6 +496,16 @@ impl Scanner {
                 .transpose()?
                 .unwrap_or_default();
             let bytes = repository.saved_bytes(file)?;
+            let pointer = matches!(file.mode, 0o100644 | 0o100755)
+                .then(|| intercat_git::lfs::Pointer::parse(&bytes))
+                .flatten();
+            let old_pointer = before
+                .get(path)
+                .filter(|file| matches!(file.mode, 0o100644 | 0o100755))
+                .and_then(|_| intercat_git::lfs::Pointer::parse(&old));
+            let old = self.lfs_bytes(path, &old, old_pointer, lfs_storage, &mut input_bytes)?;
+            let is_lfs = pointer.is_some();
+            let bytes = self.lfs_bytes(path, &bytes, pointer, lfs_storage, &mut input_bytes)?;
             if intercat_git::secret_path(path) && !before.contains_key(path) {
                 findings.push(Finding {
                     id: String::new(),
@@ -428,9 +516,21 @@ impl Scanner {
                 });
             }
             if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
-                return Err(
-                    format!("Secret scan cannot fully inspect binary content: {path}").into(),
-                );
+                if is_lfs {
+                    unscanned_lfs.push(path.clone());
+                } else {
+                    findings.push(Finding {
+                        id: String::new(),
+                        path: path.clone(),
+                        line: 1,
+                        end_line: 1,
+                        rule: BINARY_REVIEW_RULE.into(),
+                    });
+                }
+                // Exact Check-environment values still scan every byte. The
+                // UI explicitly states that binary rule scanning is incomplete.
+                fragments.push(Fragment::all(format!("files/{path}"), bytes));
+                continue;
             }
             fragments.push(Fragment {
                 path: format!("files/{path}"),
@@ -455,7 +555,45 @@ impl Scanner {
             key.extend(serde_json::to_vec(&finding)?);
             finding.id = digest(&key);
         }
-        Ok(Scan { binding, findings })
+        Ok(Scan {
+            binding,
+            findings,
+            unscanned_lfs,
+        })
+    }
+
+    fn lfs_bytes(
+        &self,
+        path: &str,
+        git_bytes: &[u8],
+        pointer: Option<intercat_git::lfs::Pointer>,
+        storage: &Path,
+        input_bytes: &mut u64,
+    ) -> Result<Vec<u8>> {
+        let Some(pointer) = pointer else {
+            return Ok(git_bytes.to_vec());
+        };
+        *input_bytes = input_bytes.saturating_add(pointer.size());
+        if *input_bytes > INPUT_LIMIT as u64 {
+            return Err("Secret scan input exceeds 64 MiB.".into());
+        }
+        let entry = intercat_git::lfs::Entry {
+            path: path.into(),
+            pointer,
+        };
+        let Some(mut file) = crate::lfs_store::read(storage, &entry)? else {
+            return Ok(Vec::new());
+        };
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(entry.pointer.size() + 1)
+            .read_to_end(&mut bytes)?;
+        // Revalidate after reading. A mutable checkout cannot substitute
+        // unscanned bytes while retaining the pointer recorded in the binding.
+        if bytes.len() as u64 != entry.pointer.size() || digest(&bytes) != entry.pointer.oid() {
+            return Err(crate::lfs_store::Problem::Corrupt { path: path.into() }.into());
+        }
+        Ok(bytes)
     }
 
     pub(crate) async fn private_spans(

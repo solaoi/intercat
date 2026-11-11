@@ -20,6 +20,7 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, Connection)> {
             [track],
         )?;
         let workspace = Workspace {
+            denied_roots: Vec::new(),
             track_id: track.into(),
             path: root.path().join(track),
             reference: format!("refs/intercat/dummy/tracks/{track}"),
@@ -79,6 +80,7 @@ async fn checkpoint(
 async fn page(journal: &Journal, track: &str, before: Option<i64>) -> Result<Page> {
     journal
         .branch_points(Query {
+            range: None,
             track_id: track.into(),
             before,
         })
@@ -97,6 +99,7 @@ async fn points_are_paged_without_losing_old_turns_when_new_ones_arrive() -> Res
     let first = page(&journal, "A", None).await?;
     assert_eq!(first.points.len(), 50);
     assert_eq!(first.points[0].turn_id, turns[54]);
+    assert_eq!(first.points[0].turn_number, 55);
     assert!(first.points.iter().all(|p| p.available));
     checkpoint(&journal, &db, "A", 57, false).await?;
     let second = page(&journal, "A", first.before).await?;
@@ -114,6 +117,54 @@ async fn points_are_paged_without_losing_old_turns_when_new_ones_arrive() -> Res
         db.query_row("SELECT count(*) FROM branches", [], |row| row
             .get::<_, i64>(0))?,
         0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lane_window_reads_only_its_completed_saved_turns() -> Result<()> {
+    let (_root, journal, db) = fixture().await?;
+    for number in 1..=12 {
+        checkpoint(&journal, &db, "A", number, false).await?;
+    }
+    checkpoint(&journal, &db, "A", 13, true).await?;
+    checkpoint(&journal, &db, "B", 5, false).await?;
+    let result = journal
+        .branch_points(Query {
+            track_id: "A".into(),
+            before: None,
+            range: Some(intercat_daemon::branch_points::Range {
+                start: 400,
+                end: 700,
+            }),
+        })
+        .await?;
+    assert_eq!(
+        result
+            .points
+            .iter()
+            .map(|point| point.turn_number)
+            .collect::<Vec<_>>(),
+        vec![7, 6, 5, 4]
+    );
+    assert!(result.points.iter().all(|point| {
+        point
+            .timeline_at
+            .is_some_and(|at| (400..=700).contains(&at))
+    }));
+    assert!(result.before.is_none());
+    assert!(
+        journal
+            .branch_points(Query {
+                track_id: "A".into(),
+                before: None,
+                range: Some(intercat_daemon::branch_points::Range {
+                    start: 700,
+                    end: 400
+                })
+            })
+            .await
+            .is_err()
     );
     Ok(())
 }
@@ -203,7 +254,10 @@ async fn authenticated_rpc_reads_points_without_creating_a_branch() -> Result<()
             BufReader::new(tokio::net::UnixStream::connect(socket.path().join("rpc.sock")).await?);
         for (method, params) in [
             ("rpc.authenticate", json!({"token":token})),
-            ("branch.points", json!({"trackId":"A","before":null})),
+            (
+                "branch.points",
+                json!({"trackId":"A","before":null,"range":null}),
+            ),
         ] {
             stream
                 .get_mut()

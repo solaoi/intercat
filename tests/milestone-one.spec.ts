@@ -158,7 +158,7 @@ test('login stops after three failed attempts', async () => {
     const sheet = page.getByRole('complementary', { name: 'Commit review' });
     await expect(sheet).toContainText('Checked and ready', { timeout: 60000 });
     await expect(sheet).toContainText('Effects outside');
-    observations.review = (await page.evaluate(() => window.intercat.getStatus())).integration;
+    observations.review = (await page.evaluate(() => window.intercat.getStatus())).integrations![0];
     await page.screenshot({ path: path.join(output, 'review.png') });
     await sheet.getByRole('button', { name: 'Commit', exact: true }).click();
     await expect(sheet).toContainText('Committed', { timeout: 30000 });
@@ -187,8 +187,8 @@ test('login stops after three failed attempts', async () => {
     }
     expect(await timelineClips(page)).toEqual(savedClips);
     expect(await timelineMarks(page)).toEqual(savedMarks);
-    expect(restored.integration?.id).toBe(committed.integration?.id);
-    expect(restored.integration?.status).toBe('done');
+    expect(restored.integrations![0]?.id).toBe(committed.integrations![0]?.id);
+    expect(restored.integrations![0]?.status).toBe('done');
     observations.restored = restored;
     observations.passed = true;
   } finally {

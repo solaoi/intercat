@@ -17,18 +17,18 @@ for (const zoom of [1, 2]) {
           title: `${label}：キャッシュと同じファイルの変更を確認するダミー作業`, included: true, checkpointCount: 1, lastClip: 1, checkpoint: { sha: 'a'.repeat(40) } }));
         const job: IntegrationJob = { id: '01a1a200-0000-7000-8000-000000000001', revision: 1, status: 'ordering',
           sessionName: 'Order fixture', slug: 'order-fixture', project: { id: 'dummy-folder', name: 'Dummy project', root: '/fixture', path: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'main' },
-          error: null, tracks, candidate: null, messages: {}, keptSecrets: [], contributions: {}, exclusions: [], assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0,
-          plan: { targetRef: 'refs/heads/intercat/order-fixture', tree: null, rows: tracks.map(track => ({ track: track.id, state: 'waiting', changes: [], conflicts: [] })) },
+          error: null, tracks, candidate: null, messages: {}, keptSecrets: [], contributions: {}, pathReview:{families:[],choices:{}},pathState:null,retirements:[],exclusions: [], assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0,
+          plan: { undoConflict:null,targetRef: 'refs/heads/intercat/order-fixture', tree: null, rows: tracks.map(track => ({ track: track.id, state: 'waiting', changes: [], conflicts: [] })) },
           orderReview: { order: tracks.map(track => track.id), confirmed: false, overlaps: [{ path: 'src/キャッシュ/shared.ts', tracks: tracks.map(track => track.id) }] } };
-        const state: DaemonStatus & { sequence: number } = { connected: true, sequence: 1, integration: job, project: { id: 'dummy-project', name: job.project.name, folders: [job.project] }, trackFolders: Object.fromEntries(tracks.map(track => [track.id,job.project.id])),
-          tracks: tracks.map(track => ({ ...track, status: 'done' })), workspaces: tracks.map(track => ({ trackId: track.id, state: 'ready', path: '/fixture', reference: '', base: '', attachmentRoots: [], error: null })), workers: [], utterances: [] };
+        const state: DaemonStatus & { sequence: number } = { connected: true, sequence: 1, integrations: [job], project: { id: 'dummy-project', name: job.project.name, folders: [job.project] }, trackFolders: Object.fromEntries(tracks.map(track => [track.id,job.project.id])),
+          tracks: tracks.map(track => ({ ...track, status: 'done' })), workspaces: tracks.map(track => ({ trackId: track.id, state: 'ready', path: '/fixture', reference: '', base: '', deniedRoots: [], attachmentRoots: [], error: null })), workers: [], utterances: [] };
         const memory = { state, calls: [] as IntegrationRequest[], applied: new Set<string>(), orders: 0, lose: zoom === 2 };
         Object.assign(globalThis, { commitOrderFixture: memory });
         ipcMain.removeHandler('intercat:status'); ipcMain.handle('intercat:status', () => state);
         ipcMain.removeHandler('intercat:timeline-window'); ipcMain.handle('intercat:timeline-window', () => ({ revision: state.sequence, reset: true, clips: [], marks: [], removed: [], removedMarks: [] }));
         ipcMain.removeHandler('intercat:integration-command'); ipcMain.handle('intercat:integration-command', (_event, request: IntegrationRequest) => {
           memory.calls.push(request);
-          if (memory.applied.has(request.opId)) return state.integration;
+          if (memory.applied.has(request.opId)) return state.integrations![0];
           if (request.action.action === 'order') {
             const ids = request.action.tracks;
             job.tracks = ids.map(id => job.tracks.find(track => track.id === id)!);
@@ -38,7 +38,7 @@ for (const zoom of [1, 2]) {
           } else if (request.action.action === 'prepare') {
             job.status = 'checked'; state.sequence++;
           }
-          return state.integration;
+          return state.integrations![0];
         });
       }, zoom);
       const page = await app.firstWindow(); await page.reload();
@@ -66,7 +66,7 @@ for (const zoom of [1, 2]) {
       await expect(page.getByRole('complementary', { name: 'Commit review', exact: true })).toBeVisible();
       const result = await app.evaluate(() => {
         const memory = (globalThis as typeof globalThis & { commitOrderFixture: { calls: IntegrationRequest[]; orders: number; state: DaemonStatus } }).commitOrderFixture;
-        return { calls: memory.calls, orders: memory.orders, tracks: memory.state.integration!.tracks.map(track => track.label) };
+        return { calls: memory.calls, orders: memory.orders, tracks: memory.state.integrations![0]!.tracks.map(track => track.label) };
       });
       expect(result.orders).toBe(1); expect(result.tracks).toEqual(['B', 'A']);
       expect(result.calls.some(call => call.action.action === 'prepare')).toBe(true);

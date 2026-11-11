@@ -4,7 +4,7 @@ use intercat_daemon::{
     journal::Journal,
     preparation::Preparation,
     project::{self, Folder},
-    worktree::GitTool,
+    worktree,
 };
 use intercat_git::Repository;
 use serde_json::{Value, json};
@@ -168,10 +168,7 @@ async fn recovers_reserved_names_and_incomplete_checkout_using_the_same_operatio
     let reference = format!("refs/intercat/{slug}/tracks/A");
     let operation = Uuid::new_v5(&Uuid::parse_str(&track)?, b"worktree.prepare");
     journal.intent(&operation.to_string(),"worktree.prepare",json!({"source":source.root,"path":destination,"head":source.head.to_string(),"ref":reference})).await?;
-    GitTool::system()
-        .await?
-        .prepare_detached(&source, &destination)
-        .await?;
+    worktree::prepare_detached(&source, &destination).await?;
     fs::remove_file(destination.join("file.txt"))?;
     let preparation = Preparation::start(&workspaces, journal.clone())?;
     let state = ready(&journal).await?;

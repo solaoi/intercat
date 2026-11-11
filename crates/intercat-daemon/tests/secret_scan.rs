@@ -71,6 +71,119 @@ fn commit(root: &Path, message: &str) -> intercat_git::ObjectId {
     git(root, &["rev-parse", "HEAD"]).parse().unwrap()
 }
 
+fn lfs_file(root: &Path, name: &str, bytes: &[u8]) -> Result<std::path::PathBuf> {
+    use sha2::{Digest, Sha256};
+    let oid = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let object = root
+        .join(".git/lfs/objects")
+        .join(&oid[..2])
+        .join(&oid[2..4])
+        .join(&oid);
+    fs::create_dir_all(object.parent().unwrap())?;
+    fs::write(&object, bytes)?;
+    fs::write(
+        root.join(name),
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n",
+            bytes.len()
+        ),
+    )?;
+    Ok(object)
+}
+
+#[tokio::test]
+async fn lfs_text_scans_payload_added_lines_and_known_check_values() -> Result<()> {
+    let root = repository(&[])?;
+    let old = format!("old_token = '{TOKEN}'\nsafe = 1\n");
+    lfs_file(root.path(), "dummy.lfs", old.as_bytes())?;
+    let base = commit(root.path(), "dummy LFS base");
+    let value = "agent-created-check-value-41";
+    let new = format!("{old}added = '{value}'\n");
+    lfs_file(root.path(), "dummy.lfs", new.as_bytes())?;
+    let head = commit(root.path(), "dummy LFS change");
+    let repo = Repository::open(root.path())?;
+    let scan = Engine::capture()?
+        .start(&[value.into()])?
+        .commit(
+            &repo,
+            base,
+            head,
+            &root.path().canonicalize()?.join(".git/lfs"),
+            watch::channel(false).1,
+        )
+        .await?;
+    assert!(scan.unscanned_lfs.is_empty());
+    assert_eq!(scan.findings.len(), 1, "{scan:?}");
+    assert_eq!(scan.findings[0].path, "dummy.lfs");
+    assert_eq!(scan.findings[0].line, 3);
+    assert_eq!(scan.findings[0].rule, "check-environment-value");
+    let encoded = serde_json::to_string(&scan)?;
+    assert!(!encoded.contains(value));
+    assert!(!encoded.contains(TOKEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn lfs_binary_is_explicitly_unscanned_and_known_values_are_still_detected() -> Result<()> {
+    let root = repository(&[])?;
+    let base = git(root.path(), &["rev-parse", "HEAD"]).parse()?;
+    let value = "agent-created-binary-check-value-83";
+    let bytes = format!("\0dummy\0{value}\0").into_bytes();
+    let object = lfs_file(root.path(), "dummy-image.lfs", &bytes)?;
+    let head = commit(root.path(), "dummy binary LFS change");
+    let repo = Repository::open(root.path())?;
+    let scanner = Engine::capture()?.start(&[value.into()])?;
+    let scan = scanner
+        .commit(
+            &repo,
+            base,
+            head,
+            &root.path().canonicalize()?.join(".git/lfs"),
+            watch::channel(false).1,
+        )
+        .await?;
+    assert_eq!(scan.unscanned_lfs, ["dummy-image.lfs"]);
+    assert!(
+        scan.findings
+            .iter()
+            .any(|finding| finding.rule == "check-environment-value")
+    );
+    assert!(!serde_json::to_string(&scan)?.contains(value));
+    fs::write(&object, b"corrupt dummy payload")?;
+    let error = scanner
+        .commit(
+            &repo,
+            base,
+            head,
+            &root.path().canonicalize()?.join(".git/lfs"),
+            watch::channel(false).1,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.downcast_ref(), Some(intercat_daemon::lfs_store::Problem::Corrupt { path }) if path == "dummy-image.lfs")
+    );
+    fs::remove_file(object)?;
+    let error = scanner
+        .commit(
+            &repo,
+            base,
+            head,
+            &root.path().canonicalize()?.join(".git/lfs"),
+            watch::channel(false).1,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref(),
+        Some(intercat_daemon::lfs_store::Problem::Missing { .. })
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn only_added_lines_are_flagged_and_each_intermediate_commit_is_checked() -> Result<()> {
     let initial = format!("old_token = '{TOKEN}'\nsafe = 1\n");
@@ -84,7 +197,13 @@ async fn only_added_lines_are_flagged_and_each_intermediate_commit_is_checked() 
     )?;
     let safe = commit(root.path(), "safe edit");
     let scan = scanner
-        .commit(&repo, base, safe, watch::channel(false).1)
+        .commit(
+            &repo,
+            base,
+            safe,
+            &root.path().canonicalize()?.join(".git/lfs"),
+            watch::channel(false).1,
+        )
         .await?;
     assert!(scan.findings.is_empty(), "{scan:?}");
     fs::write(
@@ -97,7 +216,13 @@ async fn only_added_lines_are_flagged_and_each_intermediate_commit_is_checked() 
     )?;
     let leaked = commit(root.path(), "add fixture token");
     let detected = scanner
-        .commit(&repo, safe, leaked, watch::channel(false).1)
+        .commit(
+            &repo,
+            safe,
+            leaked,
+            &root.path().canonicalize()?.join(".git/lfs"),
+            watch::channel(false).1,
+        )
         .await?;
     assert!(
         detected
@@ -112,7 +237,13 @@ async fn only_added_lines_are_flagged_and_each_intermediate_commit_is_checked() 
     let removed = commit(root.path(), "remove fixture token");
     assert!(
         scanner
-            .commit(&repo, leaked, removed, watch::channel(false).1)
+            .commit(
+                &repo,
+                leaked,
+                removed,
+                &root.path().canonicalize()?.join(".git/lfs"),
+                watch::channel(false).1
+            )
             .await?
             .findings
             .is_empty()
@@ -138,7 +269,13 @@ async fn final_messages_and_exact_values_are_scanned_and_output_is_redacted() ->
     )?;
     let head = commit(root.path(), &format!("subject\n\n{TOKEN}"));
     let scan = scanner
-        .commit(&repo, base, head, watch::channel(false).1)
+        .commit(
+            &repo,
+            base,
+            head,
+            &root.path().canonicalize()?.join(".git/lfs"),
+            watch::channel(false).1,
+        )
         .await?;
     assert!(
         scan.findings
@@ -165,7 +302,13 @@ async fn final_messages_and_exact_values_are_scanned_and_output_is_redacted() ->
     assert!(!serde_json::to_string(&scan)?.contains(&known));
     let changed_values = Engine::capture()?
         .start(&[known, "another-value".into()])?
-        .commit(&repo, base, head, watch::channel(false).1)
+        .commit(
+            &repo,
+            base,
+            head,
+            &root.path().canonicalize()?.join(".git/lfs"),
+            watch::channel(false).1,
+        )
         .await?;
     assert_ne!(
         scan.binding.value_fingerprints,
@@ -177,7 +320,13 @@ async fn final_messages_and_exact_values_are_scanned_and_output_is_redacted() ->
     );
     let amended = git(root.path(), &["rev-parse", "HEAD"]).parse()?;
     let changed_message = scanner
-        .commit(&repo, base, amended, watch::channel(false).1)
+        .commit(
+            &repo,
+            base,
+            amended,
+            &root.path().canonicalize()?.join(".git/lfs"),
+            watch::channel(false).1,
+        )
         .await?;
     assert_eq!(scan.binding.tree, changed_message.binding.tree);
     assert_ne!(
@@ -211,7 +360,13 @@ async fn boolean_words_inside_credentials_do_not_suppress_secret_detection() -> 
     let head = commit(root.path(), "Add synthetic credential cases");
     let scanner = Engine::capture()?.start(&[])?;
     let scan = scanner
-        .commit(&repo, base, head, watch::channel(false).1)
+        .commit(
+            &repo,
+            base,
+            head,
+            &root.path().canonicalize()?.join(".git/lfs"),
+            watch::channel(false).1,
+        )
         .await?;
     for i in 0..values.len() {
         assert!(
@@ -240,7 +395,7 @@ async fn boolean_words_inside_credentials_do_not_suppress_secret_detection() -> 
 }
 
 #[tokio::test]
-async fn corrupt_detector_cancellation_and_unscannable_files_fail_closed() -> Result<()> {
+async fn corrupt_detector_cancellation_and_excess_findings_fail_closed() -> Result<()> {
     let root = repository(&[])?;
     let bad = root.path().join("gitleaks");
     fs::write(&bad, "#!/bin/sh\nexit 0\n")?;
@@ -264,18 +419,44 @@ async fn corrupt_detector_cancellation_and_unscannable_files_fail_closed() -> Re
             .to_string()
             .contains("Too many secret findings")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn binary_coverage_and_known_values_require_separate_review() -> Result<()> {
+    let root = repository(&[])?;
     let repo = Repository::open(root.path())?;
     let base = git(root.path(), &["rev-parse", "HEAD"]).parse()?;
-    fs::write(root.path().join("image.bin"), b"binary\0bytes")?;
+    let value = "agent-created-binary-check-value-92";
+    fs::write(root.path().join("image.bin"), format!("\0{value}\0"))?;
     let head = commit(root.path(), "binary addition");
-    assert!(
-        scanner
-            .commit(&repo, base, head, watch::channel(false).1)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("binary content")
-    );
+    let scanner = Engine::capture()?.start(&[value.into()])?;
+    let storage = root.path().canonicalize()?.join(".git/lfs");
+    let scan = scanner
+        .commit(&repo, base, head, &storage, watch::channel(false).1)
+        .await?;
+    let binary = scan
+        .findings
+        .iter()
+        .find(|item| {
+            item.path == "image.bin"
+                && item.rule == intercat_daemon::secret_scan::BINARY_REVIEW_RULE
+        })
+        .expect("binary coverage finding");
+    let secret = scan
+        .findings
+        .iter()
+        .find(|item| item.path == "image.bin" && item.rule == "check-environment-value")
+        .expect("known value in binary contents");
+    assert!(!scan.accepted(&[binary.id.clone()].into()));
+    assert!(!scan.accepted(&[secret.id.clone()].into()));
+    assert!(scan.accepted(&[binary.id.clone(), secret.id.clone()].into()));
+    assert!(scan.unscanned_lfs.is_empty());
+    assert!(!serde_json::to_string(&scan)?.contains(value));
+    let push = scanner
+        .push_commit(&repo, head, &storage, watch::channel(false).1)
+        .await?;
+    assert_eq!(scan, push);
     Ok(())
 }
 
@@ -293,12 +474,100 @@ async fn symlink_blob_is_inspected_without_reading_its_target_and_index_is_uncha
     let scanner = Engine::capture()?.start(&[])?;
     assert!(
         scanner
-            .commit(&repo, base, head, watch::channel(false).1)
+            .commit(
+                &repo,
+                base,
+                head,
+                &root.path().canonicalize()?.join(".git/lfs"),
+                watch::channel(false).1
+            )
             .await?
             .findings
             .is_empty()
     );
     assert_eq!(fs::read(root.path().join(".git/index"))?, index);
     assert_eq!(git(root.path(), &["rev-parse", "HEAD"]), head.to_string());
+    Ok(())
+}
+
+#[tokio::test]
+async fn push_range_scans_roots_merge_resolutions_and_intermediate_removed_secrets() -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+    let value = "dummy-agent-push-range-value-75";
+    let root = repository(&[("base.txt", "dummy safe base\n")])?;
+    let base = git(root.path(), &["rev-parse", "HEAD"]).parse()?;
+    fs::write(
+        root.path().join("temporary.txt"),
+        format!("value={value}\n"),
+    )?;
+    let contains = commit(root.path(), "dummy intermediate secret");
+    fs::remove_file(root.path().join("temporary.txt"))?;
+    let removed = commit(root.path(), "dummy removed secret");
+    let repo = Repository::open(root.path())?;
+    let original = repo.commit_details(base)?;
+    let blob = repo.write_blob(format!("value={value}\n").as_bytes())?;
+    let merge_tree = repo.write_tree(&[("resolution.txt", blob)])?;
+    let merge = repo.write_commit(
+        merge_tree,
+        &[removed, base],
+        "dummy merge resolution",
+        gix::actor::Signature {
+            name: "Dummy".into(),
+            email: "dummy@example.invalid".into(),
+            time: gix::date::Time::now_local_or_utc(),
+        },
+    )?;
+    let scanner = Engine::capture()?.start(&[value.into()])?;
+    let lfs = root.path().canonicalize()?.join(".git/lfs");
+    let root_scan = scanner
+        .push_commit(&repo, base, &lfs, watch::channel(false).1)
+        .await?;
+    assert!(root_scan.findings.is_empty());
+    assert_eq!(root_scan.binding.tree, original.tree.to_string());
+    let commits = repo.push_commits(merge, &[base], &AtomicBool::new(false))?;
+    assert_eq!(commits.len(), 3);
+    let mut detected = Vec::new();
+    for sha in commits {
+        let scan = scanner
+            .push_commit(&repo, sha, &lfs, watch::channel(false).1)
+            .await?;
+        if !scan.findings.is_empty() {
+            assert_eq!(scan.findings.len(), 1);
+            assert!(!serde_json::to_string(&scan)?.contains(value));
+            detected.push(sha);
+        }
+    }
+    assert!(detected.contains(&contains));
+    assert!(detected.contains(&merge));
+    assert!(!detected.contains(&removed));
+    assert!(
+        scanner
+            .commit(&repo, removed, merge, &lfs, watch::channel(false).1)
+            .await
+            .is_err()
+    );
+    let gitlink_tree = gix::open(root.path())?
+        .write_object(&gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Commit.into(),
+                filename: "historical-gitlink".into(),
+                oid: "ab".repeat(20).parse()?,
+            }],
+        })?
+        .detach();
+    let gitlink = repo.checkpoint_commit(gitlink_tree, base, "dummy historic gitlink")?;
+    assert!(
+        scanner
+            .push_commit(&repo, gitlink, &lfs, watch::channel(false).1)
+            .await?
+            .findings
+            .is_empty()
+    );
+    assert!(
+        scanner
+            .commit(&repo, base, gitlink, &lfs, watch::channel(false).1)
+            .await
+            .is_err()
+    );
     Ok(())
 }

@@ -52,6 +52,11 @@ impl Fixture {
             )?
             .to_string();
         let point = Point {
+            views: Vec::new(),
+            parents: inherits
+                .iter()
+                .map(|point| (point.track.clone(), point.inherited()))
+                .collect(),
             track: track.into(),
             number,
             sha,
@@ -72,12 +77,14 @@ impl Fixture {
         for point in integrated {
             self.graph.incorporate(&mut done, point)?;
         }
-        let base = match self
-            .graph
-            .track_baseline(&self.repo, child, &child.basis(), &done)?
-        {
+        let base = match self.graph.track_baseline(
+            &mut intercat_daemon::merge_choices::Merges::new(&self.repo, &[])?,
+            child,
+            &child.basis(),
+            &done,
+        )? {
             Merge::Clean(base) => base,
-            Merge::Conflicts(paths) => panic!("baseline conflict: {paths:?}"),
+            Merge::Conflicts { paths, .. } => panic!("baseline conflict: {paths:?}"),
         };
         let merged = match self.repo.merge_trees(
             base,
@@ -85,7 +92,7 @@ impl Fixture {
             self.repo.tree_id(child.sha.parse()?)?,
         )? {
             Merge::Clean(tree) => tree,
-            Merge::Conflicts(paths) => panic!("delta conflict: {paths:?}"),
+            Merge::Conflicts { paths, .. } => panic!("delta conflict: {paths:?}"),
         };
         self.repo
             .tree_files(merged)?
@@ -192,7 +199,13 @@ fn a_real_child_conflict_is_not_hidden_by_the_baseline() -> Result<()> {
     let a = f.point("A", &[("a", "200\n")], &[])?;
     let b = f.point("B", &[("a", "300\n")], &[&a])?;
     let done = Ancestors::from([("A".into(), a.inherited())]);
-    let Merge::Clean(base) = f.graph.track_baseline(&f.repo, &b, &b.basis(), &done)? else {
+    let Merge::Clean(base) = f.graph.track_baseline(
+        &mut intercat_daemon::merge_choices::Merges::new(&f.repo, &[])?,
+        &b,
+        &b.basis(),
+        &done,
+    )?
+    else {
         panic!()
     };
     assert!(matches!(
@@ -201,7 +214,7 @@ fn a_real_child_conflict_is_not_hidden_by_the_baseline() -> Result<()> {
             f.tree(&[("a", "400\n")])?,
             f.repo.tree_id(b.sha.parse()?)?
         )?,
-        Merge::Conflicts(_)
+        Merge::Conflicts { .. }
     ));
     Ok(())
 }
@@ -231,9 +244,25 @@ fn missing_and_cyclic_ancestry_are_rejected() -> Result<()> {
     let mut basis = Basis::root(f.root.clone());
     basis.inherits = done.clone();
     f.graph.points[0].inherits.insert("B".into(), b.inherited());
-    assert!(f.graph.baseline(&f.repo, &basis, &done).is_err());
+    assert!(
+        f.graph
+            .baseline(
+                &mut intercat_daemon::merge_choices::Merges::new(&f.repo, &[])?,
+                &basis,
+                &done
+            )
+            .is_err()
+    );
     f.graph.points.clear();
-    assert!(f.graph.baseline(&f.repo, &basis, &done).is_err());
+    assert!(
+        f.graph
+            .baseline(
+                &mut intercat_daemon::merge_choices::Merges::new(&f.repo, &[])?,
+                &basis,
+                &done
+            )
+            .is_err()
+    );
     Ok(())
 }
 
@@ -283,6 +312,40 @@ fn intermediate_edits_do_not_conflict_while_composing_the_ancestor_baseline() ->
         assert_eq!(files["b"], "B\n");
         assert_eq!(files["x"], "X\n");
         assert_eq!(files["c"], "C\n");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_realigned_own_base_keeps_later_deletions_and_edits_from_the_target() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let a1 = f.point("A", &[("a", "old")], &[])?;
+    let x = f.point("X", &[("x", "published")], &[])?;
+    let head = f
+        .repo
+        .checkpoint_commit(
+            f.tree(&[("a", "old"), ("x", "published")])?,
+            f.root.parse()?,
+            "Dummy realigned session head",
+        )?
+        .to_string();
+    let mut a2 = f.point(
+        "A",
+        &[("a", "old"), ("x", "published"), ("own", "later A")],
+        &[],
+    )?;
+    a2.base_at = head;
+    a2.base_inherits_at.insert("A".into(), a1.inherited());
+    a2.base_inherits_at.insert("X".into(), x.inherited());
+    *f.graph.points.last_mut().unwrap() = a2.clone();
+    for current in ["old", "updated by another worker"] {
+        let files = f.merge(&a2, &[("a", current)], &[&a1, &x])?;
+        assert!(
+            !files.contains_key("x"),
+            "the realigned base must not be replaced by A's older checkpoint"
+        );
+        assert_eq!(files["a"], current);
+        assert_eq!(files["own"], "later A");
     }
     Ok(())
 }

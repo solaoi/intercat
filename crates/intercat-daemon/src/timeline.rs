@@ -11,6 +11,7 @@ pub fn install(db: &Connection) -> Result<()> {
     CREATE TABLE timeline_items(session TEXT NOT NULL,item TEXT NOT NULL,clip TEXT NOT NULL,revision INTEGER NOT NULL,record TEXT NOT NULL,summary TEXT NOT NULL,PRIMARY KEY(session,item));
     CREATE INDEX timeline_item_clip ON timeline_items(clip);
     CREATE INDEX timeline_clip_turn ON timeline_clips(json_extract(record,'$.sessionId'),json_extract(record,'$.turnId'),ordinal);
+    CREATE INDEX branch_clip_turn ON timeline_clips(track,json_extract(record,'$.turnId'));
     CREATE TABLE timeline_marks(session TEXT NOT NULL,item TEXT NOT NULL,track TEXT NOT NULL,position INTEGER NOT NULL,input TEXT,repair TEXT,PRIMARY KEY(session,item));
     CREATE TABLE timeline_outputs(session TEXT NOT NULL,item TEXT NOT NULL,reference TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(session,item,reference));")?;
     db.execute_batch("CREATE TABLE timeline_revision(revision INTEGER NOT NULL);
@@ -658,6 +659,23 @@ fn summary(db: &Connection, clip: &Clip, now: &Stamp) -> Result<Value> {
         .as_ref()
         .map(|value| value.summary.clone())
         .unwrap_or(label);
+    let merge = if let Some(run) = &clip.repair_run_id {
+        db.query_row(
+            "SELECT json_extract(record,'$.purpose.kind') FROM repair_runs WHERE id=?1",
+            [run],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .as_deref()
+            == Some("merge")
+    } else {
+        false
+    };
+    let label = if merge {
+        format!("merge · {label}")
+    } else {
+        label
+    };
     let (duration, approximate) = clip.end.as_ref().unwrap_or(now).elapsed(&clip.start);
     let approximate = approximate || clip.recovered;
     let generation = clip
@@ -696,7 +714,12 @@ fn summary(db: &Connection, clip: &Clip, now: &Stamp) -> Result<Value> {
     );
     value["warnings"] = json!(crate::clip_warnings::read(db, &clip.id)?);
     if let Some(generated) = generated {
-        value["title"] = generated.title.into();
+        value["title"] = if merge {
+            format!("merge · {}", generated.title)
+        } else {
+            generated.title
+        }
+        .into();
         value["summary"] = generated.summary.into();
     }
     if clip.category == "review" {
@@ -794,9 +817,9 @@ pub fn window(db: &Connection, request: Window) -> Result<Value> {
     // The You row covers every track, including those below the viewport.
     // Its time window is shared with clips; its history has no last-N cutoff.
     let sql = if reset {
-        "SELECT m.session,m.item,0,m.track,m.position,m.input,coalesce(u.text,'Received message'),m.repair,EXISTS(SELECT 1 FROM input_timeline p WHERE p.input=m.input) FROM timeline_marks m LEFT JOIN utterances u ON u.id=m.input WHERE m.position BETWEEN ?1 AND ?2 ORDER BY m.position,m.session,m.item"
+        "SELECT m.session,m.item,0,m.track,m.position,m.input,coalesce(u.text,CASE WHEN c.sha IS NOT NULL THEN 'Committed' ELSE 'Received message' END),m.repair,EXISTS(SELECT 1 FROM input_timeline p WHERE p.input=m.input),c.folder,c.sha,c.job FROM timeline_marks m LEFT JOIN utterances u ON u.id=m.input LEFT JOIN timeline_commits c ON c.session=m.session AND c.item=m.item WHERE m.position BETWEEN ?1 AND ?2 ORDER BY m.position,m.session,m.item"
     } else {
-        "SELECT v.session,v.item,v.deleted,m.track,m.position,m.input,coalesce(u.text,'Received message'),m.repair,EXISTS(SELECT 1 FROM input_timeline p WHERE p.input=m.input) FROM timeline_mark_versions v LEFT JOIN timeline_marks m USING(session,item) LEFT JOIN utterances u ON u.id=m.input WHERE v.version>?1 ORDER BY m.position,v.session,v.item"
+        "SELECT v.session,v.item,v.deleted,m.track,m.position,m.input,coalesce(u.text,CASE WHEN c.sha IS NOT NULL THEN 'Committed' ELSE 'Received message' END),m.repair,EXISTS(SELECT 1 FROM input_timeline p WHERE p.input=m.input),c.folder,c.sha,c.job FROM timeline_mark_versions v LEFT JOIN timeline_marks m USING(session,item) LEFT JOIN utterances u ON u.id=m.input LEFT JOIN timeline_commits c ON c.session=m.session AND c.item=m.item WHERE v.version>?1 ORDER BY m.position,v.session,v.item"
     };
     let mut query = db.prepare(sql)?;
     let args: &[i64] = if reset {
@@ -807,6 +830,7 @@ pub fn window(db: &Connection, request: Window) -> Result<Value> {
     let mut rows = query.query(rusqlite::params_from_iter(args))?;
     let mut marks = Vec::new();
     let mut removed_marks = Vec::new();
+    let mut pushed = None;
     while let Some(row) = rows.next()? {
         let id = format!("{}/{}", row.get::<_, String>(0)?, row.get::<_, String>(1)?);
         let position: Option<i64> = row.get(4)?;
@@ -823,7 +847,21 @@ pub fn window(db: &Connection, request: Window) -> Result<Value> {
                 removed_marks.push(id);
             }
         } else {
-            marks.push(json!({"id":id,"trackId":row.get::<_,String>(3)?,"at":position,"inputId":row.get::<_,Option<String>>(5)?,"text":row.get::<_,String>(6)?,"repairRunId":row.get::<_,Option<String>>(7)?}));
+            let mut mark = json!({"id":id,"trackId":row.get::<_,String>(3)?,"at":position,"inputId":row.get::<_,Option<String>>(5)?,"text":row.get::<_,String>(6)?,"repairRunId":row.get::<_,Option<String>>(7)?});
+            if let Some(sha) = row.get::<_, Option<String>>(10)? {
+                let folder = row.get::<_, String>(9)?;
+                if pushed.is_none() {
+                    pushed = Some(crate::publication_timeline::pushed(db)?);
+                }
+                let covered = pushed
+                    .as_ref()
+                    .unwrap()
+                    .contains(&(folder.clone(), sha.clone()));
+                mark["commit"] = json!({"folderId":folder,"sha":sha,"jobId":row.get::<_,String>(11)?,"pushed":covered});
+                mark["operation"] = json!("command");
+                mark["command"] = json!("commit");
+            }
+            marks.push(mark);
         }
     }
     let (inputs, removed_inputs) =

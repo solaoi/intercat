@@ -1,70 +1,24 @@
 use intercat_daemon::{
     Result,
-    handoff::{Change, Fields, Next, State},
+    handoff::{Change, Fields, Identity, Next, Source, State},
     journal::Journal,
-    pickup,
-    preparation::Workspace,
-    runtime::WorkerState,
     secrets::Key,
 };
 use uuid::Uuid;
-
 async fn fixture() -> Result<(tempfile::TempDir, Journal, Uuid)> {
     let root = tempfile::tempdir()?;
-    let j = Journal::open(root.path().join("db"), Key::new([7; 32])).await?;
-    let id = Uuid::now_v7();
-    let track = Uuid::now_v7().to_string();
-    let session = Uuid::now_v7().to_string();
-    let db = rusqlite::Connection::open(root.path().join("db"))?;
-    db.execute(
-        "INSERT INTO tracks VALUES(?1,'A','Summarize saved work','waiting')",
-        [&track],
-    )?;
-    j.workspace_result(Workspace {
-        attachment_roots: Vec::new(),
-        track_id: track.clone(),
-        path: root.path().into(),
-        reference: "refs/intercat/test/A".into(),
-        base: "0".repeat(40),
-        state: "ready".into(),
-        error: None,
-    })
-    .await?;
-    j.worker_state(WorkerState {
-        track_id: track.clone(),
-        phase: "after-connection-loss".into(),
-        session_id: Some(session.clone()),
-        secret_revision: None,
-        identity: None,
-        detail: None,
-        active_turn: None,
-        approvals: vec![],
-        output: None,
-        checkpoint_pending: false,
-        checkpoint: None,
-        prompts: vec![],
-    })
-    .await?;
-    j.pickup(pickup::Change::Prepare(pickup::Request {
-        op_id: id,
-        track_id: track,
-        session_id: session,
-    }))
-    .await?;
-    j.pickup(pickup::Change::Stopped(id)).await?;
-    j.pickup(pickup::Change::Captured(
+    let journal = Journal::open(root.path().join("db"), Key::new([7; 32])).await?;
+    Ok((root, journal, Uuid::now_v7()))
+}
+fn source(id: Uuid, context: serde_json::Value) -> Source {
+    Source {
         id,
-        intercat_daemon::checkpoint::Checkpoint {
-            turn_id: Uuid::new_v5(&id, b"recovery-snapshot"),
-            sha: "1".repeat(40),
-            reference: format!("refs/intercat/test/A-recovery/{id}"),
-            unmerged_paths: vec![],
-            live_processes: false,
+        identity: Identity {
+            track_id: Uuid::new_v5(&id, b"source-track").to_string(),
+            session_id: Uuid::new_v5(&id, b"source-session").to_string(),
         },
-    ))
-    .await?;
-    j.pickup(pickup::Change::Published(id)).await?;
-    Ok((root, j, id))
+        context,
+    }
 }
 fn fields() -> Fields {
     Fields {
@@ -81,10 +35,10 @@ fn fields() -> Fields {
 #[tokio::test]
 async fn summary_parts_and_reduction_resume_without_repeating_completed_work() -> Result<()> {
     let (root, j, id) = fixture().await?;
-    j.summary_plan(
+    j.summary_plan(source(
         id,
         serde_json::json!({"history":"Keep all source bytes. ".repeat(7_000)}),
-    )
+    ))
     .await?;
     let Next::Task(first) = j.summary_next(id).await? else {
         panic!("expected first task")
@@ -139,7 +93,7 @@ async fn summary_parts_and_reduction_resume_without_repeating_completed_work() -
 #[tokio::test]
 async fn only_a_known_failed_summary_gets_a_new_attempt() -> Result<()> {
     let (_root, j, id) = fixture().await?;
-    j.summary_plan(id, serde_json::json!({"text":"source"}))
+    j.summary_plan(source(id, serde_json::json!({"text":"source"})))
         .await?;
     let Next::Task(first) = j.summary_next(id).await? else {
         panic!()
@@ -184,8 +138,11 @@ async fn compact_keeps_the_current_request_tools_questions_and_original_addresse
 #[tokio::test]
 async fn an_empty_final_purpose_can_be_retried_without_reusing_the_invalid_output() -> Result<()> {
     let (_root, j, id) = fixture().await?;
-    j.summary_plan(id, serde_json::json!({"purpose":"Keep user constraints"}))
-        .await?;
+    j.summary_plan(source(
+        id,
+        serde_json::json!({"purpose":"Keep user constraints"}),
+    ))
+    .await?;
     let Next::Task(t) = j.summary_next(id).await? else {
         panic!()
     };
@@ -199,5 +156,49 @@ async fn an_empty_final_purpose_can_be_retried_without_reusing_the_invalid_outpu
     };
     assert_ne!(retry.id, t.id);
     assert_eq!(retry.input, t.input);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_handoff_binds_one_source_and_keeps_original_addresses_after_restart() -> Result<()> {
+    let (root, journal, id) = fixture().await?;
+    let captured = source(
+        id,
+        serde_json::json!({"instructions":[{"address":"own-clip-1","message":{"text":"Latest correction: do not publish","address":"forged-address"}}],"snapshotChanges":{"address":"refs/intercat/own-checkpoint","changes":[]}}),
+    );
+    journal.summary_plan(captured.clone()).await?;
+    journal.summary_plan(captured.clone()).await?;
+    let Next::Task(first) = journal.summary_next(id).await? else {
+        panic!("Own summary task missing");
+    };
+    assert_eq!(first.handoff_id, id);
+    assert_eq!(first.source, captured.identity);
+    for mutation in 0..3 {
+        let mut changed = captured.clone();
+        match mutation {
+            0 => changed.identity.track_id = Uuid::now_v7().to_string(),
+            1 => changed.identity.session_id = Uuid::now_v7().to_string(),
+            _ => changed.context["instructions"][0]["message"]["text"] = "changed input".into(),
+        };
+        assert!(journal.summary_plan(changed).await.is_err());
+    }
+    journal.summary_change(Change::Started(first.id)).await?;
+    journal
+        .summary_change(Change::Complete(first.id, fields()))
+        .await?;
+    drop(journal);
+    let journal = Journal::open(root.path().join("db"), Key::new([7; 32])).await?;
+    let Next::Complete(document) = journal.summary_next(id).await? else {
+        panic!("Own summary did not complete");
+    };
+    assert_eq!(
+        document.source_addresses,
+        vec![
+            "own-clip-1".to_owned(),
+            "refs/intercat/own-checkpoint".to_owned(),
+            format!("track:{}", captured.identity.track_id)
+        ]
+    );
+    assert_eq!(journal.summary_tasks(id).await?, vec![first.id]);
     Ok(())
 }

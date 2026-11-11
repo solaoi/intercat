@@ -260,13 +260,25 @@ pub struct Presentation {
     pub track_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_tracks: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publication: Option<crate::push_review::Selection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore: Option<Vec<crate::restore_review::Candidate>>,
 }
 
-pub(crate) fn prepare_presentation(decision: &mut Decision) -> Result<bool> {
+pub(crate) fn prepare_presentation(db: &Connection, decision: &mut Decision) -> Result<bool> {
     if decision.kind != Kind::Command
         || !matches!(
             decision.command.as_deref(),
-            Some("commit" | "settings" | "stage-mode" | "branch-from")
+            Some(
+                "commit"
+                    | "push"
+                    | "open-pr"
+                    | "settings"
+                    | "stage-mode"
+                    | "branch-from"
+                    | "restore"
+            )
         )
     {
         return Ok(false);
@@ -277,6 +289,15 @@ pub(crate) fn prepare_presentation(decision: &mut Decision) -> Result<bool> {
         receipt_id: Uuid::now_v7(),
         track_id: decision.track_id.clone(),
         commit_tracks: None,
+        publication: None,
+        restore: if decision.command.as_deref() == Some("restore") {
+            Some(crate::restore_review::capture(
+                db,
+                decision.track_id.as_deref(),
+            )?)
+        } else {
+            None
+        },
     };
     decision.scores["presentation"] = serde_json::to_value(presentation)?;
     Ok(true)
@@ -286,7 +307,15 @@ pub(crate) fn presentation(decision: &Decision) -> Result<Option<Presentation>> 
     if decision.kind != Kind::Command
         || !matches!(
             decision.command.as_deref(),
-            Some("commit" | "settings" | "stage-mode" | "branch-from")
+            Some(
+                "commit"
+                    | "push"
+                    | "open-pr"
+                    | "settings"
+                    | "stage-mode"
+                    | "branch-from"
+                    | "restore"
+            )
         )
     {
         return Ok(None);
@@ -312,6 +341,21 @@ pub(crate) fn presentation(decision: &Decision) -> Result<Option<Presentation>> 
             || tracks.iter().any(|id| Uuid::parse_str(id).is_err()))
     {
         return Err("Invalid Commit review selection.".into());
+    }
+    if let Some(selection) = &presentation.publication {
+        if !matches!(presentation.command.as_str(), "push" | "open-pr")
+            || presentation.track_id.is_some()
+        {
+            return Err("Invalid publication review command.".into());
+        }
+        selection.validate()?;
+    }
+    match (presentation.command.as_str(), &presentation.restore) {
+        ("restore", Some(candidates)) => {
+            crate::restore_review::validate(candidates, presentation.track_id.as_deref())?;
+        }
+        ("restore", None) | (_, Some(_)) => return Err("Invalid Restore review command.".into()),
+        _ => {}
     }
     Ok(Some(presentation))
 }

@@ -3,17 +3,8 @@ use crate::Result;
 use crate::journal::{Admission, Journal};
 use intercat_git::{Repository, WorktreeSource};
 use serde_json::json;
-use std::{
-    ffi::OsStr,
-    path::{Path, PathBuf},
-    process::Stdio,
-};
+use std::{ffi::OsStr, path::Path, process::Stdio};
 use tokio::process::Command;
-
-pub struct GitTool {
-    binary: PathBuf,
-    exec_dir: PathBuf,
-}
 
 fn quote(value: &OsStr) -> Result<String> {
     let value = value
@@ -25,145 +16,116 @@ fn quote(value: &OsStr) -> Result<String> {
     ))
 }
 
-impl GitTool {
-    pub fn binary(&self) -> &Path {
-        &self.binary
-    }
-    pub fn exec_dir(&self) -> &Path {
-        &self.exec_dir
-    }
-    pub async fn system() -> Result<Self> {
-        let output = Command::new("/usr/bin/xcrun")
-            .args(["--find", "git"])
-            .output()
-            .await?;
-        if !output.status.success() {
-            return Err(std::io::Error::other("Xcode Git is unavailable").into());
-        }
-        Self::new(PathBuf::from(String::from_utf8(output.stdout)?.trim())).await
-    }
-    pub async fn new(binary: PathBuf) -> Result<Self> {
-        let binary = binary.canonicalize()?;
-        let output = Command::new(&binary)
-            .arg("--exec-path")
-            .env_remove("GIT_EXEC_PATH")
-            .output()
-            .await?;
-        if !output.status.success() {
-            return Err(std::io::Error::other("cannot find Git helper directory").into());
-        }
-        let exec_dir = PathBuf::from(String::from_utf8(output.stdout)?.trim()).canonicalize()?;
-        Ok(Self { binary, exec_dir })
-    }
-    fn profile(
-        &self,
-        source: &WorktreeSource,
-        destination: &Path,
-        temporary: &Path,
-    ) -> Result<String> {
-        Ok(format!(
-            "(version 1)(deny default)(allow process-fork)(allow process-info*)(allow sysctl-read)(allow mach-lookup)(allow signal (target self))(allow file-read*)(allow process-exec (literal {}) (subpath {}))(allow file-write* (subpath {}) (subpath {}) (subpath {}) (literal \"/dev/null\"))",
-            quote(self.binary.as_os_str())?,
-            quote(self.exec_dir.as_os_str())?,
-            quote(source.common_dir.as_os_str())?,
-            quote(destination.as_os_str())?,
-            quote(temporary.as_os_str())?
+fn profile(
+    tool: &crate::git_tool::GitTool,
+    source: &WorktreeSource,
+    destination: &Path,
+    temporary: &Path,
+) -> Result<String> {
+    Ok(format!(
+        "(version 1)(deny default)(allow process-fork)(allow process-info*)(allow sysctl-read)(allow mach-lookup)(allow signal (target self))(allow file-read*)(allow process-exec (literal {}) (subpath {}))(allow file-write* (subpath {}) (subpath {}) (subpath {}) (literal \"/dev/null\"))",
+        quote(tool.binary().as_os_str())?,
+        quote(tool.exec_dir().as_os_str())?,
+        quote(source.common_dir.as_os_str())?,
+        quote(destination.as_os_str())?,
+        quote(temporary.as_os_str())?
+    ))
+}
+async fn run(
+    tool: &crate::git_tool::GitTool,
+    source: &WorktreeSource,
+    destination: &Path,
+    arguments: &[&OsStr],
+) -> Result<()> {
+    let temporary = tempfile::Builder::new().prefix("intercat-git-").tempdir()?;
+    let profile = profile(tool, source, destination, temporary.path())?;
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command
+        .args(["-p", &profile])
+        .arg(tool.binary())
+        .args([
+            "-c",
+            "core.fsync=objects,reference",
+            "-c",
+            "core.fsyncMethod=fsync",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(arguments)
+        .current_dir(&source.root)
+        .env_clear()
+        .env(
+            "HOME",
+            std::env::var_os("HOME").ok_or_else(|| std::io::Error::other("HOME missing"))?,
+        )
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("TMPDIR", temporary.path())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output =
+        tokio::time::timeout(std::time::Duration::from_secs(30), command.output()).await??;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "sandboxed Git failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
+        .into());
     }
-    async fn run(
-        &self,
-        source: &WorktreeSource,
-        destination: &Path,
-        arguments: &[&OsStr],
-    ) -> Result<()> {
-        let temporary = tempfile::Builder::new().prefix("intercat-git-").tempdir()?;
-        let profile = self.profile(source, destination, temporary.path())?;
-        let mut command = Command::new("/usr/bin/sandbox-exec");
-        command
-            .args(["-p", &profile])
-            .arg(&self.binary)
-            .args([
-                "-c",
-                "core.fsync=objects,reference",
-                "-c",
-                "core.fsyncMethod=fsync",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-            ])
-            .args(arguments)
-            .current_dir(&source.root)
-            .env_clear()
-            .env(
-                "HOME",
-                std::env::var_os("HOME").ok_or_else(|| std::io::Error::other("HOME missing"))?,
-            )
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("TMPDIR", temporary.path())
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(30), command.output()).await??;
-        if !output.status.success() {
-            return Err(std::io::Error::other(format!(
-                "sandboxed Git failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
-            .into());
-        }
-        Ok(())
-    }
+    Ok(())
+}
 
-    pub async fn prepare_detached(
-        &self,
-        source: &WorktreeSource,
-        destination: &Path,
-    ) -> Result<()> {
-        let parent = destination
-            .parent()
-            .ok_or_else(|| std::io::Error::other("worktree needs a parent directory"))?;
-        std::fs::create_dir_all(parent)?;
-        let destination = parent.canonicalize()?.join(
-            destination
-                .file_name()
-                .ok_or_else(|| std::io::Error::other("worktree needs a name"))?,
-        );
-        let head = source.head.to_string();
-        if destination.exists() {
-            Repository::verify_prepared_worktree(&destination, source)?;
-        } else {
-            self.run(
-                source,
-                &destination,
-                &[
-                    OsStr::new("worktree"),
-                    OsStr::new("add"),
-                    OsStr::new("--detach"),
-                    OsStr::new("--no-checkout"),
-                    OsStr::new("--"),
-                    destination.as_os_str(),
-                    OsStr::new(&head),
-                ],
-            )
-            .await?;
-        }
-        self.run(
+pub async fn prepare_detached(source: &WorktreeSource, destination: &Path) -> Result<()> {
+    let tool = crate::git_tool::GitTool::system().await?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("worktree needs a parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+    let destination = parent.canonicalize()?.join(
+        destination
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("worktree needs a name"))?,
+    );
+    let head = source.head.to_string();
+    if destination.exists() {
+        Repository::verify_prepared_worktree(&destination, source)?;
+    } else {
+        run(
+            &tool,
             source,
             &destination,
             &[
-                OsStr::new("-C"),
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--detach"),
+                OsStr::new("--no-checkout"),
+                OsStr::new("--"),
                 destination.as_os_str(),
-                OsStr::new("read-tree"),
-                OsStr::new("--reset"),
-                OsStr::new("-u"),
                 OsStr::new(&head),
             ],
         )
         .await?;
-        Ok(())
     }
+    let temporary = tempfile::Builder::new()
+        .prefix("intercat-worker-checkout-")
+        .tempdir()?;
+    let path = std::env::var("PATH")?;
+    let checkout = crate::checkout::Checkout::create(
+        &temporary.path().join("job"),
+        source.clone(),
+        source.head,
+        crate::checkout::Configuration::capture(source)?,
+        path.clone().into(),
+        crate::checkout::toolchain_paths(&path, &source.root)?,
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    checkout
+        .materialize_into(&destination, tokio::sync::watch::channel(false).1)
+        .await?;
+    Ok(())
 }
 
 pub async fn inspect(source: &Path) -> Result<WorktreeSource> {
@@ -187,10 +149,7 @@ pub async fn prepare(
     if state == Admission::Replay("superseded".into()) {
         return Err(std::io::Error::other("Worktree preparation was superseded.").into());
     }
-    GitTool::system()
-        .await?
-        .prepare_detached(source, destination)
-        .await?;
+    prepare_detached(source, destination).await?;
     let root = source.root.clone();
     let reference = track_ref.to_owned();
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -224,14 +183,19 @@ mod boundary_tests {
     #[test]
     fn worktree_profile_cannot_connect_to_the_private_rpc_socket() -> Result<()> {
         let probe = crate::sandbox_probe::Probe::new()?;
-        let tool = GitTool {
+        let tool = crate::git_tool::GitTool {
             binary: probe.program.clone(),
             exec_dir: probe.exec_dir.clone(),
         };
         let source = probe.source();
         probe.check(
             "worktree",
-            &tool.profile(&source, &probe.path("job/repo"), &probe.path("job/tmp"))?,
+            &profile(
+                &tool,
+                &source,
+                &probe.path("job/repo"),
+                &probe.path("job/tmp"),
+            )?,
         )
     }
 }

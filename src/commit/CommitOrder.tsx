@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import type { CommitOrderReview, IntegrationJob } from './types';
 
-export function CommitOrder({ job, review, busy, error, retry, confirm, close, reload }: {
-  job: IntegrationJob; review: CommitOrderReview; busy: boolean; error: string;
+export function CommitOrder({ job, review, busy, error, retry, confirm, close, reload, folderNavigation }: {
+  folderNavigation:ReactNode; job: IntegrationJob; review: CommitOrderReview; busy: boolean; error: string;
   retry: (() => void) | null; confirm: (order: string[]) => void; close: () => void; reload: () => void;
 }) {
   const [order, setOrder] = useState(review.order);
@@ -14,6 +14,7 @@ export function CommitOrder({ job, review, busy, error, retry, confirm, close, r
   return <aside className="commit-sheet commit-order" aria-label="Commit order proposal" data-focus-region tabIndex={-1}
     onKeyDown={event => { if (event.key === 'Escape' && !event.nativeEvent.isComposing) { event.stopPropagation(); close(); } }}>
     <header className="commit-heading"><div><h2>Before commit</h2><p>{job.project.name}</p></div><button aria-label="Hide commit order proposal" onClick={close}>×</button></header>
+    {folderNavigation}
     <div className="commit-order-body">
       <h3>These tracks touch the same files</h3>
       <p>Choose their order before reviewing the commit. Only saved checkpoints are included.</p>

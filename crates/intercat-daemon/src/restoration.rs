@@ -5,7 +5,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     os::fd::AsRawFd,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::Path,
 };
 
@@ -79,27 +82,13 @@ pub fn apply(root: &Path, snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn write_file(root: &Path, name: &str, mode: u16, bytes: &[u8]) -> Result<()> {
+fn replace(root: &Path, name: &str, create: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     parents(root, name)?;
     let target = root.join(name);
     let parent = target.parent().ok_or("Invalid restore path")?;
     let temporary = parent.join(format!(".intercat-restore-{}", uuid::Uuid::now_v7()));
     let result = (|| -> Result<()> {
-        if mode == 0o120000 {
-            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(bytes), &temporary)?;
-        } else {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(bytes)?;
-            file.set_permissions(fs::Permissions::from_mode(if mode == 0o100755 {
-                0o755
-            } else {
-                0o644
-            }))?;
-            sync(&file)?;
-        }
+        create(&temporary)?;
         fs::rename(&temporary, &target)?;
         sync_directory(parent)?;
         Ok(())
@@ -108,4 +97,45 @@ pub(crate) fn write_file(root: &Path, name: &str, mode: u16, bytes: &[u8]) -> Re
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+/// Finish and verify a streamed source before atomically replacing a file.
+/// In particular, an LFS payload does not need to fit in daemon memory.
+pub(crate) fn write_regular(
+    root: &Path,
+    name: &str,
+    mode: u16,
+    write: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<()> {
+    if ![0o100644, 0o100755].contains(&mode) {
+        return Err("Unsupported regular file mode.".into());
+    }
+    replace(root, name, |temporary| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(temporary)?;
+        write(&mut file)?;
+        file.set_permissions(fs::Permissions::from_mode(if mode == 0o100755 {
+            0o755
+        } else {
+            0o644
+        }))?;
+        sync(&file)
+    })
+}
+
+pub(crate) fn write_file(root: &Path, name: &str, mode: u16, bytes: &[u8]) -> Result<()> {
+    if mode == 0o120000 {
+        replace(root, name, |temporary| {
+            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(bytes), temporary)?;
+            Ok(())
+        })
+    } else {
+        write_regular(root, name, mode, |file| {
+            file.write_all(bytes)?;
+            Ok(())
+        })
+    }
 }

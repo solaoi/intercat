@@ -9,8 +9,15 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
+// Each case runs its own SQLite writer, scanner, and local Editor process.
+// Keep independent fixtures within the normal four-worker resource envelope;
+// concurrency and reply ordering inside a case are still exercised unchanged.
+static ACTIVE_FIXTURES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 struct Fixture {
+    _admission: tokio::sync::SemaphorePermit<'static>,
     _root: tempfile::TempDir,
+    _host: crate::test_host::IdleTestHost,
     journal: Journal,
     track: String,
     input: String,
@@ -24,6 +31,7 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Result<Self> {
+        let admission = ACTIVE_FIXTURES.acquire().await?;
         let root = tempfile::tempdir()?;
         let journal =
             Journal::open(root.path().join("db"), crate::secrets::Key::new([7; 32])).await?;
@@ -75,6 +83,7 @@ impl Fixture {
         }
         journal
             .workspace_result(crate::preparation::Workspace {
+                denied_roots: Vec::new(),
                 attachment_roots: vec![],
                 track_id: track.clone(),
                 path: workspace.clone(),
@@ -90,7 +99,7 @@ impl Fixture {
         let (write, incoming) = tokio::io::duplex(65536);
         let mut connection = crate::msp::Connection::new(read, write);
         let (port, commands) = Port::new(Arc::new(crate::dispatch_control::Gate::new(false)));
-        port.attach(connection.client.clone(), "session".into());
+        port.attach(connection.client.clone(), "session".into(), None);
         let mut state = WorkerState {
             track_id: track.clone(),
             phase: "ready".into(),
@@ -113,7 +122,8 @@ impl Fixture {
             editor: editor.clone(),
             capacity: capacity.clone(),
         };
-        let identity = crate::process::identity(std::process::id())?;
+        let idle_host = crate::test_host::IdleTestHost::new()?;
+        let identity = idle_host.identity()?;
         let tracker = Arc::new(Mutex::new(crate::process::Tracker::new(
             "start-outcome-test".into(),
             identity,
@@ -147,7 +157,9 @@ impl Fixture {
             (outcome, continuity)
         });
         Ok(Self {
+            _admission: admission,
             _root: root,
+            _host: idle_host,
             journal,
             track,
             input,
@@ -175,13 +187,20 @@ impl Fixture {
             .start_admitted(
                 Uuid::now_v7(),
                 self.port.stop_generation.load(Ordering::Acquire),
-                true,
+                Some(self.input.clone()),
             )
             .await
     }
     async fn read(&mut self) -> Result<Value> {
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(10), self.incoming.read_line(&mut line)).await??;
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), self.incoming.read_line(&mut line)).await;
+        if result.is_err() {
+            let word = self.journal.read_utterance(self.input.clone()).await?;
+            let snapshot = self.journal.snapshot().await?;
+            return Err(format!("No MSP frame: {}",json!({"wordState":word["state"],"reason":word["reason"],"boundary":word["decision"]["boundary"],"worker":snapshot["workers"][0],"activeSlots":self.capacity.snapshot().active,"editor":self.editor.status(),"taskFinished":self.task.is_finished(),"stopped":self.port.stopped.load(Ordering::Acquire),"boundaryHold":self.port.boundary_hold.load(Ordering::Acquire)})).into());
+        }
+        result??;
         Ok(serde_json::from_str(&line)?)
     }
     async fn send(&mut self, mut value: Value) -> Result<()> {
@@ -224,6 +243,53 @@ impl Fixture {
         self.editor.stop().await;
         Ok(result?)
     }
+}
+
+#[tokio::test]
+async fn a_duplicate_input_start_acknowledges_only_that_input_and_never_a_newer_hold() -> Result<()>
+{
+    let mut f = Fixture::new().await?;
+    f.start().await?;
+    let start = f.read().await?;
+    let generation = f.port.stop_generation.load(Ordering::Acquire);
+    f.port
+        .start_admitted(Uuid::now_v7(), generation, Some(f.input.clone()))
+        .await?;
+    assert!(
+        f.port
+            .start_admitted(Uuid::now_v7(), generation, Some(Uuid::now_v7().to_string()))
+            .await
+            .is_err()
+    );
+    assert!(
+        f.port
+            .start_admitted(Uuid::now_v7(), generation, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(f.capacity.snapshot().active, 1);
+    f.port.hold(Uuid::now_v7())?;
+    assert!(
+        f.port
+            .start_admitted(Uuid::now_v7(), generation, Some(f.input.clone()))
+            .await
+            .is_err()
+    );
+    assert!(f.port.locally_held());
+    let db = rusqlite::Connection::open(f._root.path().join("db"))?;
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM operations WHERE kind='turn.start'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        1
+    );
+    let command = start["params"]["commandId"].as_str().unwrap().parse()?;
+    f.send(json!({"id":start["id"],"error":{"code":-32602,"message":"Own dummy terminal rejection","data":{"kind":"invalidParams","commandId":start["params"]["commandId"]}}})).await?;
+    f.settled(command, "superseded").await?;
+    assert_eq!(f.capacity.snapshot().active, 0);
+    f.close().await
 }
 
 #[tokio::test]
@@ -321,14 +387,21 @@ async fn waiting_requests_on_one_worker_keep_their_original_order() -> Result<()
 async fn ten_rejected_starts_release_slots_and_keep_the_original_request() -> Result<()> {
     let mut f = Fixture::new().await?;
     let original = f.journal.read_utterance(f.input.clone()).await?["text"].clone();
-    for _ in 0..10 {
-        f.start().await?;
-        let request = f.read().await?;
+    for attempt in 1..=10 {
+        f.start()
+            .await
+            .map_err(|error| format!("Rejected start {attempt}: {error}"))?;
+        let request = f
+            .read()
+            .await
+            .map_err(|error| format!("Waiting for rejected start {attempt}: {error}"))?;
         assert_eq!(request["method"], "turn/start");
         assert_eq!(f.capacity.snapshot().active, 1);
         f.send(json!({"id":request["id"],"error":{"code":-32602,"message":"Dummy start was rejected","data":{"kind":"invalidParams","retryable":false,"commandId":request["params"]["commandId"],"reason":"fixture"}}})).await?;
         let command = request["params"]["commandId"].as_str().unwrap().parse()?;
-        f.settled(command, "superseded").await?;
+        f.settled(command, "superseded")
+            .await
+            .map_err(|error| format!("Settling rejected start {attempt}: {error}"))?;
         assert!(f.capacity.snapshot().waiting.is_empty());
         let word = f.journal.read_utterance(f.input.clone()).await?;
         assert_eq!(word["text"], original);
@@ -519,4 +592,45 @@ async fn a_steered_reply_keeps_the_sent_request_but_returns_only_the_extra_slot(
     drop(running);
     assert_eq!(capacity.snapshot().active, 0);
     Ok(())
+}
+
+#[tokio::test]
+async fn a_stop_boundary_waits_for_a_delayed_start_and_its_final_checkpoint() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    f.start().await?;
+    let start = f.read().await?;
+    assert_eq!(start["method"], "turn/start");
+    let port = f.port.clone();
+    let stopped = tokio::spawn(async move { port.stop_and_wait(Uuid::now_v7()).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !stopped.is_finished(),
+        "an unacknowledged start is still inside the Stop boundary"
+    );
+    let mut line = String::new();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), f.incoming.read_line(&mut line))
+            .await
+            .is_err(),
+        "a Stop without a known turn must not send an unscoped interrupt"
+    );
+    let turn = Uuid::now_v7();
+    f.send(json!({"id":start["id"],"result":{"commandId":start["params"]["commandId"],"turnId":turn,"disposition":"started"}})).await?;
+    let interrupt = f.read().await?;
+    assert_eq!(interrupt["method"], "turn/interrupt");
+    assert_eq!(interrupt["params"]["turnId"], turn.to_string());
+    assert!(!stopped.is_finished());
+    f.send(json!({"method":"turn/completed","params":{"sessionId":"session","turnId":turn,"terminal":"cancelled"}})).await?;
+    let saved = tokio::time::timeout(Duration::from_secs(15), stopped).await???;
+    assert_eq!(saved.session_id, "session");
+    assert_eq!(saved.checkpoint.as_ref().unwrap().turn_id, turn);
+    let snapshot = f.journal.snapshot().await?;
+    assert_eq!(
+        snapshot["workers"][0]["checkpoint"]["sha"],
+        saved.checkpoint.unwrap().sha
+    );
+    assert_eq!(snapshot["workers"][0]["checkpointPending"], false);
+    assert!(snapshot["workers"][0]["activeTurn"].is_null());
+    assert_eq!(f.capacity.snapshot().active, 0);
+    f.close().await
 }

@@ -4,8 +4,10 @@ import { groupMarks, markLabel } from './inputMarkLayout';
 import { formatTime, geometry, LABEL_WIDTH, TOP_HEIGHT, type TimelineView } from './model';
 import type { Lane } from './viewport';
 import { dependencyLinks } from './futureLayout';
+import { groupBranchPoints, type BranchPreview } from './branchPointLayout';
 
 interface SceneState {
+  branchPreview: BranchPreview | null;
   rows: Lane[]; visible: Lane[]; width: number; height: number; scroll: number; total: number;
   selected: string; selectedPlanItem: string | null; hovered: string | null; overview: boolean; view: TimelineView; marks: TimelineMark[];
 }
@@ -40,6 +42,7 @@ export class TimelineScene {
   private marks = new Container();
   private layer = new Container();
   private links = new Graphics();
+  private branchPoints = new Graphics();
   private playhead = new Container();
   private shade = new Sprite(Texture.WHITE);
   private head = new Sprite(Texture.WHITE);
@@ -57,7 +60,7 @@ export class TimelineScene {
     app.stage.eventMode = 'none';
     this.shade.alpha = 0.018; this.head.alpha = 0.75;
     this.playhead.addChild(this.shade, this.head);
-    app.stage.addChild(this.grid, this.layer, this.links, this.headings, this.marks, this.playhead, this.overview, this.position);
+    app.stage.addChild(this.grid, this.layer, this.links, this.branchPoints, this.headings, this.marks, this.playhead, this.overview, this.position);
   }
   destroy() {
     this.markTexture?.destroy(true);
@@ -115,7 +118,8 @@ export class TimelineScene {
         const mark = group.marks[0];
         const color = mark.operation === null ? 0x9299a6 : 0xd9a24a;
         const glyph = new Graphics();
-        if (mark.attached) glyph.poly([x - 4, 61, x + 2, 61, x + 5, 64, x + 5, 73, x - 4, 73]).stroke({ color, width: 1.5 });
+        if(mark.commit){glyph.rect(x-5,62,10,10);if(mark.commit.pushed)glyph.fill(0x9cbba9);else glyph.stroke({color:0x9cbba9,width:1.5});}
+        else if (mark.attached) glyph.poly([x - 4, 61, x + 2, 61, x + 5, 64, x + 5, 73, x - 4, 73]).stroke({ color, width: 1.5 });
         else if (mark.operation === 'park') glyph.poly([x, 62, x + 5, 67, x, 72, x - 5, 67]).stroke({ color, width: 1.5 });
         else glyph.poly([x, 62, x + 5, 67, x, 72, x - 5, 67]).fill(color);
         drawing.addChild(glyph);
@@ -167,9 +171,23 @@ export class TimelineScene {
     if (!mask) { mask = new Graphics(); mask.label = 'rows-mask'; this.app.stage.addChild(mask); this.layer.mask = mask; }
     mask.clear().rect(0, TOP_HEIGHT, state.width - 8, Math.max(0, state.height - TOP_HEIGHT)).fill(0xffffff);
     this.links.mask = mask;
+    this.branchPoints.mask = mask;
+    this.branchPoints.y = TOP_HEIGHT - state.scroll;
+    this.branchPoints.clear();
+    const branchRow = state.visible.find(row => !row.repairId && !row.track.ghost && row.track.id === state.branchPreview?.trackId);
+    if (!state.overview && branchRow && state.branchPreview) {
+      const groups = groupBranchPoints(state.branchPreview, state.view, state.width);
+      const selected = groups.find(group => group.selected);
+      if (selected) this.branchPoints.rect(selected.x, branchRow.top, Math.max(0, right - selected.x), branchRow.height).fill({ color: 0x05070a, alpha: 0.42 });
+      for (const group of groups) {
+        const color = group.selected ? 0xe8edf7 : branchRow.track.color;
+        segment(this.branchPoints, group.x, branchRow.top + 19, group.x, branchRow.top + 55, color, group.selected ? 1 : 0.65);
+        this.branchPoints.poly([group.x, branchRow.top + 54, group.x + 4, branchRow.top + 58, group.x, branchRow.top + 62, group.x - 4, branchRow.top + 58]).fill(color);
+      }
+    }
     this.links.y = TOP_HEIGHT - state.scroll;
     this.links.clear();
-    if (!state.overview) for (const link of dependencyLinks(state.rows, state.width, state.view, state.selectedPlanItem)) {
+    if (!state.overview) for (const link of dependencyLinks(state.rows.filter(row=>!row.track.ghost), state.width, state.view, state.selectedPlanItem)) {
       const points = link.points;
       this.links.moveTo(points[0].x, points[0].y);
       for (const point of points.slice(1)) this.links.lineTo(point.x, point.y);
@@ -203,10 +221,11 @@ export class TimelineScene {
     scene.content.removeChildren().forEach(child => child.destroy({ children: true, context: true })); scene.active = [];
     const statics = new Container(), graphics = new Graphics();
     statics.addChild(graphics);
-    const compact = row.repairId !== null;
+    const ghost=!!row.track.ghost&&!row.repairId;
+    const compact = row.repairId !== null||ghost;
     const baseTop = state.overview ? 2 : compact ? 4 : 22;
     const height = state.overview ? 8 : compact ? 18 : 31;
-    if (!state.overview) for (const clip of row.clips) {
+    if (!state.overview&&!ghost) for (const clip of row.clips) {
       for (const at of clip.assumptionTimes ?? []) {
         const x = toX(at), y = baseTop - 9;
         if (x >= LABEL_WIDTH + 5 && x <= right - 5) {
@@ -219,6 +238,12 @@ export class TimelineScene {
       const left = Math.max(LABEL_WIDTH, toX(clip.start)), end = Math.min(right, toX(clip.running ? Math.max(clip.end, state.view.now) : clip.end));
       if (end < LABEL_WIDTH || left >= right) continue;
       const width = Math.max(3, end - left - 2);
+      if(ghost) {
+        for(let x=0;x<width;x+=8){segment(graphics,left+x,top,left+Math.min(x+4,width),top,row.track.color,.65);segment(graphics,left+x,top+height,left+Math.min(x+4,width),top+height,row.track.color,.65);}
+        for(let y=0;y<height;y+=6){segment(graphics,left,top+y,left,top+Math.min(y+3,height),row.track.color,.65);segment(graphics,left+width,top+y,left+width,top+Math.min(y+3,height),row.track.color,.65);}
+        if(!state.overview&&width>25)label(statics,clip.label.slice(0,Math.max(0,Math.floor((width-20)/5.5))),left+6,top+3,row.track.color);
+        continue;
+      }
       if (clip.running) {
         const sprite = new NineSliceSprite({ texture: this.barTexture(clip.kind === 'think'), leftWidth: 1, rightWidth: 1, topHeight: 1, bottomHeight: 1, width, height });
         sprite.tint = row.track.color; sprite.position.set(left, top);
@@ -239,7 +264,7 @@ export class TimelineScene {
       if (clip.effectCount) label(statics, '⇗', left + Math.max(1, width - 13), top - 12, 0xd9a24a, 11);
       if (width > 25) label(statics, clip.label.slice(0, Math.max(0, Math.floor((width - 20) / 5.5))) + (clip.label.length * 5.5 > width - 12 ? '…' : ''), left + 6, top + 3, row.track.color);
     }
-    if (!row.repairId && !state.overview) row.track.planned.slice(0, futureCount).forEach((planned, col) => {
+    if (!row.repairId && !row.track.ghost && !state.overview) row.track.planned.slice(0, futureCount).forEach((planned, col) => {
       const x = right + 8 + col * (tileWidth + 8), color = planned.reviewFix ? 0xb497cf : row.track.color;
       for (let p = 0; p < tileWidth; p += 8) { segment(graphics, x + p, 15, x + Math.min(p + 4, tileWidth), 15, color, 0.6); segment(graphics, x + p, 60, x + Math.min(p + 4, tileWidth), 60, color, 0.6); }
       if (planned.id === state.selectedPlanItem) graphics.roundRect(x, 15, tileWidth, 45, 4).stroke({ color: 0xededef, width: 1.5 });

@@ -45,9 +45,17 @@ async fn shown(journal: &Journal, word: &Value) -> Result<Value> {
 }
 
 #[tokio::test]
-async fn commit_and_settings_wait_for_display_and_keep_the_same_receipt_after_restart() -> Result<()>
-{
-    for name in ["commit", "settings", "stage-mode", "branch-from"] {
+async fn application_commands_wait_for_display_and_keep_the_same_receipt_after_restart()
+-> Result<()> {
+    for name in [
+        "commit",
+        "push",
+        "open-pr",
+        "settings",
+        "stage-mode",
+        "branch-from",
+        "restore",
+    ] {
         let (root, journal) = fixture().await?;
         let word = command(&journal, name).await?;
         assert_eq!(word["state"], "placed");
@@ -60,6 +68,12 @@ async fn commit_and_settings_wait_for_display_and_keep_the_same_receipt_after_re
         }
         assert!(
             journal.snapshot().await?["tracks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            journal.snapshot().await?["pushes"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -208,7 +222,7 @@ async fn classification_save_failure_does_not_publish_a_display_request() -> Res
 
 #[tokio::test]
 async fn held_display_actions_resume_only_by_button_with_their_original_operation() -> Result<()> {
-    for name in ["settings", "branch-from"] {
+    for name in ["settings", "branch-from", "restore"] {
         let (_root, journal) = fixture().await?;
         let word = command(&journal, name).await?;
         let held = journal

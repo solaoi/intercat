@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import type { IntegrationJob } from '../src/commit/types';
+import { binaryReviewRule } from '../src/commit/types';
 import type { RepairRequest, RepairRun } from '../src/commit/repair';
 
 let app: ElectronApplication;
@@ -30,15 +31,44 @@ test.afterEach(async () => {
 
 function fixture(): IntegrationJob {
   const changes = [{ path: 'index.js', before: { object: 'b'.repeat(40), mode: 33188 }, after: { object: 'c'.repeat(40), mode: 33188 } }];
-  return { exclusions: [], assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0, id: '01a1a200-0000-7000-8000-000000000001', revision: 1, status: 'checked', sessionName: 'Commit fixture', slug: 'commit-fixture', project: { id: 'dummy-folder', name: 'Fixture', root: '/fixture', path: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'refs/heads/main' }, error: null,
+  return { pathReview:{families:[],choices:{}},pathState:null,retirements:[],exclusions: [], assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0, id: '01a1a200-0000-7000-8000-000000000001', revision: 1, status: 'checked', sessionName: 'Commit fixture', slug: 'commit-fixture', project: { id: 'dummy-folder', name: 'Fixture', root: '/fixture', path: '/fixture', commonDir: '/fixture/.git', base: 'a'.repeat(40), baseBranch: 'refs/heads/main' }, error: null,
     tracks: [{ id: '01a1a200-0000-7000-8000-000000000002', label: 'A', title: 'Update the exported value', included: true, checkpointCount: 1, lastClip: null, checkpoint: { sha: 'c'.repeat(40) } }],
-    plan: { targetRef: 'refs/heads/intercat/commit-fixture', tree: 'd'.repeat(40), rows: [{ track: '01a1a200-0000-7000-8000-000000000002', state: 'included', changes, conflicts: [] }] }, messages: {}, keptSecrets: [], contributions: {},
-    candidate: { revision: 1, state: 'checked', generation: 1, head: 'e'.repeat(40), tree: 'd'.repeat(40), settingsHash: 'f'.repeat(64), commits: [{ track: '01a1a200-0000-7000-8000-000000000002', sha: 'e'.repeat(40), parent: 'a'.repeat(40), tree: 'd'.repeat(40), author: 'Worker A', message: 'Update the exported value\n\nIntercat: fixture/A@1\n', changes }], blockedCommit: null, secretScans: [], check: { command: 'npm test', code: 0, stdout: 'Check passed\n', stderr: '', truncated: false }, reason: null, failedTrack: null, hooksSkipped: false, dependencyRuns: [] } };
+    plan: { undoConflict:null,targetRef: 'refs/heads/intercat/commit-fixture', tree: 'd'.repeat(40), rows: [{ track: '01a1a200-0000-7000-8000-000000000002', state: 'included', changes, conflicts: [] }] }, messages: {}, keptSecrets: [], contributions: {},
+    candidate: { revision: 1, state: 'checked', buildRevision: 1, workspace: '/private/tmp/intercat-dummy-check', head: 'e'.repeat(40), tree: 'd'.repeat(40), settingsHash: 'f'.repeat(64), commits: [{ track: '01a1a200-0000-7000-8000-000000000002', sha: 'e'.repeat(40), parent: 'a'.repeat(40), tree: 'd'.repeat(40), author: 'Worker A', message: 'Update the exported value\n\nIntercat: fixture/A@1\n', changes }], blockedCommit: null, conflict: null, undo:null,undoConflict:null,secretScans: [], check: { command: 'npm test', code: 0, stdout: 'Check passed\n', stderr: '', truncated: false }, reason: null, failedTrack: null, hooksSkipped: false, repair: null, dependencyRuns: [] } };
 }
+
+for(const zoom of [1,2])for(const owner of ['A','B'])test(`merged check worker choice ${owner} and saved attribution at ${zoom*100}%`,async()=>{
+  const job=fixture(),b='01a1a200-0000-7000-8000-000000000003';
+  job.status='failed';job.candidate!.state='check-failed';job.candidate!.check!.code=1;job.candidate!.check!.stdout='dummy merged API failure';
+  job.tracks.push({id:b,label:'B',title:'Call the changed API',included:true,checkpointCount:1,lastClip:null,checkpoint:{sha:'b'.repeat(40)}});
+  const changes=[{path:'consumer.js',before:null,after:{object:'b'.repeat(40),mode:33188}}];
+  job.plan!.rows.push({track:b,state:'included',changes,conflicts:[]});
+  job.candidate!.commits.push({track:b,sha:'b'.repeat(40),parent:job.candidate!.head,tree:'f'.repeat(40),author:'Worker B',message:'Use the API',changes});
+  job.candidate!.head='b'.repeat(40);job.candidate!.tree='f'.repeat(40);job.plan!.tree='f'.repeat(40);
+  await mock(job);await repairHandlers();
+  await app.evaluate(({BrowserWindow},zoom)=>BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(zoom),zoom);
+  const page=await app.firstWindow();await page.getByRole('button',{name:'Commit',exact:true}).click();
+  const sheet=page.getByRole('complementary',{name:'Commit review',exact:true});
+  const choices=sheet.getByRole('region',{name:'Worker to repair the integration',exact:true});
+  await expect(choices).toContainText('Choose the worker to fix the merged result.');
+  await expect(choices.getByRole('button',{name:'Ask Worker A to fix',exact:true})).toBeEnabled();
+  await expect(choices.getByRole('button',{name:'Ask Worker B to fix',exact:true})).toBeEnabled();
+  expect(await app.evaluate(()=>(globalThis as any).repairCalls)).toHaveLength(0);
+  const choose=choices.getByRole('button',{name:`Ask Worker ${owner} to fix`,exact:true});await choose.scrollIntoViewIfNeeded();await choose.click();
+  const calls=await app.evaluate(()=>(globalThis as any).repairCalls);
+  expect(calls).toHaveLength(1);expect(calls[0].request).toMatchObject({track:owner==='A'?job.tracks[0].id:b,purpose:{kind:'check'}});
+  await app.evaluate((_electron,{b})=>{
+    const state=(globalThis as any).commitState;const run=state.repairRuns[0];run.phase='done';run.revision++;
+    state.integrations![0].status='checked';state.integrations![0].candidate.state='checked';state.integrations![0].candidate.check.code=0;
+    state.integrations![0].candidate.repair={requestedTrack:run.track,appliedTrack:b};state.sequence++;
+  },{b});
+  const notice=sheet.getByRole('status').filter({hasText:'The fix needed B’s changes · added to B’s commit'});
+  if(owner==='A')await expect(notice).toBeVisible();else await expect(notice).toHaveCount(0);
+});
 
 async function mock(job: IntegrationJob, loseKeep = false) {
   await app.evaluate(({ ipcMain, BrowserWindow }, input) => {
-    const state = { connected: true, sequence: 1, workerConfigured: true, project: { id: 'dummy-project', name: input.job.project.name, folders: [input.job.project] }, trackFolders: Object.fromEntries(input.job.tracks.map(track => [track.id,input.job.project.id])), session: { id: 'session', slug: input.job.slug, name: input.job.sessionName, createdAt: 0 }, tracks: input.job.tracks.map(track => ({ ...track, status: 'done' })), workers: [], workspaces: [], utterances: [], editor: { phase: 'ready' }, integration: input.job };
+    const state = { connected: true, sequence: 1, workerConfigured: true, project: { id: 'dummy-project', name: input.job.project.name, folders: [input.job.project] }, trackFolders: Object.fromEntries(input.job.tracks.map(track => [track.id,input.job.project.id])), session: { id: 'session', slug: input.job.slug, name: input.job.sessionName, createdAt: 0 }, tracks: input.job.tracks.map(track => ({ ...track, status: 'done' })), workers: [], workspaces: [], utterances: [], editor: { phase: 'ready' }, integrations: [input.job] };
     const memory = globalThis as typeof globalThis & { commitCalls: unknown[]; commitState: typeof state; commitClips: unknown[] };
     memory.commitCalls = []; memory.commitState = state; memory.commitClips = [];
     ipcMain.removeHandler('intercat:timeline-window');
@@ -50,19 +80,19 @@ async function mock(job: IntegrationJob, loseKeep = false) {
     ipcMain.removeHandler('intercat:integration-command'); ipcMain.handle('intercat:integration-command', (_event, request) => {
       memory.commitCalls.push(request);
       if (replies.has(request.opId)) return replies.get(request.opId);
-      if (request.action.action === 'refresh') state.integration.contributions = {};
-      if (request.action.action === 'editMessage') { state.integration.messages[request.action.track] = request.action.message; state.integration.revision++; state.integration.candidate!.head = '1'.repeat(40); }
-      if (request.action.action === 'keepSecret') { state.integration.keptSecrets.push(request.action.finding); state.integration.revision++; state.integration.status = 'checked'; state.integration.candidate!.state = 'checked'; state.integration.candidate!.blockedCommit = null; }
-      if (request.action.action === 'retryAssumptions') { state.integration.assumptionsFailed = 0; state.integration.assumptionsPending = 1; state.integration.revision++; }
+      if (request.action.action === 'refresh') state.integrations![0].contributions = {};
+      if (request.action.action === 'editMessage') { state.integrations![0].messages[request.action.track] = request.action.message; state.integrations![0].revision++; state.integrations![0].candidate!.head = '1'.repeat(40); }
+      if (request.action.action === 'keepSecret') { state.integrations![0].keptSecrets.push(request.action.finding); state.integrations![0].revision++; state.integrations![0].status = 'checked'; state.integrations![0].candidate!.state = 'checked'; state.integrations![0].candidate!.blockedCommit = null; }
+      if (request.action.action === 'retryAssumptions') { state.integrations![0].assumptionsFailed = 0; state.integrations![0].assumptionsPending = 1; state.integrations![0].revision++; }
       if (request.action.action === 'keepAssumption') {
-        const assumption = state.integration.assumptions.find(value => value.id === request.action.assumption)!;
-        assumption.state = 'kept'; assumption.revision++; state.integration.revision++;
+        const assumption = state.integrations![0].assumptions.find(value => value.id === request.action.assumption)!;
+        assumption.state = 'kept'; assumption.revision++; state.integrations![0].revision++;
       }
-      if (request.action.action === 'commit') state.integration.status = 'done';
+      if (request.action.action === 'commit') state.integrations![0].status = 'done';
       state.sequence++;
-      replies.set(request.opId, structuredClone(state.integration));
+      replies.set(request.opId, structuredClone(state.integrations![0]));
       if (request.action.action === 'keepSecret' && input.loseKeep) throw new Error('Response lost after saving');
-      return state.integration;
+      return state.integrations![0];
     });
     BrowserWindow.getAllWindows()[0].setSize(1040, 760);
   }, { job, loseKeep });
@@ -70,16 +100,16 @@ async function mock(job: IntegrationJob, loseKeep = false) {
 
 async function repairHandlers(loseStart = false, loseFollowup = false, loseRefresh = false) {
   await app.evaluate(({ ipcMain }, losses) => {
-    const memory = globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number; repairRuns: RepairRun[]; workers: unknown[] }; repairCalls: { method: string; request: Record<string, unknown> }[] };
+    const memory = globalThis as typeof globalThis & { commitState: { integrations: IntegrationJob[]; sequence: number; repairRuns: RepairRun[]; workers: unknown[] }; repairCalls: { method: string; request: Record<string, unknown> }[] };
     const state = memory.commitState;
     state.repairRuns = []; memory.repairCalls = [];
     const replies = new Map<string, RepairRun>();
     ipcMain.removeHandler('intercat:repair-start'); ipcMain.handle('intercat:repair-start', (_event, request) => {
       memory.repairCalls.push({ method: 'start', request });
       if (replies.has(request.opId)) return { status: 'accepted', run: replies.get(request.opId) };
-      if (request.revision !== state.integration.revision) return { status: 'rejected', reason: 'The candidate changed. Review it again.' };
-      state.integration.revision++;
-      const run: RepairRun = { id: '01a1a200-0000-5000-8000-000000000099', revision: 1, jobId: request.jobId, jobRevision: state.integration.revision, track: request.track, purpose: request.purpose, phase: 'running', approvals: [], prompts: [], output: null, failure: null, session: 'repair-session', turn: '01a1a200-0000-7000-8000-000000000077', secretInput: null, refresh: null, restoring: null };
+      if (request.revision !== state.integrations![0].revision) return { status: 'rejected', reason: 'The candidate changed. Review it again.' };
+      state.integrations![0].revision++;
+      const run: RepairRun = { id: '01a1a200-0000-5000-8000-000000000099', revision: 1, owner:{kind:'commit',id:request.owner.id,revision:state.integrations![0].revision}, track: request.track, purpose: request.purpose, phase: 'running', approvals: [], prompts: [], output: null, failure: null, session: 'repair-session', turn: '01a1a200-0000-7000-8000-000000000077', secretInput: null, refresh: null, remaining: null, restoring: null };
       state.repairRuns = [run]; state.sequence++;
       replies.set(request.opId, structuredClone(run));
       if (losses.loseStart) throw new Error('Repair response lost after saving');
@@ -108,10 +138,10 @@ async function repairHandlers(loseStart = false, loseFollowup = false, loseRefre
       memory.repairCalls.push({ method: 'refresh', request });
       if (replies.has(request.opId)) return { status: 'accepted', run: replies.get(request.opId) };
       const run = state.repairRuns[0];
-      if (request.jobId !== state.integration.id || request.revision !== state.integration.revision || request.repairId !== run.id) return { status: 'rejected', reason: 'The review changed. Confirm Refresh again.' };
+      if (request.jobId !== state.integrations![0].id || request.revision !== state.integrations![0].revision || request.repairId !== run.id) return { status: 'rejected', reason: 'The review changed. Confirm Refresh again.' };
       run.refresh = { operation: request.opId, error: null }; run.phase = 'stopping'; state.sequence++;
       replies.set(request.opId, structuredClone(run));
-      setTimeout(() => { run.phase = 'discarded'; run.refresh = null; state.integration.revision++; state.integration.contributions = {}; state.integration.status = 'checked'; state.integration.candidate!.head = '2'.repeat(40); state.integration.candidate!.tree = '3'.repeat(40); state.sequence++; }, 100);
+      setTimeout(() => { run.phase = 'discarded'; run.refresh = null; state.integrations![0].revision++; state.integrations![0].contributions = {}; state.integrations![0].status = 'checked'; state.integrations![0].candidate!.head = '2'.repeat(40); state.integrations![0].candidate!.tree = '3'.repeat(40); state.sequence++; }, 100);
       if (losses.loseRefresh) throw new Error('Refresh response lost after saving');
       return { status: 'accepted', run: structuredClone(run) };
     });
@@ -179,6 +209,65 @@ for (const mode of ['feedback', 'restart'] as const) for (const zoom of [1, 2]) 
   });
 }
 
+for (const zoom of [1, 2]) test(`instruction file changes are called out before commit at ${zoom * 100}%`, async () => {
+  const job = fixture();
+  const changes = job.candidate!.commits[0].changes;
+  changes.push({ path: 'AGENTS.md', before: { object: 'a'.repeat(40), mode: 33188 }, after: null });
+  changes.push({ path: 'nested/.claude/CLAUDE.md', before: null, after: { object: 'b'.repeat(40), mode: 33188 } });
+  await mock(job);
+  await app.evaluate(({ BrowserWindow }, zoom) => BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(zoom), zoom);
+  const page = await app.firstWindow();
+  await page.getByRole('button', { name: 'Commit', exact: true }).click();
+  const notice = page.getByText('includes instruction files · AGENTS.md · nested/.claude/CLAUDE.md', { exact: true });
+  await expect(notice).toBeVisible();
+  await notice.scrollIntoViewIfNeeded();
+  expect(await notice.evaluate(element => { const rect = element.getBoundingClientRect(); return element.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)); })).toBe(true);
+});
+
+for (const zoom of [1, 2]) test(`LFS binary scan limit is visible before commit at ${zoom * 100}%`, async () => {
+  const job = fixture();
+  job.candidate!.secretScans = [{ findings: [], unscannedLfs: ['assets/dummy-image.lfs'] }];
+  await mock(job);
+  await app.evaluate(({ BrowserWindow }, zoom) => BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(zoom), zoom);
+  const page = await app.firstWindow();
+  await page.getByRole('button', { name: 'Commit', exact: true }).click();
+  const notice = page.getByRole('status').filter({ hasText: 'LFS binary not scanned · assets/dummy-image.lfs' });
+  await expect(notice).toBeVisible();
+  await notice.scrollIntoViewIfNeeded();
+  expect(await notice.evaluate(element => { const rect = element.getBoundingClientRect(); return element.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)); })).toBe(true);
+});
+
+for (const zoom of [1, 2]) test(`ordinary binary coverage needs explicit review at ${zoom * 100}%`, async () => {
+  const job = fixture();
+  job.status = 'failed';
+  const candidate = job.candidate!;
+  candidate.state = 'secret-found';
+  candidate.check = null;
+  candidate.secretScans = [{
+    findings: [{ id: 'dummy-binary-review', path: 'assets/fixture.bin', line: 1, endLine: 1, rule: binaryReviewRule }],
+    unscannedLfs: [],
+  }];
+  await mock(job);
+  await app.evaluate(({ BrowserWindow }, zoom) => BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(zoom), zoom);
+  const page = await app.firstWindow();
+  await page.getByRole('button', { name: 'Commit', exact: true }).click();
+  const sheet = page.getByRole('complementary', { name: 'Commit review' });
+  const review = sheet.getByRole('region', { name: 'Binary files need review' });
+  await expect(review).toContainText('assets/fixture.bin');
+  await expect(sheet.getByLabel('Secret findings')).toHaveCount(0);
+  await expect(sheet.getByRole('button', { name: 'Commit', exact: true })).toBeDisabled();
+  const keep = review.getByRole('button', { name: 'Keep binary file' });
+  await keep.focus();
+  await expect(keep).toBeFocused();
+  await keep.press('Enter');
+  await expect(sheet).toContainText('1 binary file kept after review.');
+  await expect(review).toHaveCount(0);
+  const calls = await app.evaluate(() => (globalThis as typeof globalThis & { commitCalls: { action: unknown }[] }).commitCalls);
+  expect(calls.filter(call => (call.action as { action: string }).action === 'keepSecret')).toEqual([
+    expect.objectContaining({ action: { action: 'keepSecret', id: job.id, revision: job.revision, finding: 'dummy-binary-review' } }),
+  ]);
+});
+
 test('selected checked diff starts an isolated repair and replays a lost acknowledgement', async () => {
   const job = fixture(); await mock(job); await repairHandlers(true);
   const page = await app.firstWindow(); await page.getByRole('button', { name: 'Commit', exact: true }).click();
@@ -202,9 +291,9 @@ test('changed commit keeps the draft and reanchors its selected content before r
   await page.getByRole('button', { name: 'Commit', exact: true }).click(); await selectDiffLine(page);
   await page.getByRole('textbox', { name: 'Request draft' }).fill('Return three here.');
   await app.evaluate(({ ipcMain }) => {
-    const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number } }).commitState;
-    state.integration.revision++; state.integration.candidate!.tree = 'e'.repeat(40);
-    state.integration.candidate!.commits[0].changes[0].after!.object = 'f'.repeat(40); state.sequence++;
+    const state = (globalThis as typeof globalThis & { commitState: { integrations: IntegrationJob[]; sequence: number } }).commitState;
+    state.integrations![0].revision++; state.integrations![0].candidate!.tree = 'e'.repeat(40);
+    state.integrations![0].candidate!.commits[0].changes[0].after!.object = 'f'.repeat(40); state.sequence++;
     ipcMain.removeHandler('intercat:integration-diff'); ipcMain.handle('intercat:integration-diff', () => ({ path: 'index.js', before: 'exports.value = 1;\n', after: '// moved\nexports.value = 2;\n', redacted: false, binary: false, tooLarge: false }));
   });
   await expect(page.getByLabel('Commit context')).toContainText('the commit changed');
@@ -212,7 +301,7 @@ test('changed commit keeps the draft and reanchors its selected content before r
   await page.getByRole('button', { name: 'Resend on the new version' }).click();
   await expect(page.getByRole('textbox', { name: 'Request draft' })).toHaveValue('');
   const request = await app.evaluate(() => (globalThis as typeof globalThis & { repairCalls: { request: RepairRequest }[] }).repairCalls[0].request);
-  expect(request.revision).toBe(2); expect(request.purpose).toMatchObject({ kind: 'edit', selection: { tree: 'e'.repeat(40), object: 'f'.repeat(40), startLine: 2, endLine: 2 } });
+  expect(request.owner.revision).toBe(2); expect(request.purpose).toMatchObject({ kind: 'edit', selection: { tree: 'e'.repeat(40), object: 'f'.repeat(40), startLine: 2, endLine: 2 } });
 });
 
 test('ambiguous selected lines require a new selection and never start a repair', async () => {
@@ -220,8 +309,8 @@ test('ambiguous selected lines require a new selection and never start a repair'
   await page.getByRole('button', { name: 'Commit', exact: true }).click(); await selectDiffLine(page);
   await page.getByRole('textbox', { name: 'Request draft' }).fill('Change this value.');
   await app.evaluate(({ ipcMain }) => {
-    const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number } }).commitState;
-    state.integration.revision++; state.sequence++;
+    const state = (globalThis as typeof globalThis & { commitState: { integrations: IntegrationJob[]; sequence: number } }).commitState;
+    state.integrations![0].revision++; state.sequence++;
     ipcMain.removeHandler('intercat:integration-diff'); ipcMain.handle('intercat:integration-diff', () => ({ path: 'index.js', before: '', after: 'exports.value = 2;\nexports.value = 2;\n', redacted: false, binary: false, tooLarge: false }));
   });
   await expect(page.getByLabel('Commit context')).toContainText('the commit changed');
@@ -287,8 +376,8 @@ test('a completed commit offers sending the retained draft as ordinary work', as
   await page.getByRole('button', { name: 'Commit', exact: true }).click(); await selectDiffLine(page);
   await page.getByRole('textbox', { name: 'Request draft' }).fill('Change this in the next task.');
   await app.evaluate(({ ipcMain }) => {
-    const memory = globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number }; stagedRequest: unknown };
-    memory.commitState.integration.status = 'done'; memory.commitState.sequence++;
+    const memory = globalThis as typeof globalThis & { commitState: { integrations: IntegrationJob[]; sequence: number }; stagedRequest: unknown };
+    memory.commitState.integrations![0].status = 'done'; memory.commitState.sequence++;
     ipcMain.removeHandler('intercat:stage'); ipcMain.handle('intercat:stage', (_event, request) => { memory.stagedRequest = request; return { id: 'saved-request', text: request.text, attachments: [], createdAt: Date.now(), state: 'staged', revision: 1, target: request.target, decision: null, reason: null }; });
   });
   await expect(page.getByLabel('Commit context')).toContainText('the commit is gone');
@@ -302,7 +391,7 @@ test('Japanese selected-line context and its changed-version choices fit at 200 
   await mock(fixture()); await repairHandlers(); const page = await app.firstWindow();
   await page.getByRole('button', { name: 'Commit', exact: true }).click(); await selectDiffLine(page);
   await page.getByRole('textbox', { name: 'Request draft' }).fill('この行の戻り値を三にしてください。既存の他の修正は残してください。');
-  await app.evaluate(({ BrowserWindow }) => { const window = BrowserWindow.getAllWindows()[0]; window.setSize(1040, 760); window.webContents.setZoomFactor(2); const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number } }).commitState; state.integration.revision++; state.sequence++; });
+  await app.evaluate(({ BrowserWindow }) => { const window = BrowserWindow.getAllWindows()[0]; window.setSize(1040, 760); window.webContents.setZoomFactor(2); const state = (globalThis as typeof globalThis & { commitState: { integrations: IntegrationJob[]; sequence: number } }).commitState; state.integrations![0].revision++; state.sequence++; });
   await page.getByRole('button', { name: 'Hide commit review' }).click();
   const context = page.getByLabel('Commit context'); await expect(context).toContainText('the commit changed');
   const viewport = await page.evaluate(() => ({ height: innerHeight, width: innerWidth }));
@@ -323,8 +412,8 @@ test('repair clips use a 26 pixel child row and the selected row owns the Stop s
   const sheet = page.getByRole('complementary', { name: 'Commit review' });
   await sheet.getByRole('tab', { name: 'Check', exact: true }).click(); await sheet.getByRole('button', { name: 'Ask Worker A to fix' }).click();
   await app.evaluate(() => {
-    const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; repairRuns: RepairRun[]; sequence: number; [key: string]: unknown } }).commitState;
-    const now = Date.now(), track = state.integration.tracks[0].id;
+    const state = (globalThis as typeof globalThis & { commitState: { integrations: IntegrationJob[]; repairRuns: RepairRun[]; sequence: number; [key: string]: unknown } }).commitState;
+    const now = Date.now(), track = state.integrations![0].tracks[0].id;
     state.timeline = { summaries: [], clock: { epochMs: now, monoMs: 0, bootId: 'layout', timelineMs: now } };
     (globalThis as typeof globalThis & { commitClips: unknown[] }).commitClips = [
       { id: 'work-step', trackId: track, repairRunId: null, ordinal: 1, sessionId: 'work', turnId: 'work-turn', category: 'step', label: 'ordinary work', kind: 'edit', start: now - 240000, end: now - 120000, running: false, generationEnd: null, approximate: false, toolTicks: [] },
@@ -453,7 +542,7 @@ test('stale Refresh confirmation leaves the running repair alone', async () => {
   const sheet = page.getByRole('complementary', { name: 'Commit review' });
   await sheet.getByRole('tab', { name: 'Check', exact: true }).click(); await sheet.getByRole('button', { name: 'Ask Worker A to fix' }).click();
   await sheet.getByRole('button', { name: 'Refresh', exact: true }).click();
-  await app.evaluate(() => { const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number } }).commitState; state.integration.revision++; state.sequence++; });
+  await app.evaluate(() => { const state = (globalThis as typeof globalThis & { commitState: { integrations: IntegrationJob[]; sequence: number } }).commitState; state.integrations![0].revision++; state.sequence++; });
   await sheet.getByRole('button', { name: 'Refresh now' }).click();
   await expect(sheet).toContainText('The review changed. Confirm Refresh again.');
   await expect(sheet.getByRole('region', { name: 'A · for the commit', exact: true })).toContainText('Repairing');
@@ -466,9 +555,9 @@ test('Refresh confirms dropping completed fixes and hides their old report', asy
   const sheet = page.getByRole('complementary', { name: 'Commit review' });
   await sheet.getByRole('tab', { name: 'Check', exact: true }).click(); await sheet.getByRole('button', { name: 'Ask Worker A to fix' }).click();
   await app.evaluate(() => {
-    const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; repairRuns: RepairRun[]; sequence: number } }).commitState;
+    const state = (globalThis as typeof globalThis & { commitState: { integrations: IntegrationJob[]; repairRuns: RepairRun[]; sequence: number } }).commitState;
     state.repairRuns[0].phase = 'done'; state.repairRuns[0].output = 'The candidate was repaired.';
-    state.integration.status = 'checked'; state.integration.contributions = { fixed: {} }; state.sequence++;
+    state.integrations![0].status = 'checked'; state.integrations![0].contributions = { fixed: {} }; state.sequence++;
   });
   await expect(sheet).toContainText('The candidate was repaired.');
   await sheet.getByRole('button', { name: 'Refresh', exact: true }).click();
@@ -531,7 +620,7 @@ test('repair approvals and questions keep their own target at 200 percent', asyn
 
 test('Remove starts a repair for the specific secret finding', async () => {
   const job = fixture(); job.status = 'failed'; job.candidate!.state = 'secret-found'; job.candidate!.blockedCommit = job.candidate!.commits[0];
-  job.candidate!.secretScans = [{ findings: [{ id: 'finding-to-remove', path: 'index.js', line: 1, endLine: 1, rule: 'github-pat' }] }];
+  job.candidate!.secretScans = [{ unscannedLfs: [], findings: [{ id: 'finding-to-remove', path: 'index.js', line: 1, endLine: 1, rule: 'github-pat' }] }];
   await mock(job); await repairHandlers();
   const page = await app.firstWindow(); await page.getByRole('button', { name: 'Commit', exact: true }).click();
   const sheet = page.getByRole('complementary', { name: 'Commit review' });
@@ -615,15 +704,15 @@ test('both windows keep Refresh disabled until a pending Commit finishes', async
     await expect(sheet.getByRole('button',{name:'Refresh',exact:true})).toBeDisabled();
   }
   await app.evaluate(()=>{
-    const state=(globalThis as typeof globalThis & {commitState:{sequence:number;integration:IntegrationJob}}).commitState;
-    state.integration.status='done';state.sequence++;
+    const state=(globalThis as typeof globalThis & {commitState:{sequence:number;integrations: IntegrationJob[]}}).commitState;
+    state.integrations![0].status='done';state.sequence++;
   });
   for(const page of [first,second]) await expect(page.getByRole('complementary',{name:'Commit review'})).toContainText('Committed ·');
 });
 
 test('a lost Keep response retries the same operation and never enables Commit prematurely', async () => {
   const job = fixture(); job.status = 'failed'; job.candidate!.state = 'secret-found'; job.candidate!.blockedCommit = job.candidate!.commits[0];
-  job.candidate!.secretScans = [{ findings: [{ id: 'finding-one', path: 'index.js', line: 1, endLine: 1, rule: 'github-pat' }] }];
+  job.candidate!.secretScans = [{ unscannedLfs: [], findings: [{ id: 'finding-one', path: 'index.js', line: 1, endLine: 1, rule: 'github-pat' }] }];
   await mock(job, true);
   const page = await app.firstWindow(); await page.getByRole('button', { name: 'Commit', exact: true }).click();
   const sheet = page.getByRole('complementary', { name: 'Commit review' });
@@ -636,9 +725,9 @@ test('a lost Keep response retries the same operation and never enables Commit p
   const keep = calls.filter(call => call.action.action === 'keepSecret');
   expect(keep).toHaveLength(2); expect(keep[0].opId).toBe(keep[1].opId);
   await app.evaluate(() => {
-    const state = (globalThis as typeof globalThis & { commitState: { sequence: number; integration: IntegrationJob; effects: unknown[] } }).commitState;
-    state.integration.tracks[0].included = false; state.sequence++;
-    state.effects = [{ id: 'effect', trackId: state.integration.tracks[0].id, sessionId: 's', itemId: 'i', turnId: 't', clipId: null, kind: 'push', target: 'example.invalid', ruleId: 'push', outcome: 'done', running: false, at: 1, reason: null }];
+    const state = (globalThis as typeof globalThis & { commitState: { sequence: number; integrations: IntegrationJob[]; effects: unknown[] } }).commitState;
+    state.integrations![0].tracks[0].included = false; state.sequence++;
+    state.effects = [{ id: 'effect', trackId: state.integrations![0].tracks[0].id, sessionId: 's', itemId: 'i', turnId: 't', clipId: null, kind: 'push', target: 'example.invalid', ruleId: 'push', outcome: 'done', running: false, at: 1, reason: null }];
   });
   await expect(sheet.getByRole('button', { name: 'Commit', exact: true })).toBeDisabled();
   await sheet.locator('.commit-effects > summary').click();
@@ -655,7 +744,7 @@ test('Commit review stays usable at 200 percent and preserves a stale message dr
   await sheet.getByRole('tab', { name: 'Message', exact: true }).click();
   const message = sheet.getByRole('textbox', { name: 'Message for Worker A' });
   await message.fill('Preserve my local draft.');
-  await app.evaluate(() => { const value = (globalThis as typeof globalThis & { commitState: { sequence: number; integration: IntegrationJob } }).commitState; value.sequence++; value.integration.revision++; });
+  await app.evaluate(() => { const value = (globalThis as typeof globalThis & { commitState: { sequence: number; integrations: IntegrationJob[] } }).commitState; value.sequence++; value.integrations![0].revision++; });
   await expect(sheet).toContainText('Your draft has been kept.');
   await expect(message).toHaveValue('Preserve my local draft.');
   await expect(sheet.getByRole('button', { name: 'Save message and check' })).toBeDisabled();
@@ -775,10 +864,10 @@ test('real repair approval reply declines the push and carries its instruction t
   await card.getByRole('button', { name: before.approvals[0].replyMode === 'feedback' ? 'Decline and reply' : 'Stop and send', exact: true }).click();
   await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).repairRuns?.[0]?.phase, { timeout: 150000 }).toBe('done');
   const after = await page.evaluate(() => window.intercat.getStatus());
-  expect(after.integration!.status).toBe('checked');
+  expect(after.integrations![0]!.status).toBe('checked');
   expect(after.repairRuns![0].id).toBe(before.id);
   expect(after.repairRuns![0].session).toBe(before.session);
-  expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'show', `${after.integration!.candidate!.head}:index.js`], { encoding: 'utf8' })).toBe('exports.value = 3;\n');
+  expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'show', `${after.integrations![0]!.candidate!.head}:index.js`], { encoding: 'utf8' })).toBe('exports.value = 3;\n');
   expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'show', 'HEAD:index.js'], { encoding: 'utf8' })).toBe('exports.value = 1;\n');
   expect(execFileSync('/usr/bin/git', ['-C', remote, 'for-each-ref', '--format=%(refname)'], { encoding: 'utf8' }).trim()).toBe('');
   await writeFile(path.join(output, 'result.json'), JSON.stringify({ before, after, mode: before.approvals[0].replyMode, sourceUnchanged: true, remoteUnchanged: true }, null, 2));
@@ -806,8 +895,8 @@ test('desktop sends selected checked lines to a real isolated repair', async () 
   await expect(sheet.getByRole('region', { name: 'A · for the commit', exact: true })).toBeVisible();
   await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).repairRuns?.[0]?.phase, { timeout: 120000 }).toBe('done');
   const final = await page.evaluate(() => window.intercat.getStatus());
-  expect(final.integration!.status).toBe('checked');
-  expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'show', `${final.integration!.candidate!.head}:index.js`], { encoding: 'utf8' })).toBe('exports.value = 3;\n');
+  expect(final.integrations![0]!.status).toBe('checked');
+  expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'show', `${final.integrations![0]!.candidate!.head}:index.js`], { encoding: 'utf8' })).toBe('exports.value = 3;\n');
   expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'show', 'HEAD:index.js'], { encoding: 'utf8' })).toBe('exports.value = 1;\n');
   expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'for-each-ref', '--format=%(refname)', 'refs/heads/intercat/'], { encoding: 'utf8' }).trim()).toBe('');
   await page.screenshot({ path: path.join(output, 'completed.png') });
@@ -832,7 +921,7 @@ test('desktop restores a deletion to its real held repair and keeps ordinary wor
   await page.getByRole('button', { name: /Send to repair/ }).click();
   await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).repairRuns?.[0]?.phase, { timeout: 120000 }).toBe('held');
   const state = await page.evaluate(() => window.intercat.getStatus()); const run = state.repairRuns![0];
-  const workspace = path.join(seeded.data, 'integration', run.jobId, `repair-${run.id}`, 'repo');
+  const workspace = path.join(seeded.data, 'integration', run.owner.id, `repair-${run.id}`, 'repo');
   await expect(readFile(path.join(workspace, 'fleeting.txt'))).rejects.toThrow();
   const details = await page.evaluate(async clips => Promise.all(clips.map(clip => window.intercat.getClipDetail(clip.id))), (await timelineClips(page)).filter(clip => clip.repairRunId === run.id));
   const detail = details.find(detail => detail.deletionSnapshots?.some(snapshot => snapshot.repairRunId === run.id && snapshot.paths.includes('fleeting.txt')))!;
@@ -913,14 +1002,14 @@ test('desktop repairs a real failing Check and preserves the fix when editing it
     await sheet.getByRole('button', { name: 'Ask Worker A to fix' }).click();
     await expect(sheet.getByRole('region', { name: 'A · for the commit', exact: true })).toBeVisible();
     await expect(sheet).toContainText('Checked and ready', { timeout: 120000 });
-    const repaired = (await page.evaluate(async () => window.intercat.getStatus())).integration!;
+    const repaired = (await page.evaluate(async () => window.intercat.getStatus())).integrations![0]!;
     const fixedTree = repaired.candidate!.tree;
     await page.screenshot({ path: path.join(output, 'repaired.png') });
     await sheet.getByRole('tab', { name: 'Message', exact: true }).click();
     await sheet.getByRole('textbox', { name: 'Message for Worker A' }).fill('Preserve the syntax repair');
     await sheet.getByRole('button', { name: 'Save message and check' }).click();
     await expect(sheet).toContainText('Checked and ready', { timeout: 30000 });
-    const changed = (await page.evaluate(async () => window.intercat.getStatus())).integration!;
+    const changed = (await page.evaluate(async () => window.intercat.getStatus())).integrations![0]!;
     expect(changed.candidate!.tree).toBe(fixedTree);
     expect(changed.candidate!.head).not.toBe(repaired.candidate!.head);
     expect(execFileSync('/usr/bin/git', ['-C', seeded.source, 'show', 'HEAD:index.js'], { encoding: 'utf8' })).toBe('exports.value = 1;\n');
@@ -942,11 +1031,11 @@ test('desktop commits real saved work through the authenticated daemon', async (
   const sheet = page.getByRole('complementary', { name: 'Commit review' });
   await expect(sheet).toContainText('Checked and ready', { timeout: 30000 });
   await expect(sheet.getByRole('region', { name: 'Diff for index.js' })).toBeVisible();
-  const beforeClose = await page.evaluate(async () => (await window.intercat.getStatus()).integration);
+  const beforeClose = await page.evaluate(async () => (await window.intercat.getStatus()).integrations![0]);
   await sheet.getByRole('button', { name: 'Hide commit review' }).click();
   await page.getByRole('button', { name: 'Commit', exact: true }).click();
   await expect(sheet).toContainText('Checked and ready', { timeout: 30000 });
-  const afterReopen = await page.evaluate(async () => (await window.intercat.getStatus()).integration);
+  const afterReopen = await page.evaluate(async () => (await window.intercat.getStatus()).integrations![0]);
   expect(afterReopen?.id).toBe(beforeClose?.id);
   expect(afterReopen?.candidate?.head).toBe(beforeClose?.candidate?.head);
   await page.screenshot({ path: 'research/verify/commit-ui-20261104/real-review.png' });
@@ -979,9 +1068,9 @@ test('desktop commits an unborn project while main stays empty and Open PR expla
   await expect.poll(async () => {
     const state = await page.evaluate(async () => window.intercat.getStatus());
     await writeFile(path.join(output, 'latest-state.json'), JSON.stringify(state, null, 2));
-    return state.integration?.status;
+    return state.integrations![0]?.status;
   }, { timeout: 30000 }).toBe('checked');
-  const reviewed = (await page.evaluate(async () => window.intercat.getStatus())).integration!;
+  const reviewed = (await page.evaluate(async () => window.intercat.getStatus())).integrations![0]!;
   expect(reviewed.project.baseBranch).toBeNull();
   expect(reviewed.candidate!.check!.code).toBe(0);
   await sheet.getByRole('button', { name: 'Commit', exact: true }).click();
@@ -1011,7 +1100,7 @@ test('desktop commits an unborn project while main stays empty and Open PR expla
   expect(git(['rev-list', '--count', branch])).toBe('3');
   expect(git(['show', `${branch}:index.js`])).toBe('exports.value = 2;');
   expect(git(['show', `${branch}:README.md`])).toContain('now 2');
-  const completed = (await page.evaluate(async () => window.intercat.getStatus())).integration!;
+  const completed = (await page.evaluate(async () => window.intercat.getStatus())).integrations![0]!;
   await writeFile(path.join(output, 'integration.json'), JSON.stringify({ reviewed, completed, head, branch, paidTurns: 0, mainEmpty: true, sourceUnchanged: true, indexAbsent: true, openPRDisabled: true }, null, 2));
   git(['bundle', 'create', path.join(output, 'source.bundle'), branch, `refs/intercat/starting-points/${base}`]);
   evidenceDatabase = { source: path.join(seeded.data, 'events.sqlite'), target: path.join(output, 'events.sqlite') };
@@ -1136,22 +1225,22 @@ test('Commit assumption Change starts an isolated repair and stale assumptions s
   await page.getByRole('button', { name: 'Commit', exact: true }).click();
   const sheet = page.getByRole('complementary', { name: 'Commit review' });
   await app.evaluate(() => {
-    const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number } }).commitState;
-    state.integration.assumptionsFailed = 1; state.sequence++;
+    const state = (globalThis as typeof globalThis & { commitState: { integrations: IntegrationJob[]; sequence: number } }).commitState;
+    state.integrations![0].assumptionsFailed = 1; state.sequence++;
   });
   await sheet.getByRole('button', { name: 'Retry reading', exact: true }).click();
   await expect(sheet).toContainText('Waiting for assumption reading');
   await expect(sheet.getByRole('button', { name: 'Commit · keeps 1 assumption', exact: true })).toBeDisabled();
   await app.evaluate(() => {
-    const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number } }).commitState;
-    state.integration.assumptionsPending = 0;
-    state.integration.assumptionsChanged = true; state.sequence++;
+    const state = (globalThis as typeof globalThis & { commitState: { integrations: IntegrationJob[]; sequence: number } }).commitState;
+    state.integrations![0].assumptionsPending = 0;
+    state.integrations![0].assumptionsChanged = true; state.sequence++;
   });
   await expect(sheet).toContainText('Assumptions changed · Refresh to review them.');
   await expect(sheet.getByRole('button', { name: 'Commit · keeps 1 assumption', exact: true })).toBeDisabled();
   await app.evaluate(() => {
-    const state = (globalThis as typeof globalThis & { commitState: { integration: IntegrationJob; sequence: number } }).commitState;
-    state.integration.assumptionsChanged = false; state.sequence++;
+    const state = (globalThis as typeof globalThis & { commitState: { integrations: IntegrationJob[]; sequence: number } }).commitState;
+    state.integrations![0].assumptionsChanged = false; state.sequence++;
   });
   await sheet.getByRole('button', { name: 'Change', exact: true }).click();
   await sheet.getByRole('textbox', { name: 'Change Worker A assumption' }).fill('Use PostgreSQL.');
@@ -1232,6 +1321,8 @@ test('Check environment reaches the real Check, stays private, and re-check uses
   await writeFile(file, 'CHECK_FIXTURE_VALUE=fixture-value-check-only\n');
   await app.evaluate(({ ipcMain }) => {
     const client = (globalThis as typeof globalThis & { repairFixtureClient: { request: (method: string, params?: unknown) => Promise<unknown> } }).repairFixtureClient;
+    ipcMain.removeHandler('intercat:checks'); ipcMain.handle('intercat:checks', () => client.request('checks.get', {}));
+    ipcMain.removeHandler('intercat:checks-change'); ipcMain.handle('intercat:checks-change', (_event, request) => client.request('checks.change', request));
     ipcMain.removeHandler('intercat:check-environment');
     ipcMain.handle('intercat:check-environment', () => client.request('check-environment.get', {}));
     ipcMain.removeHandler('intercat:check-environment-change');
@@ -1251,22 +1342,61 @@ test('Check environment reaches the real Check, stays private, and re-check uses
   const sheet = page.getByRole('complementary', { name: 'Commit review' });
   await expect(sheet).toContainText('Checked and ready', { timeout: 30_000 });
   await sheet.getByRole('tab', { name: 'Check', exact: true }).click();
-  const initial = (await page.evaluate(() => window.intercat.getStatus())).integration!;
+  const initial = (await page.evaluate(() => window.intercat.getStatus())).integrations![0]!;
   expect(initial.candidate!.check!.code).toBe(0);
   expect(initial.candidate!.check!.stdout).not.toContain('fixture-value-check-only');
   await sheet.getByRole('button', { name: 'Hide commit review', exact: true }).click();
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await environment.getByRole('button', { name: 'Use no file', exact: true }).click();
+  const checks = page.getByRole('region', { name: 'Checks', exact: true });
+  await checks.getByLabel('Check command', { exact: true }).selectOption('run');
+  await checks.getByLabel('Command', { exact: true }).fill('test -n "$CHECK_FIXTURE_VALUE" || exit 19');
+  await checks.getByRole('button', { name: 'Apply Check settings' }).click();
+  await expect(checks.getByRole('button', { name: 'Apply Check settings' })).toBeDisabled();
   await page.getByRole('button', { name: 'Close settings', exact: true }).click();
   await page.getByRole('button', { name: 'Commit', exact: true }).click();
   await expect(sheet).toContainText('Checked with previous settings');
   await sheet.getByRole('button', { name: 'Re-check', exact: true }).click();
-  await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).integration?.candidate?.check?.code, { timeout: 30_000 }).toBe(19);
-  const changed = (await page.evaluate(() => window.intercat.getStatus())).integration!;
+  await expect.poll(async () => (await page.evaluate(() => window.intercat.getStatus())).integrations![0]?.candidate?.check?.code, { timeout: 30_000 }).toBe(19);
+  const changed = (await page.evaluate(() => window.intercat.getStatus())).integrations![0]!;
   expect(changed.candidate!.tree).toBe(initial.candidate!.tree);
+  expect(changed.candidate!.head).toBe(initial.candidate!.head);
+  expect(changed.candidate!.workspace).not.toBe(initial.candidate!.workspace);
+  expect(changed.candidate!.check!.command).toBe('test -n "$CHECK_FIXTURE_VALUE" || exit 19');
   expect(changed.candidate!.settingsHash).not.toBe(initial.candidate!.settingsHash);
   expect(changed.tracks.map(track => track.checkpoint?.sha)).toEqual(initial.tracks.map(track => track.checkpoint?.sha));
   const records = execFileSync('python3', ['-c', 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print("\\n".join(str(r) for table in ("events", "integration_settings") for r in c.execute("select * from "+table)))', path.join(seeded.data, 'events.sqlite')], { encoding: 'utf8' });
   expect(records).not.toContain('fixture-value-check-only');
   await writeFile(test.info().outputPath('environment-check.json'), JSON.stringify({ initial, changed }, null, 2));
+});
+
+for (const zoom of [1, 2]) test(`a history-dependent Check asks before exposing history at ${zoom * 100}%`, async () => {
+  const job = fixture(); job.status = 'failed'; job.candidate!.state = 'history-required';
+  job.candidate!.check = { command: 'git describe --tags', code: 128, stdout: '', stderr: 'fatal: No names found, cannot describe anything.', truncated: false };
+  await mock(job);
+  await app.evaluate(({ ipcMain, BrowserWindow }) => {
+    const memory = globalThis as any; memory.historyCalls = []; let lost = false;
+    ipcMain.removeHandler('intercat:checks'); ipcMain.handle('intercat:checks', () => ({ setting: { revision: 7, folders: { 'dummy-folder': { revision: 7, command: { mode: 'run', command: 'git describe --tags' }, history: false } } }, folders: [] }));
+    ipcMain.removeHandler('intercat:checks-change'); ipcMain.handle('intercat:checks-change', (_event, request) => {
+      memory.historyCalls.push(request);
+      if (!lost) { lost = true; throw new Error('Dummy lost history acknowledgement'); }
+      return { revision: 8, folders: { 'dummy-folder': { revision: 8, command: request.command, history: true } } };
+    });
+    BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(1);
+  });
+  await app.evaluate(({ BrowserWindow }, zoom) => { BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(zoom); }, zoom);
+  const page = await app.firstWindow(); await page.reload();
+  await page.getByRole('button', { name: 'Commit', exact: true }).first().click();
+  const question = page.getByRole('region', { name: 'Check needs Git history' });
+  await expect(question).toContainText('including removed files and secrets');
+  await expect(page.getByRole('button', { name: /Ask Worker .* to fix/ })).toHaveCount(0);
+  await question.getByRole('button', { name: 'Enable history for checks' }).click();
+  await expect(question.getByRole('button', { name: 'Treat as failure' })).toBeDisabled();
+  await question.getByRole('button', { name: 'Retry enabling history' }).click();
+  await expect.poll(async () => app.evaluate(() => (globalThis as any).commitCalls.some((call: any) => call.action.action === 'recheck'))).toBe(true);
+  const calls = await app.evaluate(() => (globalThis as any).historyCalls);
+  expect(calls).toHaveLength(2); expect(calls[0]).toEqual(calls[1]);
+  expect(calls[0]).toMatchObject({ revision: 7, folder: job.project.id, command: { mode: 'run', command: 'git describe --tags' }, history: true });
+  await question.getByRole('button', { name: 'Treat as failure' }).scrollIntoViewIfNeeded();
+  await expect(question.getByRole('button', { name: 'Treat as failure' })).toBeInViewport();
 });

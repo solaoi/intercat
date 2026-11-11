@@ -268,6 +268,8 @@ pub struct External {
 pub struct Context {
     pub folders: BTreeSet<String>,
     pub tracks: BTreeMap<String, String>,
+    /// Historical conversation segments retain their IDs and share one current writer.
+    pub writers: BTreeMap<String, String>,
     pub external: BTreeMap<String, External>,
     pub plan_items: BTreeSet<String>,
     /// Existing explicit dependencies and within-track order, child -> parent.
@@ -504,7 +506,13 @@ fn assemble(
         {
             errors.push("Items on one track must use the same folder.".into());
         }
-        if locked.is_some_and(|track| item.track_ref != track) {
+        if locked.is_some_and(|track| {
+            context
+                .writers
+                .get(&item.track_ref)
+                .map_or(item.track_ref.as_str(), String::as_str)
+                != context.writers.get(track).map_or(track, String::as_str)
+        }) {
             errors.push("Keep every item on the locked track.".into());
         }
         if item.title.len() > 4096

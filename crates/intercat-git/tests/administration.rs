@@ -85,63 +85,6 @@ fn author() -> gix::actor::Signature {
 }
 
 #[test]
-fn project_inspection_rejects_working_staged_and_hidden_untracked_changes_without_writing_index()
--> Result<()> {
-    let dir = fixture();
-    let before = fs::read(dir.path().join(".git/index"))?;
-    let head = git(dir.path(), &["rev-parse", "HEAD"]);
-    assert_eq!(
-        Repository::clean_project(dir.path())?.head.to_string(),
-        head
-    );
-    assert_eq!(fs::read(dir.path().join(".git/index"))?, before);
-    fs::write(dir.path().join("file.txt"), "unfinished\n")?;
-    assert!(Repository::clean_project(dir.path()).is_err());
-    assert_eq!(fs::read(dir.path().join(".git/index"))?, before);
-    git(dir.path(), &["add", "file.txt"]);
-    let staged = fs::read(dir.path().join(".git/index"))?;
-    assert!(Repository::clean_project(dir.path()).is_err());
-    assert_eq!(fs::read(dir.path().join(".git/index"))?, staged);
-    git(dir.path(), &["reset", "--hard", "HEAD"]);
-    git(dir.path(), &["config", "status.showUntrackedFiles", "no"]);
-    fs::write(dir.path().join("untracked.txt"), "not committed\n")?;
-    assert!(Repository::clean_project(dir.path()).is_err());
-    fs::write(dir.path().join(".git/info/exclude"), "untracked.txt\n")?;
-    assert_eq!(
-        Repository::clean_project(dir.path())?.head.to_string(),
-        head
-    );
-    assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head);
-    Ok(())
-}
-
-#[test]
-fn empty_unborn_project_has_a_stable_parentless_base_without_moving_head_or_index() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    git(dir.path(), &["init", "-q", "-b", "main"]);
-    let head = fs::read(dir.path().join(".git/HEAD"))?;
-    let source = Repository::clean_project(dir.path())?;
-    let repo = Repository::open(dir.path())?;
-    let details = repo.commit_details(source.head)?;
-    assert!(details.parents.is_empty());
-    assert!(repo.tree_files(details.tree)?.is_empty());
-    assert!(repo.tracked_paths()?.is_empty());
-    assert_eq!(Repository::clean_project(dir.path())?.head, source.head);
-    assert_eq!(repo.base_branch()?, None);
-    assert_eq!(repo.reference_target("refs/heads/main")?, None);
-    assert_eq!(fs::read(dir.path().join(".git/HEAD"))?, head);
-    assert!(!dir.path().join(".git/index").exists());
-    fs::write(dir.path().join("unsaved.txt"), "keep this work")?;
-    assert!(Repository::clean_project(dir.path()).is_err());
-    assert_eq!(
-        fs::read_to_string(dir.path().join("unsaved.txt"))?,
-        "keep this work"
-    );
-    assert!(!dir.path().join(".git/index").exists());
-    Ok(())
-}
-
-#[test]
 fn cas_replay_rejects_stale_updates_and_protects_user_refs() -> Result<()> {
     let dir = fixture();
     let repo = Repository::open(dir.path())?;
@@ -283,15 +226,98 @@ fn merge_returns_conflicting_paths_without_running_configured_programs() -> Resu
     );
     let before_config = fs::read(dir.path().join(".git/config"))?;
     let index_before = fs::read(dir.path().join(".git/index"))?;
-    let Merge::Conflicts(paths) = repo.merge_trees(base, ours, theirs)? else {
+    let Merge::Conflicts {
+        paths,
+        base: recorded_base,
+        target: recorded_target,
+        incoming: recorded_incoming,
+    } = repo.merge_trees(base, ours, theirs)?
+    else {
         panic!("conflict expected")
     };
+    assert_eq!(
+        (recorded_base, recorded_target, recorded_incoming),
+        (base, ours, theirs)
+    );
     assert_eq!(paths, vec![gix::bstr::BString::from("file.txt")]);
     assert!(!marker.exists());
     assert_eq!(fs::read(dir.path().join(".git/config"))?, before_config);
     assert_eq!(fs::read(dir.path().join(".git/index"))?, index_before);
+    let resolution = dir.path().join("resolution.index");
+    let prepared = repo.merge_for_resolution(base, ours, theirs, "dummy-merge", &resolution)?;
+    assert_eq!(prepared.conflicts, paths);
+    let files = repo.tree_files(prepared.tree)?;
+    let contents = String::from_utf8(repo.saved_bytes(&files["file.txt"])?)?;
+    assert!(contents.contains("<<<<<<< Intercat target dummy-merge\nours\n"));
+    assert!(contents.contains(">>>>>>> Intercat change dummy-merge"));
+    let stages = gix::index::File::at(
+        &resolution,
+        gix::hash::Kind::Sha1,
+        false,
+        Default::default(),
+    )?;
+    let staged = stages
+        .entries()
+        .iter()
+        .filter(|entry| entry.path(&stages) == "file.txt")
+        .map(|entry| entry.stage_raw())
+        .collect::<Vec<_>>();
+    assert_eq!(staged, [1, 2, 3]);
+    assert!(repo.tree_from_index(&resolution).is_err());
+    assert!(!marker.exists());
+    assert_eq!(fs::read(dir.path().join(".git/config"))?, before_config);
+    assert_eq!(fs::read(dir.path().join(".git/index"))?, index_before);
+    assert!(
+        repo.merge_for_resolution(
+            base,
+            ours,
+            theirs,
+            "dummy-merge",
+            &dir.path().join(".git/index")
+        )
+        .is_err()
+    );
     let clean = repo.merge_trees(base, ours, base)?;
     assert!(matches!(clean, Merge::Clean(id) if id == ours));
+    Ok(())
+}
+
+#[test]
+fn merge_resolution_keeps_binary_deletion_and_rename_conflicts_unmerged() -> Result<()> {
+    let dir = fixture();
+    let repo = Repository::open(dir.path())?;
+    let original = fs::read(dir.path().join(".git/index"))?;
+    let tree = |files: &[(&str, &[u8])]| -> Result<ObjectId> {
+        let entries = files
+            .iter()
+            .map(|(path, bytes)| Ok((*path, repo.write_blob(bytes)?)))
+            .collect::<Result<Vec<_>>>()?;
+        repo.write_tree(&entries)
+    };
+    let cases = [
+        (
+            tree(&[("binary.bin", b"base\0bytes")])?,
+            tree(&[("binary.bin", b"ours\0bytes")])?,
+            tree(&[("binary.bin", b"theirs\0bytes")])?,
+        ),
+        (
+            tree(&[("file.txt", b"base\n")])?,
+            tree(&[])?,
+            tree(&[("file.txt", b"theirs\n")])?,
+        ),
+        (
+            tree(&[("old.txt", b"base\n")])?,
+            tree(&[("ours.txt", b"base\n")])?,
+            tree(&[("theirs.txt", b"base\n")])?,
+        ),
+    ];
+    for (number, (base, ours, theirs)) in cases.into_iter().enumerate() {
+        let resolution = dir.path().join(format!("resolution-{number}.index"));
+        let prepared = repo.merge_for_resolution(base, ours, theirs, "dummy-merge", &resolution)?;
+        assert!(!prepared.conflicts.is_empty(), "case {number}");
+        assert!(repo.tree_from_index(&resolution).is_err(), "case {number}");
+        assert_eq!(fs::read(dir.path().join(".git/index"))?, original);
+    }
     Ok(())
 }
 

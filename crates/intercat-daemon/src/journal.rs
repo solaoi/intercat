@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-pub const SCHEMA_VERSION: i64 = 85;
+pub const SCHEMA_VERSION: i64 = 146;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
@@ -60,6 +60,20 @@ fn refresh_plan_guards(db: &rusqlite::Connection, guards: &mut PlanGuards) {
 }
 
 enum Job {
+    FreezeIntegrationContext {
+        command: uuid::Uuid,
+        input: String,
+        track: String,
+        reply: oneshot::Sender<Result<Option<String>>>,
+    },
+    CaptureScope {
+        workspace: crate::preparation::Workspace,
+        reply: oneshot::Sender<Result<crate::capture_scope::Context>>,
+    },
+    CheckpointScope {
+        action: crate::checkpoint_scope::Change,
+        reply: oneshot::Sender<Result<bool>>,
+    },
     StopReview {
         request: crate::reviews::Stop,
         reply: oneshot::Sender<Result<crate::reviews::Job>>,
@@ -137,6 +151,85 @@ enum Job {
         input: String,
         reply: oneshot::Sender<Result<Option<crate::inheritance_apply_store::Context>>>,
     },
+    ChangeRealignQueue {
+        change: crate::realign_queue::Change,
+        reply: oneshot::Sender<Result<Option<crate::realign::Job>>>,
+    },
+    ChangePathRetirement {
+        change: crate::path_retirement::Change,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    PendingPathRetirement {
+        job: uuid::Uuid,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    PathRestoreSource {
+        retirement: uuid::Uuid,
+        reply: oneshot::Sender<Result<crate::path_restore_source::Context>>,
+    },
+    ChangePathRestore {
+        change: crate::path_restore_store::Change,
+        reply: oneshot::Sender<Result<crate::path_restore::Job>>,
+    },
+    AsideProcessScope {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<
+            Result<(
+                crate::path_retirement::Entry,
+                Option<crate::runtime::WorkerState>,
+            )>,
+        >,
+    },
+    ChangeAsideProcesses {
+        change: crate::aside_processes::Change,
+        reply: oneshot::Sender<Result<crate::aside_processes::Status>>,
+    },
+    ChangeRestoreMerge {
+        change: crate::restore_merge_store::Change,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    PathRestoreApplication {
+        request: crate::path_restore::Request,
+        reply: oneshot::Sender<Result<Option<(crate::path_restore_store::Application, String)>>>,
+    },
+    PathRestoreAccessAllowed {
+        request: crate::path_restore::Request,
+        fingerprint: String,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    ApproveRealignAccess {
+        consent: crate::workspace_access::Consent,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    RealignAccessAllowed {
+        request: crate::realign::Request,
+        fingerprint: String,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    RealignContext {
+        request: crate::realign::Request,
+        reply: oneshot::Sender<Result<crate::realign_store::Context>>,
+    },
+    ChangeRealign {
+        change: crate::realign_store::Change,
+        reply: oneshot::Sender<Result<Option<crate::checkpoint::Checkpoint>>>,
+    },
+    PrepareSharedContext {
+        request: crate::shared_context_store::Request,
+        reply: oneshot::Sender<Result<crate::shared_context_store::Preparation>>,
+    },
+    ChangeSharedContext {
+        change: crate::shared_context_store::Change,
+        reply: oneshot::Sender<Result<crate::shared_context_store::Record>>,
+    },
+    ReadSharedContext {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<crate::shared_context_store::Record>>,
+    },
+    ChangeSharedMerge {
+        change: crate::shared_merge_store::Change,
+        reply: oneshot::Sender<Result<()>>,
+    },
     ChangeInheritance {
         change: crate::inheritance_apply_store::Change,
         reply: oneshot::Sender<Result<Option<crate::checkpoint::Checkpoint>>>,
@@ -149,6 +242,14 @@ enum Job {
         workspace: crate::preparation::Workspace,
         initial: crate::inheritance::Initial,
         reply: oneshot::Sender<Result<()>>,
+    },
+    ChangeUndoMerge {
+        change: crate::undo_merge_store::Change,
+        reply: oneshot::Sender<Result<Option<crate::integration::Job>>>,
+    },
+    UndoMergeResult {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<(crate::undo_merge_store::Applied, String)>>,
     },
     PlanBasedOn {
         id: uuid::Uuid,
@@ -213,6 +314,13 @@ enum Job {
         request: crate::execution_limits::Change,
         reply: oneshot::Sender<Result<crate::execution_limits::Setting>>,
     },
+    ReadCheckSettings {
+        reply: oneshot::Sender<Result<crate::check_settings::Setting>>,
+    },
+    ChangeCheckSettings {
+        request: crate::check_settings::Change,
+        reply: oneshot::Sender<Result<crate::check_settings::Setting>>,
+    },
     ReadCheckEnvironment {
         reply: oneshot::Sender<Result<crate::check_environment::Selection>>,
     },
@@ -244,11 +352,11 @@ enum Job {
         change: crate::backup_apply::Change,
         reply: oneshot::Sender<Result<crate::backup_apply::State>>,
     },
-    BackupResume {
+    SessionStart {
         track: String,
-        reply: oneshot::Sender<Result<Option<(crate::session_retirement::Resume, bool)>>>,
+        reply: oneshot::Sender<Result<Option<crate::session_start::Reservation>>>,
     },
-    BackupResumeOpened {
+    SessionStartOpened {
         track: String,
         session: String,
         reply: oneshot::Sender<Result<()>>,
@@ -275,9 +383,35 @@ enum Job {
         request: crate::pickup::CancelRequest,
         reply: oneshot::Sender<Result<crate::pickup::Recovery>>,
     },
-    SummaryPlan {
+    TwoWays {
+        change: crate::two_ways::Change,
+        ownership: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+        reply: oneshot::Sender<Result<crate::two_ways::Job>>,
+    },
+    TwoWaysStart {
+        input: String,
+        track: String,
+        reply: oneshot::Sender<Result<Option<crate::branch_start::Point>>>,
+    },
+    TwoWaysSource {
+        query: crate::two_ways::OptionsQuery,
+        reply: oneshot::Sender<Result<crate::two_ways::OptionsSource>>,
+    },
+    TwoWaysRead {
         id: uuid::Uuid,
-        input: Value,
+        reply: oneshot::Sender<Result<Option<crate::two_ways::Job>>>,
+    },
+    FreshRead {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<Option<crate::fresh::Job>>>,
+    },
+    Fresh {
+        change: crate::fresh::Change,
+        ownership: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+        reply: oneshot::Sender<Result<crate::fresh::Job>>,
+    },
+    SummaryPlan {
+        source: crate::handoff::Source,
         reply: oneshot::Sender<Result<()>>,
     },
     SummaryNext {
@@ -420,6 +554,10 @@ enum Job {
         request: crate::repair_run::Request,
         reply: oneshot::Sender<Result<crate::repair_run::Run>>,
     },
+    MergeStart {
+        request: crate::repair_run::Request,
+        reply: tokio::sync::oneshot::Sender<Result<crate::repair_run::Run>>,
+    },
     RepairControl {
         command: crate::repair_run::Command,
         reply: oneshot::Sender<Result<crate::repair_run::Run>>,
@@ -452,6 +590,30 @@ enum Job {
         result: crate::deletion::Restored,
         reply: oneshot::Sender<Result<()>>,
     },
+    RepairRetired {
+        id: uuid::Uuid,
+        remaining: crate::run_processes::Remaining,
+        reply: oneshot::Sender<Result<crate::repair_run::Run>>,
+    },
+    DecideRepairProcesses {
+        request: crate::run_processes::Command,
+        reply: oneshot::Sender<Result<crate::repair_run::Run>>,
+    },
+    RepairProcessesCleaning {
+        id: uuid::Uuid,
+        nonce: uuid::Uuid,
+        reply: oneshot::Sender<Result<crate::repair_run::Run>>,
+    },
+    RepairProcessesFailed {
+        id: uuid::Uuid,
+        nonce: uuid::Uuid,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    RepairProcessesClear {
+        id: uuid::Uuid,
+        nonce: uuid::Uuid,
+        reply: oneshot::Sender<Result<()>>,
+    },
     RepairTransition {
         op: uuid::Uuid,
         id: uuid::Uuid,
@@ -468,6 +630,93 @@ enum Job {
                 crate::candidate::Settings,
             )>,
         >,
+    },
+    RepairSource {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<(crate::repair_run::Run, crate::run_input::Source)>>,
+    },
+    RepairRun {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<crate::repair_run::Run>>,
+    },
+    ComparisonCapture {
+        request: crate::comparison::Open,
+        reply: oneshot::Sender<Result<crate::comparison_source::Capture>>,
+    },
+    ComparisonRead {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<Option<crate::comparison::Job>>>,
+    },
+    ComparisonSettings {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<crate::candidate::Settings>>,
+    },
+    ComparisonChange {
+        change: crate::comparison_store::Change,
+        reply: oneshot::Sender<Result<crate::comparison::Job>>,
+    },
+    ComparisonControl {
+        request: crate::comparison::Control,
+        reply: oneshot::Sender<Result<crate::comparison::Job>>,
+    },
+    ComparisonRecover {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    PullCommand {
+        request: crate::pull_request::Command,
+        reply: oneshot::Sender<Result<crate::pull_request::Job>>,
+    },
+    ChangePull {
+        id: uuid::Uuid,
+        change: crate::pull_changes::Change,
+        reply: oneshot::Sender<Result<crate::pull_request::Job>>,
+    },
+    RecoverPulls {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    OpenPull {
+        request: crate::pull_request::Open,
+        reply: oneshot::Sender<Result<crate::pull_request::Job>>,
+    },
+    ReadPull {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<crate::pull_request::Job>>,
+    },
+    PushCommand {
+        command: crate::push_job::Command,
+        reply: oneshot::Sender<Result<crate::push_job::Job>>,
+    },
+    ReadPush {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<crate::push_job::Job>>,
+    },
+    AdvancePush {
+        progress: crate::push_job::Progress,
+        reply: oneshot::Sender<Result<crate::push_job::Job>>,
+    },
+    RecoverPushJobs {
+        reply: oneshot::Sender<Result<Vec<crate::push_job::Job>>>,
+    },
+    PushApprovals {
+        session: String,
+        folder: String,
+        reply: oneshot::Sender<Result<Vec<crate::push_job::Approval>>>,
+    },
+    PushContext {
+        request: crate::push_review::Request,
+        reply: oneshot::Sender<Result<crate::push_review::Context>>,
+    },
+    ReadPushReview {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<Option<crate::push_review::Review>>>,
+    },
+    BeginPushReview {
+        review: Box<crate::push_review::Review>,
+        reply: oneshot::Sender<Result<crate::push_review::Review>>,
+    },
+    CompletePushReview {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<()>>,
     },
     RepairBeginApply {
         id: uuid::Uuid,
@@ -499,6 +748,17 @@ enum Job {
         id: uuid::Uuid,
         revision: u64,
         reply: oneshot::Sender<Result<bool>>,
+    },
+    ChangeCommitGroup {
+        change: crate::commit_group::Change,
+        reply: oneshot::Sender<Result<crate::commit_group::Changed>>,
+    },
+    ActiveCommitGroups {
+        reply: oneshot::Sender<Result<Vec<crate::commit_group::Group>>>,
+    },
+    ReadIntegration {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<crate::integration::Job>>,
     },
     IntegrationSettings {
         id: uuid::Uuid,
@@ -721,6 +981,7 @@ enum Job {
         revision: i64,
         track: String,
         params: Value,
+        paired_model: Option<crate::two_ways::Variation>,
         reply: oneshot::Sender<Result<Admission>>,
     },
     InputExecution {
@@ -850,6 +1111,10 @@ enum Job {
     ReadReasonReview {
         input: String,
         reply: oneshot::Sender<Result<Option<crate::reason_review::Review>>>,
+    },
+    InitialBranchInstructions {
+        track: String,
+        reply: oneshot::Sender<Result<Option<crate::branch::InstructionSnapshot>>>,
     },
     ReadRequestSources {
         input: String,
@@ -1125,6 +1390,9 @@ impl Job {
                 | Self::ReadPlans { .. }
                 | Self::ReadInheritance { .. }
                 | Self::InheritanceApplication { .. }
+                | Self::RealignContext { .. }
+                | Self::ReadSharedContext { .. }
+                | Self::RealignAccessAllowed { .. }
                 | Self::PlanContext { .. }
                 | Self::DispatchPause { .. }
                 | Self::Snapshot { .. }
@@ -1151,6 +1419,7 @@ impl Job {
                 | Self::PrivacyState { .. }
                 | Self::ReviewPossible { .. }
                 | Self::ReadReasonReview { .. }
+                | Self::InitialBranchInstructions { .. }
                 | Self::ReadRequestSources { .. }
                 | Self::PreviousAttachmentScreening { .. }
                 | Self::ReadAttachmentScreening { .. }
@@ -1159,12 +1428,27 @@ impl Job {
                 | Self::FingerprintRecovery { .. }
                 | Self::BackupReview { .. }
                 | Self::BackupApplyRead { .. }
-                | Self::BackupResume { .. }
+                | Self::SessionStart { .. }
                 | Self::SummaryTasks { .. }
+                | Self::FreshRead { .. }
+                | Self::TwoWaysRead { .. }
+                | Self::TwoWaysSource { .. }
+                | Self::TwoWaysStart { .. }
                 | Self::PickupCheckpoint { .. }
                 | Self::RepairInput { .. }
+                | Self::RepairSource { .. }
+                | Self::RepairRun { .. }
+                | Self::PushContext { .. }
+                | Self::ReadPushReview { .. }
+                | Self::ReadPush { .. }
+                | Self::ReadPull { .. }
+                | Self::PushApprovals { .. }
                 | Self::PendingPublications { .. }
+                | Self::PendingPathRetirement { .. }
+                | Self::ActiveCommitGroups { .. }
+                | Self::ReadIntegration { .. }
                 | Self::IntegrationSettings { .. }
+                | Self::ReadCheckSettings { .. }
                 | Self::ViewCursor { .. }
                 | Self::ViewSeen { .. }
                 | Self::ViewFloor { .. }
@@ -1178,6 +1462,7 @@ impl Job {
                 | Self::EditorLog { .. }
                 | Self::EditorAway { .. }
                 | Self::BranchPoints { .. }
+                | Self::CaptureScope { .. }
         )
     }
 }
@@ -1221,6 +1506,7 @@ fn flush_controls(connection: &mut Connection, pending: &mut std::collections::V
 pub struct Journal {
     full_privacy: crate::full_privacy::Runtime,
     fingerprint_gate: std::sync::Arc<tokio::sync::RwLock<()>>,
+    snapshot_gate: std::sync::Arc<tokio::sync::RwLock<()>>,
     secret_key: std::sync::Arc<crate::secrets::Key>,
     attachment_root: std::sync::Arc<PathBuf>,
     jobs: mpsc::Sender<Job>,
@@ -1536,6 +1822,7 @@ impl Journal {
         path: PathBuf,
         mut params: Value,
     ) -> Result<crate::screening::Command> {
+        crate::two_ways_files::before_turn(self, &input, &track).await?;
         loop {
             let (reply, result) = oneshot::channel();
             self.jobs
@@ -1569,10 +1856,31 @@ impl Journal {
                 crate::review_fixes::Checked::Outdated => return Err(StartSuperseded.into()),
             }
         }
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::FreezeIntegrationContext {
+                command: serde_json::from_value(params["commandId"].clone())?,
+                input: input.clone(),
+                track: track.clone(),
+                reply,
+            })
+            .await?;
+        let integration_note = result.await??;
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::InitialBranchInstructions {
+                track: track.clone(),
+                reply,
+            })
+            .await?;
+        let frozen = result.await??;
         let (mut instructions, workspace) = tokio::task::spawn_blocking(move || -> Result<_> {
             let workspace = path.canonicalize()?;
             Ok((
-                crate::instructions::Instructions::capture(&workspace)?,
+                match frozen {
+                    Some(snapshot) => crate::branch_instructions::initial(&workspace, &snapshot)?,
+                    None => crate::instructions::Instructions::capture(&workspace)?,
+                },
                 workspace,
             ))
         })
@@ -1667,6 +1975,12 @@ impl Journal {
                 .ok_or("Missing retry instruction.")?;
             params["input"][0]["arguments"] =
                 format!("{definition}\n\nRetry instruction:\n{text}").into();
+        }
+        if let Some(note) = integration_note {
+            let text = params["input"][0]["arguments"]
+                .as_str()
+                .ok_or("Missing work request.")?;
+            params["input"][0]["arguments"] = format!("{text}\n\n{note}").into();
         }
         params["input"][0]["arguments"] = instructions
             .with_request(
@@ -2212,23 +2526,23 @@ impl Journal {
         }
         Ok(Some(state.recovery()))
     }
-    pub(crate) async fn backup_resume(
+    pub(crate) async fn session_start(
         &self,
         track: &str,
-    ) -> Result<Option<(crate::session_retirement::Resume, bool)>> {
+    ) -> Result<Option<crate::session_start::Reservation>> {
         let (reply, result) = oneshot::channel();
         self.jobs
-            .send(Job::BackupResume {
+            .send(Job::SessionStart {
                 track: track.into(),
                 reply,
             })
             .await?;
         result.await?
     }
-    pub(crate) async fn backup_resume_opened(&self, track: &str, session: &str) -> Result<()> {
+    pub(crate) async fn session_start_opened(&self, track: &str, session: &str) -> Result<()> {
         let (reply, result) = oneshot::channel();
         self.jobs
-            .send(Job::BackupResumeOpened {
+            .send(Job::SessionStartOpened {
                 track: track.into(),
                 session: session.into(),
                 reply,
@@ -2294,11 +2608,77 @@ impl Journal {
         self.jobs.send(Job::CancelPickup { request, reply }).await?;
         result.await?
     }
-    pub async fn summary_plan(&self, id: uuid::Uuid, input: Value) -> Result<()> {
+    pub async fn two_ways(&self, change: crate::two_ways::Change) -> Result<crate::two_ways::Job> {
+        let ownership = if matches!(change, crate::two_ways::Change::Cancelled { .. }) {
+            Some(self.snapshot_gate.clone().write_owned().await)
+        } else {
+            None
+        };
         let (reply, result) = oneshot::channel();
         self.jobs
-            .send(Job::SummaryPlan { id, input, reply })
+            .send(Job::TwoWays {
+                change,
+                ownership,
+                reply,
+            })
             .await?;
+        result.await?
+    }
+    pub(crate) async fn two_ways_start(
+        &self,
+        input: String,
+        track: String,
+    ) -> Result<Option<crate::branch_start::Point>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::TwoWaysStart {
+                input,
+                track,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn two_ways_source(
+        &self,
+        query: crate::two_ways::OptionsQuery,
+    ) -> Result<crate::two_ways::OptionsSource> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::TwoWaysSource { query, reply }).await?;
+        result.await?
+    }
+    pub async fn two_ways_job(&self, id: uuid::Uuid) -> Result<Option<crate::two_ways::Job>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::TwoWaysRead { id, reply }).await?;
+        result.await?
+    }
+    pub async fn fresh_job(&self, id: uuid::Uuid) -> Result<Option<crate::fresh::Job>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::FreshRead { id, reply }).await?;
+        result.await?
+    }
+    pub async fn fresh(&self, change: crate::fresh::Change) -> Result<crate::fresh::Job> {
+        let ownership = if matches!(
+            change,
+            crate::fresh::Change::Transfer { .. } | crate::fresh::Change::Cancelled { .. }
+        ) {
+            Some(self.snapshot_gate.clone().write_owned().await)
+        } else {
+            None
+        };
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::Fresh {
+                change,
+                ownership,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn summary_plan(&self, source: crate::handoff::Source) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::SummaryPlan { source, reply }).await?;
         result.await?
     }
     pub async fn summary_next(&self, id: uuid::Uuid) -> Result<crate::handoff::Next> {
@@ -2606,6 +2986,14 @@ impl Journal {
         self.jobs.send(Job::RepairStart { request, reply }).await?;
         result.await?
     }
+    pub async fn merge_start(
+        &self,
+        request: crate::repair_run::Request,
+    ) -> Result<crate::repair_run::Run> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::MergeStart { request, reply }).await?;
+        result.await?
+    }
     pub async fn repair_control(
         &self,
         command: crate::repair_run::Command,
@@ -2687,6 +3075,56 @@ impl Journal {
             .await?;
         result.await?
     }
+    pub async fn repair_retired(
+        &self,
+        id: uuid::Uuid,
+        remaining: crate::run_processes::Remaining,
+    ) -> Result<crate::repair_run::Run> {
+        let (reply, receive) = oneshot::channel();
+        self.jobs
+            .send(Job::RepairRetired {
+                id,
+                remaining,
+                reply,
+            })
+            .await?;
+        receive.await?
+    }
+    pub async fn decide_repair_processes(
+        &self,
+        request: crate::run_processes::Command,
+    ) -> Result<crate::repair_run::Run> {
+        let (reply, receive) = oneshot::channel();
+        self.jobs
+            .send(Job::DecideRepairProcesses { request, reply })
+            .await?;
+        receive.await?
+    }
+    pub async fn repair_processes_cleaning(
+        &self,
+        id: uuid::Uuid,
+        nonce: uuid::Uuid,
+    ) -> Result<crate::repair_run::Run> {
+        let (reply, receive) = oneshot::channel();
+        self.jobs
+            .send(Job::RepairProcessesCleaning { id, nonce, reply })
+            .await?;
+        receive.await?
+    }
+    pub async fn repair_processes_failed(&self, id: uuid::Uuid, nonce: uuid::Uuid) -> Result<()> {
+        let (reply, receive) = oneshot::channel();
+        self.jobs
+            .send(Job::RepairProcessesFailed { id, nonce, reply })
+            .await?;
+        receive.await?
+    }
+    pub async fn repair_processes_clear(&self, id: uuid::Uuid, nonce: uuid::Uuid) -> Result<()> {
+        let (reply, receive) = oneshot::channel();
+        self.jobs
+            .send(Job::RepairProcessesClear { id, nonce, reply })
+            .await?;
+        receive.await?
+    }
     pub async fn repair_transition(
         &self,
         op: uuid::Uuid,
@@ -2716,6 +3154,180 @@ impl Journal {
     )> {
         let (reply, result) = oneshot::channel();
         self.jobs.send(Job::RepairInput { id, reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn repair_source(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<(crate::repair_run::Run, crate::run_input::Source)> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::RepairSource { id, reply }).await?;
+        result.await?
+    }
+    pub async fn repair_run(&self, id: uuid::Uuid) -> Result<crate::repair_run::Run> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::RepairRun { id, reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn push_context(
+        &self,
+        request: crate::push_review::Request,
+    ) -> Result<crate::push_review::Context> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::PushContext { request, reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn capture_comparison(
+        &self,
+        request: crate::comparison::Open,
+    ) -> Result<crate::comparison_source::Capture> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ComparisonCapture { request, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn comparison_job(&self, id: uuid::Uuid) -> Result<Option<crate::comparison::Job>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ComparisonRead { id, reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn comparison_settings(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<crate::candidate::Settings> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ComparisonSettings { id, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn change_comparison(
+        &self,
+        change: crate::comparison_store::Change,
+    ) -> Result<crate::comparison::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ComparisonChange { change, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn control_comparison(
+        &self,
+        request: crate::comparison::Control,
+    ) -> Result<crate::comparison::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ComparisonControl { request, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn recover_comparisons(&self) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ComparisonRecover { reply }).await?;
+        result.await?
+    }
+    pub async fn pull_command(
+        &self,
+        request: crate::pull_request::Command,
+    ) -> Result<crate::pull_request::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::PullCommand { request, reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn change_pull(
+        &self,
+        id: uuid::Uuid,
+        change: crate::pull_changes::Change,
+    ) -> Result<crate::pull_request::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangePull { id, change, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn recover_pulls(&self) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::RecoverPulls { reply }).await?;
+        result.await?
+    }
+    pub async fn open_pull(
+        &self,
+        request: crate::pull_request::Open,
+    ) -> Result<crate::pull_request::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::OpenPull { request, reply }).await?;
+        result.await?
+    }
+    pub async fn pull_job(&self, id: uuid::Uuid) -> Result<crate::pull_request::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ReadPull { id, reply }).await?;
+        result.await?
+    }
+    pub async fn push_command(
+        &self,
+        command: crate::push_job::Command,
+    ) -> Result<crate::push_job::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::PushCommand { command, reply }).await?;
+        result.await?
+    }
+    pub async fn push_job(&self, id: uuid::Uuid) -> Result<crate::push_job::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ReadPush { id, reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn push_progress(
+        &self,
+        progress: crate::push_job::Progress,
+    ) -> Result<crate::push_job::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::AdvancePush { progress, reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn recover_push_jobs(&self) -> Result<Vec<crate::push_job::Job>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::RecoverPushJobs { reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn push_approvals(
+        &self,
+        session: String,
+        folder: String,
+    ) -> Result<Vec<crate::push_job::Approval>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::PushApprovals {
+                session,
+                folder,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub async fn push_review(&self, id: uuid::Uuid) -> Result<Option<crate::push_review::Review>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ReadPushReview { id, reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn begin_push_review(
+        &self,
+        review: crate::push_review::Review,
+    ) -> Result<crate::push_review::Review> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::BeginPushReview {
+                review: Box::new(review),
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn complete_push_review(&self, id: uuid::Uuid) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::CompletePushReview { id, reply })
+            .await?;
         result.await?
     }
     pub async fn repair_begin_apply(
@@ -2912,6 +3524,21 @@ impl Journal {
             .await?;
         result.await?
     }
+    pub async fn check_settings(&self) -> Result<crate::check_settings::Setting> {
+        let (reply, receive) = oneshot::channel();
+        self.jobs.send(Job::ReadCheckSettings { reply }).await?;
+        receive.await?
+    }
+    pub async fn change_check_settings(
+        &self,
+        request: crate::check_settings::Change,
+    ) -> Result<crate::check_settings::Setting> {
+        let (reply, receive) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangeCheckSettings { request, reply })
+            .await?;
+        receive.await?
+    }
     pub async fn check_environment(&self) -> Result<crate::check_environment::Selection> {
         let (reply, result) = oneshot::channel();
         self.jobs.send(Job::ReadCheckEnvironment { reply }).await?;
@@ -2954,6 +3581,26 @@ impl Journal {
                 reply,
             })
             .await?;
+        result.await?
+    }
+    pub(crate) async fn change_commit_group(
+        &self,
+        change: crate::commit_group::Change,
+    ) -> Result<crate::commit_group::Changed> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangeCommitGroup { change, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn active_commit_groups(&self) -> Result<Vec<crate::commit_group::Group>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ActiveCommitGroups { reply }).await?;
+        result.await?
+    }
+    pub async fn integration_job(&self, id: uuid::Uuid) -> Result<crate::integration::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ReadIntegration { id, reply }).await?;
         result.await?
     }
     pub async fn integration_settings(
@@ -3494,6 +4141,7 @@ impl Journal {
         revision: i64,
         track: String,
         params: Value,
+        paired_model: Option<crate::two_ways::Variation>,
     ) -> Result<Admission> {
         let (reply, result) = oneshot::channel();
         self.jobs
@@ -3503,6 +4151,7 @@ impl Journal {
                 revision,
                 track,
                 params,
+                paired_model,
                 reply,
             })
             .await?;
@@ -3744,6 +4393,222 @@ impl Journal {
                 reply,
             })
             .await?;
+        result.await?
+    }
+    pub(crate) async fn change_realign_queue(
+        &self,
+        change: crate::realign_queue::Change,
+    ) -> Result<Option<crate::realign::Job>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangeRealignQueue { change, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn change_path_retirement(
+        &self,
+        change: crate::path_retirement::Change,
+    ) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangePathRetirement { change, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn pending_path_retirement(&self, job: uuid::Uuid) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::PendingPathRetirement { job, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn path_restore_source(
+        &self,
+        retirement: uuid::Uuid,
+    ) -> Result<crate::path_restore_source::Context> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::PathRestoreSource { retirement, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn restore_path(
+        &self,
+        request: crate::path_restore::Request,
+    ) -> Result<crate::path_restore::Job> {
+        self.change_path_restore(crate::path_restore_store::Change::Request(request))
+            .await
+    }
+    pub(crate) async fn aside_process_scope(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<(
+        crate::path_retirement::Entry,
+        Option<crate::runtime::WorkerState>,
+    )> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::AsideProcessScope { id, reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn change_aside_processes(
+        &self,
+        change: crate::aside_processes::Change,
+    ) -> Result<crate::aside_processes::Status> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangeAsideProcesses { change, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn change_path_restore(
+        &self,
+        change: crate::path_restore_store::Change,
+    ) -> Result<crate::path_restore::Job> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangePathRestore { change, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn change_restore_merge(
+        &self,
+        change: crate::restore_merge_store::Change,
+    ) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangeRestoreMerge { change, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn path_restore_application(
+        &self,
+        request: crate::path_restore::Request,
+    ) -> Result<Option<(crate::path_restore_store::Application, String)>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::PathRestoreApplication { request, reply })
+            .await?;
+        result.await?
+    }
+    pub async fn approve_path_restore_access(
+        &self,
+        consent: crate::path_restore::AccessConsent,
+    ) -> Result<crate::path_restore::Job> {
+        self.change_path_restore(crate::path_restore_store::Change::ApproveAccess(consent))
+            .await
+    }
+    pub(crate) async fn path_restore_access_allowed(
+        &self,
+        request: crate::path_restore::Request,
+        fingerprint: String,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::PathRestoreAccessAllowed {
+                request,
+                fingerprint,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn approve_realign_access(
+        &self,
+        consent: crate::workspace_access::Consent,
+    ) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ApproveRealignAccess { consent, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn realign_access_allowed(
+        &self,
+        request: crate::realign::Request,
+        fingerprint: String,
+    ) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::RealignAccessAllowed {
+                request,
+                fingerprint,
+                reply,
+            })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn realign_context(
+        &self,
+        request: crate::realign::Request,
+    ) -> Result<crate::realign_store::Context> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::RealignContext { request, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn change_realign(
+        &self,
+        change: crate::realign_store::Change,
+    ) -> Result<Option<crate::checkpoint::Checkpoint>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ChangeRealign { change, reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn prepare_shared_context(
+        &self,
+        request: crate::shared_context_store::Request,
+    ) -> Result<crate::shared_context_store::Preparation> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::PrepareSharedContext { request, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn change_shared_context(
+        &self,
+        change: crate::shared_context_store::Change,
+    ) -> Result<crate::shared_context_store::Record> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangeSharedContext { change, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn shared_context(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<crate::shared_context_store::Record> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::ReadSharedContext { id, reply }).await?;
+        result.await?
+    }
+    pub(crate) async fn change_undo_merge(
+        &self,
+        change: crate::undo_merge_store::Change,
+    ) -> Result<Option<crate::integration::Job>> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangeUndoMerge { change, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn change_shared_merge(
+        &self,
+        change: crate::shared_merge_store::Change,
+    ) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::ChangeSharedMerge { change, reply })
+            .await?;
+        result.await?
+    }
+    pub(crate) async fn undo_merge_result(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<(crate::undo_merge_store::Applied, String)> {
+        let (reply, result) = oneshot::channel();
+        self.jobs.send(Job::UndoMergeResult { id, reply }).await?;
         result.await?
     }
     pub(crate) async fn change_inheritance(
@@ -4617,6 +5482,27 @@ impl Journal {
         self.jobs.send(Job::BranchPoints { query, reply }).await?;
         result.await?
     }
+    pub(crate) async fn capture_scope(
+        &self,
+        workspace: crate::preparation::Workspace,
+    ) -> Result<crate::capture_scope::Scope> {
+        let permit = self.snapshot_gate.clone().read_owned().await;
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::CaptureScope { workspace, reply })
+            .await?;
+        Ok(crate::capture_scope::Scope {
+            context: result.await??,
+            permit,
+        })
+    }
+    pub async fn checkpoint_scope(&self, action: crate::checkpoint_scope::Change) -> Result<bool> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job::CheckpointScope { action, reply })
+            .await?;
+        result.await?
+    }
     pub async fn snapshot(&self) -> Result<Value> {
         let (reply, result) = oneshot::channel();
         self.jobs.send(Job::Snapshot { reply }).await?;
@@ -4778,18 +5664,26 @@ impl Journal {
                         continue;
                     }
                     match job {
+                        Job::CaptureScope{workspace,reply}=>{let _=reply.send(crate::capture_scope::context(&connection,&workspace));},
+                        Job::CheckpointScope{action,reply}=>{let _=reply.send(crate::checkpoint_scope::change(&mut connection,action));},
                         Job::PlanBasedOn{id,generation,revision,values,reply}=>{let _=reply.send(crate::plan_store::based_on(&mut connection,id,generation,revision,values));},
                         Job::AdvancePlans{reply}=>{let _=reply.send(crate::plan_rewrite::expire(&mut connection,&crate::clock::Stamp::now()).and_then(|()|crate::plan_execution::advance(&mut connection)));},
                         Job::BackupApplyRead{id,reply}=>{let _=reply.send(crate::backup_apply::read(&connection,id,&pickup_key));},
                         Job::BackupApplyChange{change,reply}=>{let _=reply.send(crate::backup_apply::change(&mut connection,change,&pickup_key));},
-                        Job::BackupResume{track,reply}=>{let _=reply.send(crate::session_retirement::resume(&connection,&track));},
-                        Job::BackupResumeOpened{track,session,reply}=>{let _=reply.send(crate::session_retirement::opened(&connection,&track,&session));},
+                        Job::SessionStart{track,reply}=>{let _=reply.send(crate::session_start::read(&connection,&track));},
+                        Job::SessionStartOpened{track,session,reply}=>{let _=reply.send(crate::session_start::opened(&connection,&track,&session));},
                         Job::SaveBackupChoice{receipt,record,reply}=>{let _=reply.send(crate::backup_choices::save(&mut connection,&receipt,record,&pickup_key));},
                         Job::SaveBackupFiles{id,payload,reply}=>{let _=reply.send(crate::backup_review::save_files(&mut connection,id,payload));},
                         Job::BackupReview{receipt,reply}=>{let _=reply.send(crate::backup_review::plan(&connection,&receipt,&pickup_key));},
                         Job::SummaryTasks{id,reply}=>{let _=reply.send(crate::handoff::task_ids(&connection,id));},
                         Job::CancelPickup{request,reply}=>{let _=reply.send(crate::pickup::request_cancel(&mut connection,request));},
-                        Job::SummaryPlan{id,input,reply}=>{let _=reply.send(crate::handoff::plan(&mut connection,id,input));},
+                        Job::TwoWays{change,ownership,reply}=>{let result=crate::two_ways_store::change(&mut connection,change);drop(ownership);let _=reply.send(result);},
+                        Job::TwoWaysStart{input,track,reply}=>{let _=reply.send(crate::two_ways_store::start(&connection,&input,&track));},
+                        Job::TwoWaysSource{query,reply}=>{let _=reply.send(crate::two_ways_store::options_source(&connection,&query));},
+                        Job::TwoWaysRead{id,reply}=>{let _=reply.send(crate::two_ways_store::read(&connection,id));},
+                        Job::FreshRead{id,reply}=>{let _=reply.send(crate::fresh_store::read(&connection,id));},
+                        Job::Fresh{change,ownership,reply}=>{let result=crate::fresh_store::change(&mut connection,change,&pickup_key);drop(ownership);let _=reply.send(result);},
+                        Job::SummaryPlan{source,reply}=>{let _=reply.send(crate::handoff::plan(&mut connection,source));},
                         Job::SummaryNext{id,reply}=>{let _=reply.send(crate::handoff::next(&mut connection,id));},
                         Job::SummaryChange{change,reply}=>{let _=reply.send(crate::handoff::change(&mut connection,change));},
                         Job::Pickup{change,reply}=>{let _=reply.send(crate::pickup::change(&mut connection,change,&pickup_key));},
@@ -4824,6 +5718,7 @@ impl Journal {
                         Job::PrivacyChange{request,local_ready,reply}=>{let _=reply.send(crate::privacy_policy::change(&mut connection,&request,local_ready));},
                         Job::ReadAllFingerprints{reply}=>{let _=reply.send(crate::secret_store::all(&connection));},
                         Job::RepairStart{request,reply}=>{let _=reply.send(crate::repair_run_store::start(&mut connection,request));},
+                        Job::MergeStart{request,reply}=>{let _=reply.send(crate::repair_run_store::start_manual(&mut connection,request));},
                         Job::RepairControl{command,reply}=>{let _=reply.send(crate::repair_run_store::control(&mut connection,command));},
                         Job::RepairFollowup{request,reply}=>{let _=reply.send(crate::repair_run_store::followup(&mut connection,request));},
                         Job::RepairRefresh{request,reply}=>{let _=reply.send(crate::repair_run_store::begin_refresh(&mut connection,request));},
@@ -4831,8 +5726,35 @@ impl Journal {
                         Job::RepairCompleteRefresh{operation,reply}=>{let _=reply.send(crate::repair_run_store::complete_refresh(&mut connection,operation));},
                         Job::RepairBeginRestore{operation,id,track,snapshot,reply}=>{let _=reply.send(crate::repair_run_store::begin_restore(&mut connection,operation,id,track,snapshot));},
                         Job::RepairFinishRestore{operation,result,reply}=>{let _=reply.send(crate::repair_run_store::finish_restore(&mut connection,operation,result));},
+                        Job::RepairRetired{id,remaining,reply}=>{let _=reply.send(crate::repair_process_store::retired(&mut connection,id,remaining));},
+                        Job::DecideRepairProcesses{request,reply}=>{let _=reply.send(crate::repair_process_store::decide(&mut connection,request));},
+                        Job::RepairProcessesCleaning{id,nonce,reply}=>{let _=reply.send(crate::repair_process_store::cleaning(&mut connection,id,nonce));},
+                        Job::RepairProcessesFailed{id,nonce,reply}=>{let _=reply.send(crate::repair_process_store::failed(&mut connection,id,nonce));},
+                        Job::RepairProcessesClear{id,nonce,reply}=>{let _=reply.send(crate::repair_process_store::clear(&mut connection,id,nonce));},
                         Job::RepairTransition{op,id,revision,event,reply}=>{let _=reply.send(crate::repair_run_store::transition(&mut connection,op,id,revision,event));},
                         Job::RepairInput{id,reply}=>{let _=reply.send(crate::repair_run_store::input(&connection,id));},
+                        Job::RepairSource{id,reply}=>{let _=reply.send(crate::repair_run_store::source(&connection,id));},
+                        Job::RepairRun{id,reply}=>{let _=reply.send(crate::repair_run_store::read(&connection,id));},
+                        Job::ComparisonCapture{request,reply}=>{let _=reply.send(crate::comparison_source::capture(&connection,request));},
+                        Job::ComparisonRead{id,reply}=>{let _=reply.send(crate::comparison_store::read(&connection,id));},
+                        Job::ComparisonSettings{id,reply}=>{let _=reply.send(crate::comparison_store::settings(&connection,id));},
+                        Job::ComparisonChange{change,reply}=>{let _=reply.send(crate::comparison_store::change(&mut connection,change));},
+                        Job::ComparisonControl{request,reply}=>{let _=reply.send(crate::comparison_store::control(&mut connection,request));},
+                        Job::ComparisonRecover{reply}=>{let _=reply.send(crate::comparison_store::recover(&mut connection));},
+                        Job::PullCommand{request,reply}=>{let _=reply.send(crate::pull_store::command(&mut connection,request));},
+                        Job::ChangePull{id,change,reply}=>{let _=reply.send(crate::pull_store::change(&mut connection,id,change));},
+                        Job::RecoverPulls{reply}=>{let _=reply.send(crate::pull_store::recover(&mut connection));},
+                        Job::OpenPull{request,reply}=>{let _=reply.send(crate::pull_store::open(&mut connection,request));},
+                        Job::ReadPull{id,reply}=>{let _=reply.send(crate::pull_store::read(&connection,id));},
+                        Job::PushCommand{command,reply}=>{let _=reply.send(crate::push_job_store::command(&mut connection,command));},
+                        Job::ReadPush{id,reply}=>{let _=reply.send(crate::push_job_store::read(&connection,id));},
+                        Job::AdvancePush{progress,reply}=>{let _=reply.send(crate::push_job_store::progress(&mut connection,progress));},
+                        Job::RecoverPushJobs{reply}=>{let _=reply.send(crate::push_job_store::recover(&mut connection));},
+                        Job::PushApprovals{session,folder,reply}=>{let _=reply.send(crate::push_job_store::approvals(&connection,&session,&folder));},
+                        Job::PushContext{request,reply}=>{let _=reply.send(crate::push_review_store::context(&connection,&request));},
+                        Job::ReadPushReview{id,reply}=>{let _=reply.send(crate::push_review_store::read(&connection,id));},
+                        Job::BeginPushReview{review,reply}=>{let _=reply.send(crate::push_review_store::begin(&mut connection,*review));},
+                        Job::CompletePushReview{id,reply}=>{let _=reply.send(crate::push_review_store::complete(&mut connection,id));},
                         Job::RepairBeginApply{id,revision,reply}=>{let _=reply.send(crate::repair_run_store::begin_apply(&mut connection,id,revision));},
                         Job::RepairApplied{id,revision,result,reply}=>{let _=reply.send(crate::repair_run_store::applied(&mut connection,id,revision,*result));},
                         Job::PendingPublications{reply}=>{let _=reply.send(crate::integration_store::pending_publications(&connection));},
@@ -4874,8 +5796,13 @@ impl Journal {
                         },
                         Job::ReadExecutionLimits{reply}=>{let _=reply.send(crate::execution_limits::read(&connection));},
                         Job::ChangeExecutionLimits{request,reply}=>{let _=reply.send(crate::execution_limits::change(&mut connection,&request));},
+                        Job::ReadCheckSettings{reply}=>{let _=reply.send(crate::check_settings::read(&connection));},
+                        Job::ChangeCheckSettings{request,reply}=>{let _=reply.send(crate::check_settings::change(&mut connection,&request));},
                         Job::ReadCheckEnvironment{reply}=>{let _=reply.send(crate::check_environment::selection(&connection));},
                         Job::ChangeCheckEnvironment{request,project_id,file,reply}=>{let _=reply.send(crate::check_environment::change(&mut connection,&request,project_id,file));},
+                        Job::ChangeCommitGroup{change,reply}=>{let _=reply.send(crate::commit_group_store::change(&mut connection,change));},
+                        Job::ActiveCommitGroups{reply}=>{let _=reply.send(crate::commit_group_store::active(&connection));},
+                        Job::ReadIntegration{id,reply}=>{let _=reply.send(crate::integration_store::read(&connection,id));},
                         Job::IntegrationSettings{id,revision,reply}=>{let _=reply.send(crate::integration_store::settings(&connection,id,revision));},
                         Job::SaveIntegrationSettings{id,revision,settings,reply}=>{let _=reply.send(crate::integration_store::save_settings(&mut connection,id,revision,settings));},
                         Job::IntegrationCandidate{id,revision,result,reply}=>{let _=reply.send(crate::integration_store::candidate(&mut connection,id,revision,*result));},
@@ -4922,7 +5849,7 @@ impl Journal {
                         Job::AnalyzeReport{id,revision,analysis,reply}=>{let _=reply.send(crate::report_store::analyzed(&mut connection,&id,revision,analysis));},
                         Job::AnalyzeBackgroundReports{results,reply}=>{let _=reply.send(crate::report_store::analyzed_background(&mut connection,&results));},
                         Job::RespondReport{id,question,revision,answer,reply}=>{let result=crate::report_store::respond(&mut connection,id,&question,revision,answer).and_then(|input|input.map(|input|read_input(&connection,&input)).transpose().map(|v|v.unwrap_or(Value::Null)));let _=reply.send(result);},
-                        Job::ReserveTurn{id,input,revision,track,params,reply}=>{let _=reply.send(reserve_turn(&mut connection,&id,&input,revision,&track,&params));}
+                        Job::ReserveTurn{id,input,revision,track,params,paired_model,reply}=>{let _=reply.send(reserve_turn(&mut connection,&id,&input,revision,&track,&params,paired_model.as_ref()));}
                         Job::InputExecution{input,revision,state,reply}=>{let _=reply.send(input_execution(&mut connection,&input,revision,&state));}
                         Job::StopLostWorker{id,state,turn,reply}=>{let _=reply.send(stop_lost_worker(&mut connection,id,&state,turn));}
                         Job::RetryWorker {id,track,reply}=>{let _=reply.send(retry_worker(&mut connection,&id,&track));}
@@ -4962,6 +5889,26 @@ impl Journal {
                         Job::InheritanceIssue{id,reply}=>{let _=reply.send(crate::inheritance_issue::read(&connection,id));}
                         Job::InheritanceIssueCommand{command,stopped,reply}=>{let _=reply.send(crate::inheritance_issue::command(&mut connection,command,stopped));}
                         Job::InheritanceApplication{input,reply}=>{let _=reply.send(crate::inheritance_apply_store::context(&connection,&input));}
+                        Job::ChangeRealignQueue{change,reply}=>{let _=reply.send(crate::realign_queue::change(&mut connection,change));}
+                        Job::ChangePathRetirement{change,reply}=>{let _=reply.send(crate::path_retirement::change(&mut connection,change));}
+                        Job::PendingPathRetirement{job,reply}=>{let _=reply.send(crate::path_retirement::pending(&connection,job));}
+                        Job::PathRestoreSource{retirement,reply}=>{let _=reply.send(crate::path_restore_source::capture(&connection,retirement));}
+                        Job::ChangePathRestore{change,reply}=>{let _=reply.send(crate::path_restore_store::change(&mut connection,change));}
+                        Job::AsideProcessScope{id,reply}=>{let _=reply.send(crate::aside_processes::scope(&connection,id));}
+                        Job::ChangeAsideProcesses{change,reply}=>{let _=reply.send(crate::aside_processes::change(&mut connection,change));}
+                        Job::ChangeRestoreMerge{change,reply}=>{let _=reply.send(crate::restore_merge_store::change(&mut connection,change));}
+                        Job::PathRestoreApplication{request,reply}=>{let _=reply.send(crate::path_restore_store::application(&connection,&request));}
+                        Job::PathRestoreAccessAllowed{request,fingerprint,reply}=>{let _=reply.send(crate::path_restore_store::access_allowed(&connection,&request,&fingerprint));}
+                        Job::ApproveRealignAccess{consent,reply}=>{let _=reply.send(crate::realign_store::approve_access(&mut connection,&consent));}
+                        Job::RealignAccessAllowed{request,fingerprint,reply}=>{let _=reply.send(crate::realign_store::access_allowed(&connection,&request,&fingerprint));}
+                        Job::RealignContext{request,reply}=>{let _=reply.send(crate::realign_store::context(&connection,&request));}
+                        Job::ChangeRealign{change,reply}=>{let _=reply.send(crate::realign_store::change(&mut connection,change));}
+                        Job::PrepareSharedContext{request,reply}=>{let _=reply.send(crate::shared_context_store::prepare(&mut connection,&request));}
+                        Job::ChangeSharedContext{change,reply}=>{let _=reply.send(crate::shared_context_store::change(&mut connection,change));}
+                        Job::ReadSharedContext{id,reply}=>{let _=reply.send(crate::shared_context_store::read(&connection,id));}
+                        Job::ChangeSharedMerge{change,reply}=>{let _=reply.send(crate::shared_merge_store::change(&mut connection,change));}
+                        Job::ChangeUndoMerge{change,reply}=>{let _=reply.send(crate::undo_merge_store::change(&mut connection,change));}
+                        Job::UndoMergeResult{id,reply}=>{let _=reply.send(crate::undo_merge_store::result(&connection,id));}
                         Job::ChangeInheritance{change,reply}=>{let _=reply.send(crate::inheritance_apply_store::change(&mut connection,change));}
                         Job::InheritedWorkspace {workspace,initial,reply}=>{let _=reply.send(workspace_result(&mut connection,&workspace,Some(&initial)));}
                         Job::RetryPreparation { id, reply } => { let _ = reply.send(retry_preparation(&mut connection, &id)); }
@@ -5045,6 +5992,8 @@ impl Journal {
                         Job::DependencyRetryInstructions{input,reply}=>{let _=reply.send(crate::dependency_retry::instructions(&connection,&input));}
                         Job::ReviewPossible {input,revision,tracks,reply}=>{let _=reply.send(crate::reason_review::possible(&connection,&input,revision,&tracks));},
                         Job::ReadReasonReview {input,reply}=>{let _=reply.send(crate::reason_review::read(&connection,&input));},
+                        Job::FreezeIntegrationContext{command,input,track,reply}=>{let _=reply.send(crate::integration_followup::freeze(&mut connection,command,&input,&track));},
+                        Job::InitialBranchInstructions {track,reply}=>{let _=reply.send(crate::branch::initial_instructions(&connection,&track));},
                         Job::ReadRequestSources {input,reply}=>{
                             let result = (|| {
                                 let text = connection.query_row("SELECT text FROM utterances WHERE id=?1", [&input], |row| row.get(0))?;
@@ -5208,6 +6157,7 @@ impl Journal {
         Ok(Self {
             full_privacy: crate::full_privacy::Runtime::default(),
             fingerprint_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+            snapshot_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
             jobs,
             changes,
             secret_key,
@@ -5232,6 +6182,7 @@ fn open_connection(path: &Path, key_check: &[u8; 32]) -> Result<Connection> {
     connection.execute_batch("BEGIN IMMEDIATE;")?;
     connection.execute_batch("CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY,ts INTEGER NOT NULL,mono INTEGER NOT NULL DEFAULT (intercat_mono()),boot TEXT NOT NULL DEFAULT (intercat_boot()),position INTEGER NOT NULL DEFAULT (intercat_position()),track_id TEXT,session_id TEXT,kind TEXT NOT NULL,payload TEXT NOT NULL,source_seq INTEGER REFERENCES events(seq));
     CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,payload TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('prepared','dispatched','complete','superseded')));
+    CREATE INDEX IF NOT EXISTS operation_kinds ON operations(kind,state);
     CREATE TABLE IF NOT EXISTS utterances(id TEXT PRIMARY KEY,text TEXT NOT NULL,created_at INTEGER NOT NULL,target TEXT NOT NULL,selected TEXT,state TEXT NOT NULL,revision INTEGER NOT NULL,decision TEXT,reason TEXT,provisional TEXT,question_id TEXT,question_revision INTEGER,dispatch_command TEXT);
     CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY,record TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS input_attachments(input TEXT NOT NULL REFERENCES utterances(id),attachment TEXT NOT NULL REFERENCES attachments(id),ordinal INTEGER NOT NULL,PRIMARY KEY(input,attachment),UNIQUE(input,ordinal));
@@ -5265,13 +6216,25 @@ fn open_connection(path: &Path, key_check: &[u8; 32]) -> Result<Connection> {
         crate::backup_choices::install(&connection)?;
         crate::backup_apply::install(&connection)?;
         crate::timeline::install(&connection)?;
+        crate::publication_timeline::install(&connection)?;
         crate::history_store::install(&connection)?;
         crate::integration_store::install(&connection)?;
+        crate::integration_record_store::install(&connection)?;
+        crate::replacement_undo_store::install(&connection)?;
+        crate::path_retirement::install(&connection)?;
+        crate::path_restore_store::install(&connection)?;
+        crate::integration_followup::install(&connection)?;
+        crate::commit_group_store::install(&connection)?;
+        crate::push_job_store::install(&connection)?;
+        crate::pull_store::install(&connection)?;
+        crate::comparison_store::install(&connection)?;
         crate::repair_run_store::install(&connection)?;
         crate::secret_store::install(&connection)?;
         crate::secret_input_store::install(&connection)?;
         crate::redirect::install(&connection)?;
         crate::branch::install(&connection)?;
+        crate::continuation::install(&connection)?;
+        crate::worker_hold::install(&connection)?;
         crate::folders::install(&connection)?;
     }
     crate::clip_summary_store::install(&connection)?;
@@ -5301,8 +6264,12 @@ fn open_connection(path: &Path, key_check: &[u8; 32]) -> Result<Connection> {
     crate::lineage_store::install(&connection)?;
     crate::inheritance::install(&connection)?;
     crate::inheritance_apply_store::install(&connection)?;
+    crate::realign_store::install(&connection)?;
+    crate::realign_queue::install(&connection)?;
+    crate::shared_context_store::install(&connection)?;
     crate::plan_files::install(&connection)?;
     crate::inheritance_issue::install(&connection)?;
+    crate::checkpoint_scope::install(&connection)?;
     crate::dependency_references::install(&connection)?;
     crate::inference_store::install(&connection)?;
     crate::routing_index::install(&connection)?;
@@ -5323,6 +6290,7 @@ fn open_connection(path: &Path, key_check: &[u8; 32]) -> Result<Connection> {
     crate::input_readings::recover(&mut connection)?;
     crate::plan_store::recover(&mut connection)?;
     crate::inheritance_apply_store::interrupt(&mut connection)?;
+    crate::realign_queue::interrupt(&mut connection)?;
     connection.execute("UPDATE project_secret_state SET ready=0", [])?;
     Ok(connection)
 }
@@ -5483,10 +6451,23 @@ fn input_value(connection: &Connection, row: InputRow) -> Result<Value> {
     }
     if let Some(track) = value["decision"]["trackId"].as_str() {
         value["workspaceAvailable"] =
-            crate::inheritance_apply_store::available(connection, track, &row.0)?.into();
+            (crate::inheritance_apply_store::available(connection, track, &row.0)?
+                && !crate::realign_store::pending(connection, track)?)
+            .into();
     }
     value["planReply"] =
         crate::plan_feedback::projection(connection, &row.0)?.unwrap_or(Value::Null);
+    if let Some(track) = value["decision"]["trackId"].as_str() {
+        let dispatch = crate::worker_hold::allowed(connection, track, &row.0)?;
+        let fresh = crate::continuation::allowed(connection, track, &row.0)?;
+        let paired = crate::two_ways_store::allowed(connection, &row.0, track)?;
+        value["dispatchRunnable"] = dispatch.into();
+        value["freshRunnable"] = fresh.into();
+        value["twoWaysRunnable"] = paired.into();
+    }
+    value["twoWays"] = serde_json::to_value(crate::two_ways_store::for_input(connection, &row.0)?)?;
+    value["reasoningEffort"] =
+        serde_json::to_value(crate::two_ways_store::effort(connection, &row.0)?)?;
     value["reading"] = crate::input_readings::status(connection, &row.0)?.unwrap_or(Value::Null);
     value["rephrase"] = crate::rephrases::read(connection, &row.0)?.unwrap_or(Value::Null);
     value["reasonReview"] =
@@ -5543,16 +6524,16 @@ fn snapshot(connection: &Connection) -> Result<Value> {
         )?;
     }
     utterances.reverse();
-    let mut stmt = connection.prepare("SELECT id,label,title,status FROM tracks ORDER BY rowid")?;
+    let mut stmt = connection.prepare("SELECT id,label,title,status FROM tracks WHERE id NOT IN (SELECT json_extract(record,'$.trackId') FROM branches WHERE json_extract(record,'$.phase')='cancelled') ORDER BY rowid")?;
     let mut tracks=stmt.query_map([],|r|Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"label":r.get::<_,String>(1)?,"title":crate::privacy::truncate(&r.get::<_,String>(2)?,80),"status":r.get::<_,String>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut stmt = connection.prepare("SELECT record FROM workspaces ORDER BY rowid")?;
-    let workspaces = stmt
+    let mut workspaces = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
         .map(|s| serde_json::from_str::<Value>(&s).map_err(Into::into))
         .collect::<Result<Vec<_>>>()?;
-    let mut stmt = connection.prepare("SELECT record FROM workers ORDER BY rowid")?;
+    let mut stmt = connection.prepare("SELECT record FROM workers WHERE track_id NOT IN (SELECT json_extract(record,'$.trackId') FROM branches WHERE json_extract(record,'$.phase')='cancelled') ORDER BY rowid")?;
     let workers = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -5563,8 +6544,39 @@ fn snapshot(connection: &Connection) -> Result<Value> {
     let proposal = crate::proposals::current(connection)?;
     let plans = crate::plan_store::list(connection)?;
     let dependencies = crate::plan_dependencies::projection(connection, &plans)?;
-    let mut value = serde_json::json!({"trackFolders":crate::folders::track_ids(connection)?,"sessionFolders":crate::folders::sessions(connection)?,"inheritanceIssues":crate::inheritance_issue::snapshot(connection)?,"pendingInheritance":crate::inheritance_apply_store::snapshot(connection)?,"planDependencies":dependencies,"plans":plans,"planAssumptions":crate::plan_assumptions::candidates(connection)?,"proposal":proposal,"editorEntries":crate::editor_log::current(connection)?,"confirmation":crate::confirmation::status(connection)?,"unloggedControls":crate::dispatch_control::unlogged(connection)?,"localResumes":crate::dispatch_control::local_resumes(connection)?,"dispatchPaused":crate::dispatch_control::paused(connection)?,"pickups":crate::pickup::snapshot(connection)?.iter().map(|r|r.status()).collect::<Vec<_>>(),"branches":crate::branch::snapshot(connection)?,"redirects":crate::redirect::snapshot(connection)?,"projectSecrets":crate::project_secrets::status(connection)?,"secretInputs":crate::secret_input_store::snapshot(connection)?,"daemonPid":std::process::id(),"sequence":sequence,"privacy":crate::privacy_policy::state(connection)?,"privacyRevision":crate::secret_store::catalog(connection)?.current.revision.checked_add(crate::privacy_policy::state(connection)?.revision).ok_or("Privacy revision overflow.")?,"integration":crate::integration_store::snapshot(connection)?,"repairRuns":crate::repair_run_store::snapshot(connection)?,"timeline":crate::timeline::snapshot(connection)?,"stops":crate::policy_store::stops(connection)?,"effects":crate::effects::list(connection,None,None)?,"pendingRestores":crate::deletion::pending(connection)?,"editHistory":crate::timeline_history::snapshot(connection)?,"utterances":utterances,"tracks":tracks,"workspaces":workspaces,"workers":workers,"reports":crate::report_store::pending_reports(connection)?,"reportQuestions":crate::report_store::active_questions(connection)?,"assumptions":crate::assumption_store::list(connection,None)?,"workerConfigured":read_setting(connection,"worker")?.is_some(),"project":read_setting(connection,"project")?,"session":read_setting(connection,"session")?});
+    for workspace in &mut workspaces {
+        if let Some(track) = workspace["trackId"].as_str() {
+            workspace["writerClosed"] = crate::continuation::closed(connection, track)?.into();
+        }
+    }
+    let mut value = serde_json::json!({"checkpointIssues":crate::checkpoint_scope::snapshot(connection)?,"trackFolders":crate::folders::track_ids(connection)?,"sessionFolders":crate::folders::sessions(connection)?,"inheritanceIssues":crate::inheritance_issue::snapshot(connection)?,"pendingInheritance":crate::inheritance_apply_store::snapshot(connection)?,"pendingRealignments":crate::realign_store::snapshot(connection)?,"planDependencies":dependencies,"plans":plans,"planAssumptions":crate::plan_assumptions::candidates(connection)?,"proposal":proposal,"editorEntries":crate::editor_log::current(connection)?,"confirmation":crate::confirmation::status(connection)?,"unloggedControls":crate::dispatch_control::unlogged(connection)?,"localResumes":crate::dispatch_control::local_resumes(connection)?,"dispatchPaused":crate::dispatch_control::paused(connection)?,"pickups":crate::pickup::snapshot(connection)?.iter().map(|r|r.status()).collect::<Vec<_>>(),"branches":crate::branch::snapshot(connection)?,"redirects":crate::redirect::snapshot(connection)?,"projectSecrets":crate::project_secrets::status(connection)?,"secretInputs":crate::secret_input_store::snapshot(connection)?,"daemonPid":std::process::id(),"sequence":sequence,"privacy":crate::privacy_policy::state(connection)?,"privacyRevision":crate::secret_store::catalog(connection)?.current.revision.checked_add(crate::privacy_policy::state(connection)?.revision).ok_or("Privacy revision overflow.")?,"integrations":crate::integration_store::snapshot(connection)?,"repairRuns":crate::repair_run_store::snapshot(connection)?,"timeline":crate::timeline::snapshot(connection)?,"stops":crate::policy_store::stops(connection)?,"effects":crate::effects::list(connection,None,None)?,"pendingRestores":crate::deletion::pending(connection)?,"editHistory":crate::timeline_history::snapshot(connection)?,"utterances":utterances,"tracks":tracks,"workspaces":workspaces,"workers":workers,"reports":crate::report_store::pending_reports(connection)?,"reportQuestions":crate::report_store::active_questions(connection)?,"assumptions":crate::assumption_store::list(connection,None)?,"workerConfigured":read_setting(connection,"worker")?.is_some(),"project":read_setting(connection,"project")?,"session":read_setting(connection,"session")?});
+    value["twoWays"] = serde_json::to_value(crate::two_ways_store::list(connection)?)?;
+    value["workerHolds"] = crate::worker_hold::snapshot(connection)?;
+    value["continuations"] = serde_json::to_value(
+        crate::continuation::list(connection)?
+            .iter()
+            .map(crate::continuation::Continuation::status)
+            .collect::<Vec<_>>(),
+    )?;
+    value["freshTracks"] = serde_json::to_value(
+        crate::fresh_store::snapshot(connection)?
+            .iter()
+            .map(crate::fresh::Job::status)
+            .collect::<Vec<_>>(),
+    )?;
+    value["realignments"] = serde_json::to_value(crate::realign_queue::snapshot(connection)?)?;
+    value["pathRetirements"] = serde_json::to_value(crate::path_retirement::snapshot(connection)?)?;
+    value["pathRestores"] = serde_json::to_value(crate::path_restore_store::snapshot(connection)?)?;
+    value["restoreFollowups"] =
+        serde_json::to_value(crate::path_restore_control::snapshot(connection)?)?;
+    value["asideProcessStops"] =
+        serde_json::to_value(crate::aside_processes::snapshot(connection)?)?;
+    value["comparisons"] = serde_json::to_value(crate::comparison_store::snapshot(connection)?)?;
+    value["pullRequests"] = serde_json::to_value(crate::pull_store::snapshot(connection)?)?;
+    value["pushes"] = serde_json::to_value(crate::push_job_store::snapshot(connection)?)?;
+    value["commitGroups"] = crate::commit_group_store::snapshot(connection)?;
     crate::session_parameters::project(connection, &mut value)?;
+    crate::two_ways_presentation::project(connection, &mut value)?;
     value["reviewFixes"] = serde_json::to_value(crate::review_fix_store::projection(connection)?)?;
     value["reviewerLane"] = serde_json::to_value(crate::review_timeline::lane(connection)?)?;
     let blocked: std::collections::HashSet<String> = value["reviewFixes"]
@@ -5591,6 +6603,7 @@ fn reserve_turn(
     revision: i64,
     track: &str,
     params: &Value,
+    paired_model: Option<&crate::two_ways::Variation>,
 ) -> Result<Admission> {
     crate::session_retirement::ensure_open(
         connection,
@@ -5620,9 +6633,19 @@ fn reserve_turn(
     }
     crate::redirect::reserve(&transaction, input, revision, track, &params["sessionId"])?;
     crate::report_store::validate_dispatch(&transaction, input, track)?;
+    crate::two_ways_store::validate_turn(&transaction, input, track, params, paired_model)?;
     crate::project_secrets::validate_dispatch(&transaction, track)?;
     crate::start_condition::validate_dispatch(&transaction, input)?;
-    if crate::inheritance_apply_store::pending(&transaction, track)?.is_some() {
+    if crate::inheritance_apply_store::pending(&transaction, track)?.is_some()
+        || crate::realign_store::pending(&transaction, track)?
+        || crate::realign_queue::holds_work(&transaction, track)?
+        || crate::path_retirement::holds(&transaction, track)?
+        || crate::fresh_store::holds(&transaction, track)?
+        || !crate::two_ways_store::allowed(&transaction, input, track)?
+        || crate::branch::cancelled_track(&transaction, track)?
+        || !crate::worker_hold::allowed(&transaction, track, input)?
+        || !crate::continuation::allowed(&transaction, track, input)?
+    {
         return Err(StartSuperseded.into());
     }
     if crate::plan_store::source(&transaction, input)?
@@ -5634,6 +6657,7 @@ fn reserve_turn(
         transaction.commit()?;
         return Err(StartSuperseded.into());
     }
+    crate::integration_followup::validate_start(&transaction, id, input, track)?;
     crate::plan_execution::admit(&transaction, input)?;
     if !crate::dependency_retry::allowed(&transaction, input)? {
         return Err(StartSuperseded.into());
@@ -5709,6 +6733,7 @@ fn input_execution(
 }
 
 fn retry_worker(connection: &mut Connection, id: &str, track: &str) -> Result<Admission> {
+    crate::continuation::ensure_writer(connection, track)?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     let transaction = connection.transaction()?;
     let payload = serde_json::to_string(&serde_json::json!({"trackId":track}))?;
@@ -5760,6 +6785,7 @@ fn worker_state(connection: &mut Connection, state: &crate::runtime::WorkerState
     Ok(())
 }
 fn record_worker_state(connection: &Connection, state: &crate::runtime::WorkerState) -> Result<()> {
+    crate::continuation::ensure_writer(connection, &state.track_id)?;
     if let Some(session) = &state.session_id {
         crate::session_retirement::ensure_open(connection, session)?;
     }
@@ -5807,6 +6833,7 @@ fn record_worker_state(connection: &Connection, state: &crate::runtime::WorkerSt
     crate::redirect::worker_changed(connection, state)?;
     crate::review_fix_store::observe_worker(connection, state)?;
     crate::review_store::observe(connection, state)?;
+    crate::continuation::observe(connection, state)?;
     Ok(())
 }
 fn stop_lost_worker(
@@ -6284,6 +7311,11 @@ pub(crate) fn insert_utterance(
             transaction.execute("UPDATE utterances SET decision=?2,state=CASE WHEN state='held' THEN state ELSE 'placed' END WHERE id=?1",params![id,decision.to_string()])?;
             crate::review_fix_store::human_input(transaction, id, 1, track)?;
         }
+        if let Some(track) = provisional.as_deref()
+            && crate::branch::cancelled_track(transaction, track)?
+        {
+            crate::branch::orphan_cancelled_inputs(transaction, track)?;
+        }
     }
     read_input(transaction, id)
 }
@@ -6294,7 +7326,7 @@ fn input_candidates(
     target: &Target,
     selected: Option<&str>,
 ) -> Result<crate::routing::Selection> {
-    let mut statement = connection.prepare("SELECT t.id,t.title,t.status,t.label,(SELECT max(u.created_at) FROM utterances u WHERE json_extract(u.decision,'$.trackId')=t.id) FROM tracks t ORDER BY t.rowid")?;
+    let mut statement = connection.prepare("SELECT t.id,t.title,t.status,t.label,(SELECT max(u.created_at) FROM utterances u WHERE json_extract(u.decision,'$.trackId')=t.id) FROM tracks t WHERE t.id NOT IN (SELECT json_extract(record,'$.trackId') FROM branches WHERE json_extract(record,'$.phase')='cancelled') ORDER BY t.rowid")?;
     let tracks = statement
         .query_map([], |r| {
             Ok(crate::routing::Track {
@@ -6491,6 +7523,13 @@ pub(crate) fn apply_outcome(
             )
         }
         Outcome::Classified(mut decision) => {
+            let previous_track = decision.track_id.clone();
+            crate::fresh_words::route(transaction, &mut decision)?;
+            if previous_track != decision.track_id
+                && let Some(track) = &decision.track_id
+            {
+                transaction.execute("UPDATE utterances SET provisional=?2,selected=CASE WHEN selected=?4 THEN ?2 ELSE selected END,target=CASE WHEN json_extract(target,'$.mode')='lock' AND json_extract(target,'$.trackId')=?4 THEN ?3 ELSE target END WHERE id=?1",params![id,track,serde_json::to_string(&Target::Lock(track.clone()))?,previous_track])?;
+            }
             let plan_only_command =
                 decision.kind == Kind::Command && decision.command.as_deref() == Some("plan-only");
             if plan_only_command {
@@ -6509,7 +7548,16 @@ pub(crate) fn apply_outcome(
             }
             let mut state = "placed";
             let mut reason = None;
-            if decision.timed_out {
+            if decision
+                .track_id
+                .as_deref()
+                .map(|track| crate::branch::cancelled_track(transaction, track))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                state = "orphaned";
+                reason = Some(crate::branch::CANCELLED_DESTINATION.into());
+            } else if decision.timed_out {
                 state = "asked";
                 reason = Some("The Editor took too long. Choose where this should go.".into());
             } else if let Some(mut review) = crate::decision_review::read(&decision)? {
@@ -6552,8 +7600,14 @@ pub(crate) fn apply_outcome(
             {
                 reason = crate::app_commands::begin(transaction, id, &mut decision)?;
                 state = if reason.is_some() { "asked" } else { "landed" };
-            } else if crate::app_commands::prepare_presentation(&mut decision)? {
+            } else if crate::app_commands::prepare_presentation(transaction, &mut decision)? {
                 no_turn = true;
+            } else if decision.kind == Kind::Trim
+                && let Some(track) = &decision.track_id
+                && crate::path_retirement::holds(transaction, track)?
+            {
+                state = "held";
+                reason = Some("Held while this path is set aside".into());
             } else if decision.kind == Kind::Trim {
                 if crate::redirect::prepare(
                     transaction,
@@ -6613,6 +7667,30 @@ pub(crate) fn apply_outcome(
     if state == "placed" && !no_turn && crate::dispatch_control::paused(transaction)? {
         state = "held";
         reason = Some("Turns stopped".into());
+    }
+    if state == "placed"
+        && !no_turn
+        && let Some(track) = decision
+            .as_ref()
+            .map(|raw| serde_json::from_str::<Value>(raw))
+            .transpose()?
+            .and_then(|value| value["trackId"].as_str().map(str::to_owned))
+        && crate::path_retirement::holds(transaction, &track)?
+    {
+        state = "held";
+        reason = Some("Held while this path is set aside".into());
+    }
+    if state == "placed"
+        && !no_turn
+        && let Some(track) = decision
+            .as_ref()
+            .map(|raw| serde_json::from_str::<Value>(raw))
+            .transpose()?
+            .and_then(|value| value["trackId"].as_str().map(str::to_owned))
+        && !crate::worker_hold::allowed(transaction, &track, id)?
+    {
+        state = "held";
+        reason = Some("Held after this turn".into());
     }
     transaction.execute(
         "UPDATE utterances SET state=?2,decision=?3,reason=?4 WHERE id=?1",
@@ -6753,17 +7831,21 @@ fn resolve_input(
                 if state == "orphaned" {
                     let (kind, track_id) = match target {
                         Target::Lock(track) => {
-                            if !transaction.query_row(
-                                "SELECT EXISTS(SELECT 1 FROM tracks WHERE id=?1)",
-                                [track],
-                                |row| row.get::<_, bool>(0),
-                            )? {
+                            if crate::branch::cancelled_track(&transaction, track)?
+                                || !transaction.query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM tracks WHERE id=?1)",
+                                    [track],
+                                    |row| row.get::<_, bool>(0),
+                                )?
+                            {
                                 return Err("The chosen track is unavailable.".into());
                             }
                             (Kind::Extend, Some(track.clone()))
                         }
                         Target::New => (Kind::Fork, None),
-                        Target::None => return Err("Choose a destination for this reply.".into()),
+                        Target::None => {
+                            return Err("Choose a destination for this instruction.".into());
+                        }
                     };
                     transaction.execute(
                         "UPDATE utterances SET target=?2,revision=revision+1 WHERE id=?1",
@@ -6826,6 +7908,16 @@ fn resolve_input(
 fn hold_inputs(connection: &mut Connection, id: &str, track: &str, unlogged: bool) -> Result<()> {
     connection.pragma_update(None, "synchronous", "FULL")?;
     let tx = connection.transaction()?;
+    hold_inputs_at(&tx, id, track, unlogged)?;
+    tx.commit()?;
+    Ok(())
+}
+pub(crate) fn hold_inputs_at(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    track: &str,
+    unlogged: bool,
+) -> Result<()> {
     let payload = serde_json::to_string(&serde_json::json!({"trackId":track}))?;
     if let Some((kind, saved)) = tx
         .query_row(
@@ -6848,12 +7940,9 @@ fn hold_inputs(connection: &mut Connection, id: &str, track: &str, unlogged: boo
         return Err("The track is unavailable.".into());
     }
     tx.execute("UPDATE utterances SET state='held',revision=revision+1,reason='Held after this turn' WHERE state IN ('staged','reading','placed','held') AND (json_extract(decision,'$.trackId')=?1 OR (decision IS NULL AND provisional=?1)) AND coalesce(json_extract(decision,'$.kind'),'')<>'park'",[track])?;
-    tx.execute(
-        "INSERT INTO operations VALUES(?1,'worker.hold',?2,'complete')",
-        params![id, payload],
-    )?;
+    crate::worker_hold::record(tx, id, track)?;
     let event = if unlogged {
-        crate::dispatch_control::mark_uncertain(&tx, Some(track))?;
+        crate::dispatch_control::mark_uncertain(tx, Some(track))?;
         serde_json::json!({"trackId":track,"opId":id,"unlogged":true}).to_string()
     } else {
         payload
@@ -6862,7 +7951,6 @@ fn hold_inputs(connection: &mut Connection, id: &str, track: &str, unlogged: boo
         "INSERT INTO events(ts,kind,payload) VALUES(?1,'worker.hold',?2)",
         params![timestamp(), event],
     )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -7019,12 +8107,46 @@ fn intent(connection: &mut Connection, id: &str, kind: &str, payload: &Value) ->
         }
         return Ok(Admission::Replay(state));
     }
+    if (kind == "worker.start" || kind == "deletion.restore" && payload["repairRunId"].is_null())
+        && (crate::fresh_store::holds(
+            &transaction,
+            payload["trackId"].as_str().ok_or("Missing worker track.")?,
+        )? || crate::continuation::closed(
+            &transaction,
+            payload["trackId"].as_str().ok_or("Missing worker track.")?,
+        )?)
+    {
+        return Err("Start fresh holds this worker’s future requests.".into());
+    }
+    if kind == "worker.start" && !matches!(payload["scope"].as_str(), Some("worker" | "input")) {
+        return Err("Choose the worker or input start scope.".into());
+    }
     transaction.execute(
         "INSERT INTO operations VALUES(?1,?2,?3,'prepared')",
         params![id, kind, json],
     )?;
+    if kind == "two-ways.initial" {
+        let intent: crate::two_ways_initial::Intent = serde_json::from_value(payload.clone())?;
+        crate::two_ways_store::validate_initial_intent(&transaction, &intent)?;
+        crate::lineage_store::reserve(&transaction, id, &intent.track_id, &intent.snapshot.sha)?;
+    }
     if kind == "checkpoint.save" {
-        crate::lineage_store::reserve(&transaction, id, payload)?;
+        crate::continuation::ensure_writer(
+            &transaction,
+            payload["trackId"]
+                .as_str()
+                .ok_or("Missing checkpoint track.")?,
+        )?;
+        crate::lineage_store::reserve(
+            &transaction,
+            id,
+            payload["trackId"]
+                .as_str()
+                .ok_or("Missing checkpoint track.")?,
+            payload["checkpoint"]["sha"]
+                .as_str()
+                .ok_or("Missing checkpoint tree.")?,
+        )?;
     }
     transaction.execute(
         "INSERT INTO events(ts,kind,payload) VALUES(?1,?2,?3)",
@@ -7091,6 +8213,65 @@ fn finish(connection: &mut Connection, id: &str, state: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_queued_transfer_keeps_its_ownership_permit_after_its_caller_is_cancelled()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("journal.sqlite");
+        let journal = Journal::open(&path, crate::secrets::Key::new([7; 32])).await?;
+        let db = Connection::open(&path)?;
+        db.execute_batch("BEGIN IMMEDIATE")?;
+        let saved = journal.clone();
+        let blocked = tokio::spawn(async move {
+            saved
+                .append("own.blocked-write", serde_json::json!({}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if journal.jobs.capacity() == journal.jobs.max_capacity() && !blocked.is_finished()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        let capacity = journal.jobs.capacity();
+        let saved = journal.clone();
+        let caller = tokio::spawn(async move {
+            saved
+                .fresh(crate::fresh::Change::Transfer {
+                    id: uuid::Uuid::now_v7(),
+                    revision: 1,
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while journal.jobs.capacity() >= capacity {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let retained = journal.snapshot_gate.try_read().is_err();
+        db.execute_batch("COMMIT")?;
+        blocked.await??;
+        let released = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            journal.snapshot_gate.read(),
+        )
+        .await?;
+        drop(released);
+        assert!(
+            retained,
+            "A queued journal operation must own its write permit"
+        );
+        journal.snapshot().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn reference_screening_holds_fingerprints_without_holding_stop_or_snapshot() -> Result<()>
@@ -7228,6 +8409,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+        journal.append("integration.published",serde_json::json!({"id":uuid::Uuid::now_v7(),"revision":2,"status":"done","fixes":{&track:["caller.txt"]},"candidate":{"head":"a".repeat(40),"commits":[{"track":track}]}})).await?;
         let operation = uuid::Uuid::now_v7();
         let params = serde_json::json!({"commandId":operation,"sessionId":"s","input":[{"type":"skill","source":"user","selector":"intercat-report","arguments":"Explain the change"}]});
         let prepared = journal
@@ -7235,6 +8417,8 @@ mod tests {
             .await?;
         let text = prepared.params()["input"][0]["arguments"].as_str().unwrap();
         assert!(!text.contains(secret));
+        assert!(text.contains("Integration updated your committed contribution"));
+        assert!(text.contains("caller.txt"));
         assert!(text.contains("Explain the change"));
         assert!(text.contains("Keep this rule."));
         assert!(text.contains("Preserve the final constraint."));
@@ -7246,7 +8430,8 @@ mod tests {
                     id.to_string(),
                     1,
                     track,
-                    prepared.params().clone()
+                    prepared.params().clone(),
+                    None,
                 )
                 .await?,
             Admission::New

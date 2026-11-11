@@ -24,6 +24,9 @@ export interface PlanDependency { id: string; trackId: string; clipId: string | 
 export interface PlannedTurn { reviewFix?: boolean; id: string; label: string; after: string; planId?: string; dependencies?: PlanDependency[]; blocked?: boolean }
 export interface RepairLane { id: string; status: TrackStatus; canStop: boolean; clips: Clip[] }
 export interface Track {
+  ghost?: {id:string;phase:import('../restore/types').Retirement['phase'];error:string|null};
+  integrationFailed?: boolean;
+  branchContext?: string;
   reviewer?: boolean;
   reviewJobs?: {id:string;revision:number;state:'queued'|'running'}[];
   reviewRows?: number;
@@ -80,17 +83,18 @@ export const LABEL_WIDTH = 180;
 export const TOP_HEIGHT = 112;
 export const ROW_HEIGHT = 76;
 export const REPAIR_ROW_HEIGHT = 26;
+export function trackRowHeight(track:Track) {return track.ghost?26:ROW_HEIGHT+Math.max(0,(track.reviewRows??1)-1)*40;}
 
 export function trackLayout(tracks: Track[]) {
   let top = TOP_HEIGHT;
   return tracks.map(track => {
-    const row = { track, top, repairs: track.repairs.map((repair, index) => ({ repair, top: top + ROW_HEIGHT + index * REPAIR_ROW_HEIGHT })) };
-    top += ROW_HEIGHT + Math.max(0,(track.reviewRows ?? 1)-1)*40 + track.repairs.length * REPAIR_ROW_HEIGHT;
+    const row = { track, top, repairs: track.repairs.map((repair, index) => ({ repair, top: top + trackRowHeight(track) + index * REPAIR_ROW_HEIGHT })) };
+    top += trackRowHeight(track) + track.repairs.length * REPAIR_ROW_HEIGHT;
     return row;
   });
 }
 export function timelineHeight(tracks: Track[]) {
-  return TOP_HEIGHT + tracks.reduce((sum, track) => sum + ROW_HEIGHT + Math.max(0,(track.reviewRows ?? 1)-1)*40 + track.repairs.length * REPAIR_ROW_HEIGHT, 0);
+  return TOP_HEIGHT + tracks.reduce((sum, track) => sum + trackRowHeight(track) + track.repairs.length * REPAIR_ROW_HEIGHT, 0);
 }
 
 export function cutPlannedTurn(tracks: Track[], id: string): Track[] {

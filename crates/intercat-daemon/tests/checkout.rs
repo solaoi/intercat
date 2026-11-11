@@ -6,6 +6,60 @@ use intercat_git::{ObjectId, Repository, WorktreeSource};
 use std::{ffi::OsString, fs, net::TcpListener, path::Path, process::Command, time::Duration};
 use tokio::sync::watch;
 
+fn lfs_tool() -> Result<std::path::PathBuf> {
+    // A fixture uses only our explicitly installed test tool, never a user's
+    // system LFS installation or configuration.
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.tools/git-lfs-3.8.1/git-lfs")
+        .canonicalize()?)
+}
+
+fn lfs_pointer(bytes: &[u8]) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let oid = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let pointer = format!(
+        "version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n",
+        bytes.len()
+    );
+    (oid, pointer)
+}
+
+fn lfs_object(root: &Path, oid: &str, bytes: &[u8]) -> Result<std::path::PathBuf> {
+    let path = root
+        .join("objects")
+        .join(&oid[..2])
+        .join(&oid[2..4])
+        .join(oid);
+    fs::create_dir_all(path.parent().unwrap())?;
+    fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+fn configure_lfs(f: &Fixture) -> Result<std::path::PathBuf> {
+    let tool = lfs_tool()?;
+    fs::write(
+        f.source.common_dir.join("info/attributes"),
+        "*.lfs filter=lfs -text\n",
+    )?;
+    for (key, command) in [
+        ("filter.lfs.clean", "clean -- %f"),
+        ("filter.lfs.smudge", "smudge -- %f"),
+        ("filter.lfs.process", "filter-process"),
+    ] {
+        let command = format!("'{}' {command}", tool.display());
+        git(&f.source.root, &["config", key, &command]);
+    }
+    git(&f.source.root, &["config", "filter.lfs.required", "true"]);
+    git(
+        &f.source.root,
+        &["config", "lfs.storage", "../../lfs-cache"],
+    );
+    Ok(f.root.path().canonicalize()?.join("lfs-cache"))
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("/usr/bin/git")
         .current_dir(dir)
@@ -214,6 +268,245 @@ async fn clones_only_the_frozen_revision_and_never_shares_objects_or_original_fi
         )
         .await?;
     assert!(!unreadable.success());
+    f.unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lfs_materializes_only_current_payload_and_returns_check_changes_before_import()
+-> Result<()> {
+    let f = Fixture::new()?;
+    let storage = configure_lfs(&f)?;
+    let bytes = b"agent-created current LFS text\n";
+    let history = b"agent-created historical LFS text\n";
+    let (oid, pointer) = lfs_pointer(bytes);
+    let (old_oid, _) = lfs_pointer(history);
+    let original = lfs_object(&storage, &oid, bytes)?;
+    let historical = lfs_object(&storage, &old_oid, history)?;
+    let repo = Repository::open(&f.source.root)?;
+    let tree = repo.write_tree(&[("asset.lfs", repo.write_blob(pointer.as_bytes())?)])?;
+    let config = Configuration::capture(&f.source)?;
+    assert_eq!(config.lfs_directory, storage);
+    let checkout = Checkout::create(
+        &f.root.path().join("lfs-job"),
+        f.source.clone(),
+        f.head,
+        config,
+        OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"),
+        vec![lfs_tool()?.parent().unwrap().to_path_buf()],
+        no_cancel(),
+    )
+    .await?;
+    checkout.deploy(tree, no_cancel()).await?;
+    assert_eq!(fs::read(checkout.workdir.join("asset.lfs"))?, bytes);
+    let own = checkout.workdir.join(".git/lfs");
+    assert!(
+        !own.join("objects")
+            .join(&old_oid[..2])
+            .join(&old_oid[2..4])
+            .join(&old_oid)
+            .exists()
+    );
+    let old_blob = git(&f.source.root, &["rev-parse", "HEAD~:old-secret.txt"]);
+    let probe = format!(
+        "! cat '{}' >/dev/null 2>&1 && ! git cat-file -e '{old_blob}' 2>/dev/null && ! cat '{}' >/dev/null 2>&1",
+        historical.display(),
+        original.display(),
+    );
+    let output = checkout
+        .run_check(
+            &probe,
+            &Default::default(),
+            no_cancel(),
+            Duration::from_secs(20),
+        )
+        .await?;
+    assert!(output.success(), "{output:?}");
+    let changed = b"agent-created modified LFS text\n";
+    fs::write(checkout.workdir.join("asset.lfs"), changed)?;
+    checkout.stage(f.head, no_cancel()).await?;
+    let output = checkout
+        .git(
+            &[
+                "-c".into(),
+                "user.name=Fixture".into(),
+                "-c".into(),
+                "user.email=fixture@example.invalid".into(),
+                "commit".into(),
+                "-qm".into(),
+                "dummy LFS change".into(),
+            ],
+            true,
+            no_cancel(),
+        )
+        .await?;
+    assert!(output.success(), "{output:?}");
+    let commit = Repository::open(&checkout.workdir)?.head_commit()?;
+    checkout.import_commit(commit)?;
+    let (new_oid, _) = lfs_pointer(changed);
+    let transferred = storage
+        .join("objects")
+        .join(&new_oid[..2])
+        .join(&new_oid[2..4])
+        .join(new_oid);
+    assert_eq!(fs::read(transferred)?, changed);
+    assert_eq!(fs::read(original)?, bytes);
+    assert_eq!(
+        repo.commit_details(commit)?.tree,
+        Repository::open(&checkout.workdir)?
+            .commit_details(commit)?
+            .tree
+    );
+    f.unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn absent_lfs_payload_stops_deploy_before_filter_execution() -> Result<()> {
+    let f = Fixture::new()?;
+    let storage = configure_lfs(&f)?;
+    let (_, pointer) = lfs_pointer(b"agent-created absent data\n");
+    let repo = Repository::open(&f.source.root)?;
+    let tree = repo.write_tree(&[("missing.lfs", repo.write_blob(pointer.as_bytes())?)])?;
+    let checkout = Checkout::create(
+        &f.root.path().join("missing-lfs-job"),
+        f.source.clone(),
+        f.head,
+        Configuration::capture(&f.source)?,
+        OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"),
+        vec![lfs_tool()?.parent().unwrap().to_path_buf()],
+        no_cancel(),
+    )
+    .await?;
+    let error = checkout.deploy(tree, no_cancel()).await.unwrap_err();
+    assert!(
+        matches!(error.downcast_ref(), Some(intercat_daemon::lfs_store::Problem::Missing { path }) if path == "missing.lfs")
+    );
+    assert!(!checkout.workdir.join("missing.lfs").exists());
+    assert!(
+        !storage.exists(),
+        "missing source storage must never be created"
+    );
+    f.unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn copied_check_generation_rebinds_metadata_and_old_code_cannot_write_into_it() -> Result<()>
+{
+    let f = Fixture::new()?;
+    let mut configuration = Configuration::capture(&f.source)?;
+    configuration.attributes = Some(b"*.txt text\n".to_vec());
+    let old = f.checkout(configuration).await?;
+    old.deploy(
+        Repository::open(&f.source.root)?.tree_id(f.head)?,
+        no_cancel(),
+    )
+    .await?;
+    fs::write(
+        old.workdir.join("generated.txt"),
+        b"dummy previous generation\n",
+    )?;
+    let next = old.next_check(f.head, no_cancel()).await?;
+    assert_ne!(old.root, next.root);
+    assert_eq!(
+        fs::read(next.workdir.join("generated.txt"))?,
+        b"dummy previous generation\n"
+    );
+    next.ensure_attachments()?;
+    let attributes = git(&next.workdir, &["config", "--get", "core.attributesFile"]);
+    assert_eq!(Path::new(&attributes), next.root.join("control/attributes"));
+    assert_eq!(fs::read(attributes)?, b"*.txt text\n");
+    assert_eq!(
+        Path::new(&git(&next.workdir, &["config", "--get", "lfs.storage"])),
+        next.workdir.join(".git/lfs")
+    );
+    for directory in [&next.workdir, &next.temporary] {
+        let intrusion = directory.join("old-process-write");
+        let script = format!("printf dummy > '{}'", intrusion.display());
+        let result = old
+            .run_check(
+                &script,
+                &Default::default(),
+                no_cancel(),
+                Duration::from_secs(20),
+            )
+            .await?;
+        assert!(!result.success());
+        assert!(!intrusion.exists());
+    }
+    fs::write(
+        old.workdir.join("generated.txt"),
+        b"dummy changed old generation\n",
+    )?;
+    assert_eq!(
+        fs::read(next.workdir.join("generated.txt"))?,
+        b"dummy previous generation\n"
+    );
+    fs::write(
+        next.workdir.join("generated.txt"),
+        b"dummy changed new generation\n",
+    )?;
+    assert_eq!(
+        fs::read(old.workdir.join("generated.txt"))?,
+        b"dummy changed old generation\n"
+    );
+    f.unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn original_alternate_objects_remain_denied_inside_an_allowed_toolchain_directory()
+-> Result<()> {
+    let f = Fixture::new()?;
+    let tools = f.root.path().join("dummy-shared-tools");
+    fs::create_dir(&tools)?;
+    let alternate = tools.join("object-pool.git");
+    fs::create_dir(&alternate)?;
+    Repository::init_isolated(&alternate)?;
+    let alternate = alternate.canonicalize()?;
+    let oid =
+        Repository::open(&alternate)?.write_blob(b"agent-created history-only alternate object")?;
+    fs::create_dir_all(f.source.common_dir.join("objects/info"))?;
+    fs::write(
+        f.source.common_dir.join("objects/info/alternates"),
+        format!("{}\n", alternate.join("objects").display()),
+    )?;
+    let configuration = Configuration::capture(&f.source)?;
+    assert!(
+        configuration
+            .object_directories
+            .contains(&alternate.join("objects"))
+    );
+    let checkout = Checkout::create(
+        &f.root.path().join("alternate-job"),
+        f.source.clone(),
+        f.head,
+        configuration,
+        OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"),
+        vec![tools],
+        no_cancel(),
+    )
+    .await?;
+    let object = oid.to_string();
+    let loose = alternate
+        .join("objects")
+        .join(&object[..2])
+        .join(&object[2..]);
+    let script = format!(
+        "! cat '{}' >/dev/null 2>&1 && ! git --git-dir='{}' cat-file blob '{oid}' >/dev/null 2>&1",
+        loose.display(),
+        alternate.display()
+    );
+    let result = checkout
+        .run_check(
+            &script,
+            &Default::default(),
+            no_cancel(),
+            Duration::from_secs(20),
+        )
+        .await?;
+    assert!(result.success(), "{result:?}");
     f.unchanged()?;
     Ok(())
 }
@@ -629,5 +922,80 @@ async fn runs_npm_test_with_the_selected_node_toolchain_inside_the_isolated_chec
     );
     assert!(String::from_utf8(result.stdout)?.contains("isolated npm check passed"));
     f.unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn check_history_is_explicit_and_turning_it_off_removes_historical_objects() -> Result<()> {
+    let f = Fixture::new()?;
+    fs::write(
+        f.source.root.join("removed.env"),
+        "DUMMY_REMOVED_VALUE=own-fixture-only\n",
+    )?;
+    git(&f.source.root, &["add", "."]);
+    git(&f.source.root, &["commit", "-m", "dummy historical file"]);
+    let old = git(&f.source.root, &["rev-parse", "HEAD:removed.env"]);
+    git(&f.source.root, &["tag", "old-blob", &old]);
+    fs::remove_file(f.source.root.join("removed.env"))?;
+    git(&f.source.root, &["add", "-A"]);
+    git(&f.source.root, &["commit", "-m", "remove dummy file"]);
+    let head: ObjectId = git(&f.source.root, &["rev-parse", "HEAD"]).parse()?;
+    git(&f.source.root, &["tag", "current"]);
+    let source = Repository::worktree_source(&f.source.root, None)?;
+    let checkout = Checkout::create(
+        &f.root.path().join("history"),
+        source.clone(),
+        head,
+        Configuration::capture(&source)?,
+        OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"),
+        vec![],
+        no_cancel(),
+    )
+    .await?;
+    checkout
+        .deploy(
+            Repository::open(&checkout.workdir)?.tree_id(head)?,
+            no_cancel(),
+        )
+        .await?;
+    assert!(
+        !checkout
+            .run_check(
+                &format!("git cat-file -e {old}"),
+                &Default::default(),
+                no_cancel(),
+                Duration::from_secs(5)
+            )
+            .await?
+            .success()
+    );
+    checkout.set_history(true, head, no_cancel()).await?;
+    let output = checkout
+        .run_check(
+            &format!("git describe --tags && git cat-file blob {old}"),
+            &Default::default(),
+            no_cancel(),
+            Duration::from_secs(5),
+        )
+        .await?;
+    assert!(
+        output.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("own-fixture-only"));
+    let next = checkout.next_check(head, no_cancel()).await?;
+    next.set_history(false, head, no_cancel()).await?;
+    let output = next
+        .run_check(
+            &format!("git cat-file -e {old}"),
+            &Default::default(),
+            no_cancel(),
+            Duration::from_secs(5),
+        )
+        .await?;
+    assert!(!output.success());
+    assert_eq!(Repository::open(&next.workdir)?.head_commit()?, head);
+    assert!(next.workdir.join(".git/shallow").is_file());
     Ok(())
 }

@@ -4,6 +4,25 @@ import { queuedTracks } from '../scheduling';
 import { addPlans } from '../plans/timeline';
 import type { DaemonStatus, TimelineClip } from '../bridge';
 import type { Track, Clip, RepairLane } from './model';
+import { branchContext } from './branchPointLayout';
+
+function branchOrder(status: DaemonStatus) {
+  const tracks = status.tracks ?? [];
+  const parents = new Map(status.branches?.map(branch => [branch.trackId, branch.request.parentTrackId]));
+  for (const link of status.continuations ?? []) parents.set(link.successor, link.source);
+  const ids = new Set(tracks.map(track => track.id));
+  const children = Map.groupBy(tracks, track => { const parent = parents.get(track.id); return parent && ids.has(parent) ? parent : ''; });
+  const ordered: typeof tracks = [];
+  const visited = new Set<string>();
+  const append = (track: typeof tracks[number]) => {
+    if (visited.has(track.id)) return;
+    visited.add(track.id); ordered.push(track);
+    for (const child of children.get(track.id) ?? []) append(child);
+  };
+  for (const track of children.get('') ?? []) append(track);
+  for (const track of tracks) append(track);
+  return ordered;
+}
 
 interface Clips { work: Clip[]; repairs: Map<string, Clip[]> }
 const indexed = new WeakMap<TimelineClip[], Map<string, Clips>>();
@@ -29,33 +48,45 @@ const EMPTY_CLIPS: Clip[] = [];
 export function liveTimeline(status: DaemonStatus, source: TimelineClip[]): Track[] {
   const queued = queuedTracks(status);
   const colors = [0x819af5, 0x70b8ab, 0xb497cf, 0xd3ac72];
+  const colorsById = new Map(status.tracks?.map((track, index) => [track.id, colors[index % colors.length]]));
   const clips = groupClips(source);
   const workers = new Map(status.workers?.map(worker => [worker.trackId, worker]));
   const ready = new Set(status.workspaces?.filter(workspace => workspace.state === 'ready').map(workspace => workspace.trackId));
   const runs = Map.groupBy(status.repairRuns ?? [], run => run.track);
+  const failureOwners = new Set((status.integrations??[]).flatMap(integration=>{
+    const run=status.repairRuns?.find(run=>run.owner.kind==='commit'&&run.owner.id===integration.id&&!['done','discarded'].includes(run.phase));
+    const resolving=run&&['queued','preparing','running','stopping','captured','applying'].includes(run.phase);
+    return integration.status==='failed'&&!resolving?[run?.track??integration.candidate?.failedTrack]:[];
+  }));
   const words = Map.groupBy(status.utterances?.filter(word => (word.state === 'placed' || word.state === 'held' && word.reviewFix && word.reviewFixRunnable) && (!word.planItemId || word.planContinuation)) ?? [], word => word.decision?.trackId);
   const questions = Map.groupBy(status.reportQuestions ?? [], question => question.trackId);
   const plannedTracks = new Set(status.plans?.flatMap(plan => plan.items.filter(item => item.state === 'planned' || item.state === 'editing').map(item => item.trackRef)) ?? []);
-  const tracks = addPlans((status.tracks ?? []).filter(track => track.status !== 'planned' || plannedTracks.has(track.id) || workers.has(track.id) || clips.has(track.id) || words.has(track.id) || runs.has(track.id)).map((track, index) => {
+  const tracks = addPlans(branchOrder(status).filter(track => track.status !== 'planned' || plannedTracks.has(track.id) || workers.has(track.id) || clips.has(track.id) || words.has(track.id) || runs.has(track.id)).map(track => {
     const group = clips.get(track.id);
     const repairRuns = runs.get(track.id) ?? [];
     const worker = workers.get(track.id);
+    const retirement=status.pathRetirements?.find(entry=>entry.track===track.id&&entry.kind==='aside'&&entry.phase!=='released');
+    const branch = status.branches?.find(branch => branch.trackId === track.id);
+    const continuation = status.continuations?.find(link => link.successor === track.id);
     const waitingForAnswer = questions.get(track.id) ?? [];
     const working = worker?.phase === 'working';
     const ids = new Set([...repairRuns.filter(run => run.phase !== 'discarded' || group?.repairs.has(run.id)).map(run => run.id), ...(group?.repairs.keys() ?? [])]);
     const repairs: RepairLane[] = [...ids].map(id => {
       const run = repairRuns.find(run => run.id === id);
       const working = run && ['queued', 'preparing', 'running', 'stopping', 'captured', 'applying'].includes(run.phase);
-      const waiting = run && (['held', 'failed', 'needs-recovery'].includes(run.phase) || run.approvals.length > 0 || run.prompts.length > 0);
+      const waiting = run && (['held', 'manual', 'failed', 'needs-recovery'].includes(run.phase) || run.approvals.length > 0 || run.prompts.length > 0);
       return { id, status: waiting ? 'waiting' : working ? 'working' : 'done', canStop: !!run && ['queued', 'preparing', 'running'].includes(run.phase), clips: group?.repairs.get(id) ?? EMPTY_CLIPS };
     });
     return {
       id: track.id, label: track.label, title: track.title,
+      ghost:retirement?{id:retirement.id,phase:retirement.phase,error:retirement.error}:undefined,
+      integrationFailed: failureOwners.has(track.id) || !!status.realignments?.some(job=>job.request.trackId===track.id&&['failed','held'].includes(job.phase)),
+      branchContext: continuation ? `${branchContext(continuation.origin, status.tracks?.find(track => track.id === continuation.source)?.label ?? 'the source')} · summarized` : branch ? branchContext(branch.origin, status.tracks?.find(track => track.id === branch.request.parentTrackId)?.label ?? 'the source') : undefined,
       completion: track.completion,
       waitingForMemory: waitingForMemory(status, track.id),
       queuePosition: worker?.activeTurn ? undefined : queued.get(track.id),
       folder: status.project ? `${status.project.folders.find(folder => folder.id === status.trackFolders?.[track.id])?.name ?? 'Choose a folder'}${ready.has(track.id) ? '' : ' · preparing'}` : 'awaiting project',
-      status: working ? 'working' : queued.has(track.id) ? 'waiting' : waitingForAnswer.length ? 'stopped' : track.status === 'done' ? 'done' : track.status === 'stopped' ? 'stopped' : 'waiting', color: colors[index % colors.length],
+      status: working ? 'working' : queued.has(track.id) ? 'waiting' : waitingForAnswer.length ? 'stopped' : track.status === 'done' ? 'done' : track.status === 'stopped' ? 'stopped' : 'waiting', color: retirement?0x858995:colorsById.get(track.id)!,
       nextWaitsForAnswer: working && !!worker?.activeTurn && waitingForAnswer.some(question => question.askedBeforeLastMessage),
       clips: group?.work ?? EMPTY_CLIPS, repairs,
       planned: (words.get(track.id) ?? []).toSorted((a,b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)).map(word => ({ id: word.id, reviewFix: !!word.reviewFix, label: word.reviewFix ? `fix: ${word.reviewFix.path}` : word.planContinuation ? `About ${word.planContinuation.title}` : word.text, after: word.state === 'held' ? 'held · Start' : word.startCondition?.source && !word.startCondition.ready ? word.startCondition.detail ? `held · ${word.startCondition.detail}` : `after ${waitSourceLabel(word.startCondition.source)}` : word.decision?.boundary === 'when-told' ? 'when you say start' : word.decision?.boundary === 'after-turn' || workers.get(track.id)?.activeTurn ? 'after this turn' : waitingForMemory(status, track.id) ? 'queued · waiting for memory' : 'ready · waiting for worker' })),

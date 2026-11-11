@@ -17,6 +17,8 @@ pub enum Action {
     Later,
     KeepPlan,
     ParallelPlan,
+    Realign,
+    OpenPr,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -134,6 +136,8 @@ fn candidates(db: &Connection) -> Result<Vec<Value>> {
     let quiet = crate::quiet_proposals::candidates(db, &proposals)?;
     proposals.extend(quiet);
     proposals.extend(crate::plan_conflicts::candidates(db)?);
+    proposals.extend(crate::integration_followup::candidates(db)?);
+    proposals.extend(crate::publication_followup::candidates(db)?);
     proposals.sort_by_key(|value| {
         (
             value["kind"] != "work-overlap",
@@ -187,6 +191,10 @@ pub(crate) fn respond(db: &mut Connection, command: &Command) -> Result<Value> {
     }
     let result = if proposal["kind"] == "plan-conflict" {
         crate::plan_conflicts::respond(&tx, &proposal, &command.action)?
+    } else if proposal["kind"] == "integration-fix" {
+        crate::integration_followup::respond(&tx, &proposal, &command.action)?
+    } else if proposal["kind"] == "publication" {
+        crate::publication_followup::respond(&tx, &proposal, &command.action)?
     } else {
         let track = proposal["trackId"].as_str().unwrap();
         let mut result = json!({"proposalId":command.proposal_id,"action":command.action,"trackId":track,"source":proposal["source"]});
@@ -246,7 +254,7 @@ pub(crate) fn respond(db: &mut Connection, command: &Command) -> Result<Value> {
                     timed_out: false,
                     scores: json!({}),
                 };
-                crate::app_commands::prepare_presentation(&mut decision)?;
+                crate::app_commands::prepare_presentation(&tx, &mut decision)?;
                 if proposal["kind"] == "work-overlap" {
                     decision.scores["presentation"]["commitTracks"] =
                         proposal["source"]["trackIds"].clone();
@@ -256,7 +264,7 @@ pub(crate) fn respond(db: &mut Connection, command: &Command) -> Result<Value> {
                 result["inputId"] = input.into();
             }
             Action::Later => {}
-            Action::KeepPlan | Action::ParallelPlan => {
+            Action::KeepPlan | Action::ParallelPlan | Action::Realign | Action::OpenPr => {
                 return Err("This is not a plan conflict.".into());
             }
         }

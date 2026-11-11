@@ -97,6 +97,7 @@ async fn reserve(journal: &Journal, word: &Value) -> Result<Admission> {
             word["revision"].as_i64().unwrap(),
             word["decision"]["trackId"].as_str().unwrap().into(),
             json!({"commandId":op,"sessionId":"new-worker","input":[]}),
+            None,
         )
         .await
 }

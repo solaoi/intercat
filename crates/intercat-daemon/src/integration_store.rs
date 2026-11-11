@@ -15,7 +15,7 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE integration_jobs(id TEXT PRIMARY KEY,session TEXT NOT NULL,active INTEGER NOT NULL,record TEXT NOT NULL);
     CREATE TABLE integration_settings(job TEXT NOT NULL,revision INTEGER NOT NULL,record TEXT NOT NULL,PRIMARY KEY(job,revision));
     CREATE TABLE integration_counts(track TEXT PRIMARY KEY,count INTEGER NOT NULL);
-    CREATE UNIQUE INDEX one_active_integration ON integration_jobs(session) WHERE active=1;")?;
+    CREATE UNIQUE INDEX one_active_integration_per_folder ON integration_jobs(session,json_extract(record,'$.project.id')) WHERE active=1;")?;
     Ok(())
 }
 
@@ -31,7 +31,20 @@ pub(crate) fn read(db: &Connection, id: Uuid) -> Result<Job> {
     job.assumptions_changed = !crate::integration_assumptions::current(db, &job)?;
     (job.assumptions_pending, job.assumptions_failed) =
         crate::integration_assumptions::unfinished(db, &job)?;
+    job.path_state = Some(crate::replacement_review_store::evaluate(db, &job)?);
+    job.retirements = crate::path_retirement::snapshot(db)?
+        .into_iter()
+        .filter(|entry| entry.session == job.session_id && entry.folder == job.project.id)
+        .collect();
     Ok(job)
+}
+pub(crate) fn active_for_folder(
+    db: &Connection,
+    session: &str,
+    folder: &str,
+) -> Result<Option<Job>> {
+    let id:Option<String>=db.query_row("SELECT id FROM integration_jobs WHERE session=?1 AND json_extract(record,'$.project.id')=?2 AND active=1",params![session,folder],|row|row.get(0)).optional()?;
+    id.map(|id| read(db, Uuid::parse_str(&id)?)).transpose()
 }
 fn setting(db: &Connection, key: &str) -> Result<Value> {
     let value: String = db.query_row("SELECT value FROM settings WHERE key=?1", [key], |row| {
@@ -47,6 +60,25 @@ fn checkpoint_count(db: &Connection, track: &str) -> Result<u64> {
     let count: i64 = db.query_row("SELECT count(*) FROM operations WHERE kind='checkpoint.save' AND state='complete' AND json_extract(payload,'$.trackId')=?1", [track], |r| r.get(0))?;
     Ok(count.try_into()?)
 }
+fn requested_folder(
+    db: &Connection,
+    selected: Option<&[String]>,
+) -> Result<crate::project::Folder> {
+    let configured: Project = serde_json::from_value(setting(db, "project")?)?;
+    let folder = if let Some(first) = selected.and_then(|tracks| tracks.first()) {
+        crate::folders::track(db, first)?
+    } else {
+        configured.only_folder()?.clone()
+    };
+    if let Some(tracks) = selected {
+        for track in tracks {
+            if crate::folders::track(db, track)?.id != folder.id {
+                return Err("Choose tracks from one folder for this review.".into());
+            }
+        }
+    }
+    Ok(folder)
+}
 fn capture(
     db: &Connection,
     id: Uuid,
@@ -60,15 +92,16 @@ fn capture(
     let configured: Project = serde_json::from_value(setting(db, "project")?)?;
     let project = if let Some(previous) = previous {
         configured.folder(&previous.project.id())?.clone()
-    } else if let Some(id) = selected.and_then(|tracks| tracks.first()) {
-        crate::folders::track(db, id)?
     } else {
-        configured.only_folder()?.clone()
+        requested_folder(db, selected)?
     };
     let session_id = session["id"]
         .as_str()
         .ok_or("Missing session ID.")?
         .to_string();
+    if crate::path_restore_store::owns_folder(db, &session_id, &project.id)? {
+        return Err("Finish Restore before reviewing this folder's Commit.".into());
+    }
     if previous.is_some_and(|previous| {
         previous.session_id != session_id
             || previous.project.root != project.root
@@ -105,6 +138,9 @@ fn capture(
             continue;
         }
         let workspace: Workspace = serde_json::from_str(&workspace)?;
+        if workspace.reference != format!("refs/intercat/{slug}/tracks/{label}") {
+            continue;
+        }
         if workspace.state != "ready" {
             continue;
         }
@@ -117,9 +153,9 @@ fn capture(
             return Err("Invalid track label.".into());
         }
         let applying:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE kind='workspace.apply-inheritance' AND state<>'complete' AND json_extract(payload,'$.dependencies.track')=?1)",[&track_id],|row|row.get(0))?;
-        if applying {
+        if applying || crate::realign_store::pending(db, &track_id)? {
             return Err(
-                format!("Finish {label}’s inherited file update before opening Commit.").into(),
+                format!("Finish {label}’s saved file update before opening Commit.").into(),
             );
         }
         // A completed operation is authoritative even if the worker-state
@@ -136,7 +172,9 @@ fn capture(
             Some(checkpoint) => db.query_row("SELECT max(ordinal) FROM timeline_clips WHERE track=?1 AND json_extract(record,'$.turnId')=?2 AND json_extract(record,'$.category')='step'", params![track_id, checkpoint.turn_id.to_string()], |row| row.get(0))?,
             None => None,
         };
-        let included = checkpoint.is_some()
+        let included = !crate::continuation::closed(db, &track_id)?
+            && checkpoint.is_some()
+            && !crate::path_retirement::holds(db, &track_id)?
             && match selected {
                 Some(ids) => ids.contains(&track_id),
                 None => previous
@@ -187,6 +225,16 @@ fn capture(
                 .unwrap_or(usize::MAX)
         });
     }
+    let lineage = crate::lineage_store::freeze(db)?.for_tracks(
+        tracks
+            .iter()
+            .flat_map(|track| {
+                std::iter::once(track.id.clone())
+                    .chain(track.basis.base_inherits.keys().cloned())
+                    .chain(track.basis.inherits.keys().cloned())
+            })
+            .collect(),
+    );
     let mut job = Job {
         id,
         revision: previous.map_or(1, |p| p.revision + 1),
@@ -197,23 +245,30 @@ fn capture(
         session_name: name,
         project,
         tracks,
-        lineage: crate::lineage_store::freeze(db)?,
+        lineage,
         omitted_conflicts: previous
             .map(|job| job.omitted_conflicts.clone())
             .unwrap_or_default(),
         plan: None,
+        undo: None,
+        path_review: Default::default(),
+        path_state: None,
+        retirements: Vec::new(),
         error: None,
         candidate: None,
         messages: previous.map(|job| job.messages.clone()).unwrap_or_default(),
         publication: None,
         kept_secrets: Default::default(),
         contributions: Default::default(),
+        fixes: Default::default(),
         assumptions: Vec::new(),
         assumptions_changed: false,
         assumptions_pending: 0,
         assumptions_failed: 0,
         order_review: None,
     };
+    job.path_review = crate::replacement_review_store::capture(db, &job)?;
+    job.path_state = Some(crate::replacement_review_store::evaluate(db, &job)?);
     crate::integration_exclusions::enforce(&mut job)?;
     crate::integration_exclusions::order_sources_first(&mut job)?;
     crate::integration_assumptions::capture(db, &mut job)?;
@@ -299,13 +354,21 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
             "A repair Run owns this candidate. Stop and discard it before changing the job.".into(),
         );
     }
+    if let Some(id) = request["id"].as_str()
+        && crate::realign_queue::owns_review(tx, Uuid::parse_str(id)?)?
+    {
+        return Err(
+            "Finish or discard this review's dependency realignment before changing it.".into(),
+        );
+    }
     let mut job = match &command.action {
         Action::Open { tracks } => {
             let session = setting(tx, "session")?;
+            let folder = requested_folder(tx, tracks.as_deref())?;
             let active: Option<String> = tx
                 .query_row(
-                    "SELECT id FROM integration_jobs WHERE session=?1 AND active=1",
-                    [session["id"].as_str().ok_or("Missing session ID.")?],
+                    "SELECT id FROM integration_jobs WHERE session=?1 AND json_extract(record,'$.project.id')=?2 AND active=1",
+                    params![session["id"].as_str().ok_or("Missing session ID.")?, folder.id],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -349,8 +412,11 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
             let mut job = read(tx, *id)?;
             editable(&job, *revision)?;
             crate::integration_exclusions::select(&mut job, track, *included)?;
+            crate::replacement_review_store::refresh(tx, &mut job)?;
             job.revision += 1;
-            job.status = if job.contributions.is_empty() {
+            job.status = if job.path_state.as_ref().is_some_and(|state| !state.ready()) {
+                Status::Choosing
+            } else if job.contributions.is_empty() {
                 Status::Preparing
             } else {
                 Status::Building
@@ -361,6 +427,28 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
             copy_settings(tx, *id, *revision, job.revision, None)?;
             // Preserve the original refs and checkpoint selection. Including
             // or excluding a row is not an implicit Refresh.
+            job
+        }
+        Action::ChoosePath {
+            id,
+            revision,
+            track,
+        } => {
+            let mut job = read(tx, *id)?;
+            editable(&job, *revision)?;
+            crate::replacement_review_store::choose(tx, &mut job, track)?;
+            crate::integration_exclusions::enforce(&mut job)?;
+            crate::integration_exclusions::order_sources_first(&mut job)?;
+            job.revision += 1;
+            job.status = if job.path_state.as_ref().is_some_and(|state| !state.ready()) {
+                Status::Choosing
+            } else {
+                Status::Preparing
+            };
+            job.candidate = None;
+            job.kept_secrets.clear();
+            job.error = None;
+            copy_settings(tx, *id, *revision, job.revision, None)?;
             job
         }
         Action::Order {
@@ -393,9 +481,36 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
             {
                 return Err("Resolve the candidate before re-checking.".into());
             }
+            let candidate = job
+                .candidate
+                .as_mut()
+                .ok_or("Build a candidate before re-checking.")?;
+            if candidate.blocked_commit.is_some()
+                || candidate.pending_undo()
+                || !matches!(
+                    candidate.state,
+                    crate::candidate::State::Checked
+                        | crate::candidate::State::CheckFailed
+                        | crate::candidate::State::HistoryRequired
+                        | crate::candidate::State::CheckMutated
+                        | crate::candidate::State::DirtyBeforeCheck
+                        | crate::candidate::State::EnvFailed
+                        | crate::candidate::State::Cancelled
+                        | crate::candidate::State::SecretFound
+                )
+            {
+                return Err("Resolve the candidate before re-checking.".into());
+            }
             job.revision += 1;
+            candidate.revision = job.revision;
+            candidate.state = crate::candidate::State::Rechecking;
+            candidate.check = None;
+            candidate.reason = None;
+            candidate.failed_track = None;
+            candidate.secret_scans.clear();
+            candidate.dependency_runs.clear();
+            candidate.dependency_error = None;
             job.status = Status::Building;
-            job.candidate = None;
             job.kept_secrets.clear();
             job.error = None;
             job
@@ -403,26 +518,37 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
         Action::Prepare { id, revision } => {
             let mut job = read(tx, *id)?;
             editable(&job, *revision)?;
-            if job
+            let plan = job
                 .plan
                 .as_ref()
-                .and_then(|plan| plan.tree.as_ref())
-                .is_none()
+                .ok_or("The integration has no frozen plan.")?;
+            if plan.tree.is_none()
+                && plan.undo_conflict.is_none()
+                && !plan
+                    .rows
+                    .iter()
+                    .any(|row| row.state == crate::integration::RowState::Conflict)
             {
-                return Err("The integration has no resolved tree to build.".into());
+                return Err("The integration has no tree or conflict to build.".into());
             }
-            if job.status == Status::MergeConflict || job.status == Status::Preparing {
+            if job.status == Status::Preparing {
                 return Err("The integration is not ready to build.".into());
             }
             if job.status == Status::Failed {
                 job.revision += 1;
                 copy_settings(tx, *id, *revision, job.revision, None)?;
-                let resume = job.candidate.as_ref().is_some_and(|candidate| {
-                    candidate.blocked_commit.is_some()
-                        && candidate
-                            .secret_scans
-                            .last()
-                            .is_some_and(|scan| scan.accepted(&job.kept_secrets))
+                let resume = job.candidate.as_mut().is_some_and(|candidate| {
+                    if candidate.check.is_some() && candidate.blocked_commit.is_none() {
+                        candidate.state = crate::candidate::State::Rechecking;
+                        candidate.check = None;
+                        true
+                    } else {
+                        (candidate.blocked_commit.is_some() || candidate.pending_undo())
+                            && candidate
+                                .scans()
+                                .last()
+                                .is_some_and(|scan| scan.accepted(&job.kept_secrets))
+                    }
                 });
                 if resume {
                     job.candidate.as_mut().unwrap().revision = job.revision;
@@ -435,6 +561,21 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
                 job.status = Status::Building;
                 job.error = None;
             }
+            job
+        }
+        Action::TreatCheckAsFailure { id, revision } => {
+            let mut job = read(tx, *id)?;
+            editable(&job, *revision)?;
+            let candidate = job.candidate.as_mut().ok_or("No Check result to review.")?;
+            if candidate.state != crate::candidate::State::HistoryRequired {
+                return Err("The Check history question changed. Review again.".into());
+            }
+            job.revision += 1;
+            candidate.revision = job.revision;
+            candidate.state = crate::candidate::State::CheckFailed;
+            candidate.reason = Some("The merged Check failed.".into());
+            job.error = candidate.reason.clone();
+            copy_settings(tx, *id, *revision, job.revision, None)?;
             job
         }
         Action::SkipHooks { id, revision } => {
@@ -531,9 +672,8 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
                 .as_ref()
                 .ok_or("No secret finding to review.")?;
             if candidate.state != crate::candidate::State::SecretFound
-                || candidate.blocked_commit.is_none()
                 || !candidate
-                    .secret_scans
+                    .scans()
                     .last()
                     .is_some_and(|scan| scan.findings.iter().any(|item| item.id == *finding))
             {
@@ -545,11 +685,15 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
             let candidate = job.candidate.as_mut().unwrap();
             candidate.revision = job.revision;
             if candidate
-                .secret_scans
+                .scans()
                 .last()
                 .unwrap()
                 .accepted(&job.kept_secrets)
             {
+                if candidate.blocked_commit.is_none() && !candidate.pending_undo() {
+                    candidate.state = crate::candidate::State::Rechecking;
+                    candidate.check = None;
+                }
                 job.status = Status::Building;
                 job.error = None;
             }
@@ -564,10 +708,12 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
         } => {
             let mut job = read(tx, *id)?;
             editable(&job, *revision)?;
+            if crate::path_restore_store::owns_folder(tx, &job.session_id, &job.project.id)? {
+                return Err("Finish Restore before committing this folder.".into());
+            }
             let candidate = job.candidate.as_ref().ok_or("No checked candidate.")?;
             if candidate
-                .secret_scans
-                .iter()
+                .scans()
                 .any(|scan| scan.binding.ruleset != crate::secret_scan::ruleset())
             {
                 return Err("Secret detection rules changed. Refresh before committing.".into());
@@ -584,10 +730,13 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
                 return Err("The sheet changed · review again".into());
             }
             crate::integration_assumptions::keep(tx, &mut job, None)?;
+            crate::lineage_store::coverage_before_publication(tx, &job)?;
+            crate::replacement_undo_store::available(tx, &job)?;
             let publication = crate::publication::intent(
                 &job,
                 Uuid::new_v5(&command.op_id, b"integration.publish"),
             )?;
+            crate::path_retirement::begin(tx, &job, publication.operation)?;
             tx.execute(
                 "INSERT INTO operations VALUES(?1,'integration.publish',?2,'prepared')",
                 params![
@@ -614,6 +763,10 @@ pub(crate) fn command_in(tx: &Connection, command: &Command) -> Result<Job> {
         }
     };
     job.order_review = crate::integration_order::read(tx, job.id, job.revision)?;
+    job.retirements = crate::path_retirement::snapshot(tx)?
+        .into_iter()
+        .filter(|entry| entry.session == job.session_id && entry.folder == job.project.id)
+        .collect();
     job.assumptions_changed = !crate::integration_assumptions::current(tx, &job)?;
     (job.assumptions_pending, job.assumptions_failed) =
         crate::integration_assumptions::unfinished(tx, &job)?;
@@ -658,6 +811,9 @@ pub(crate) fn published(
         .operation;
     match outcome {
         crate::publication::Outcome::Complete => {
+            crate::path_retirement::finish(&tx, job.id, true)?;
+            crate::replacement_undo_store::published(&tx, &job, operation)?;
+            crate::integration_record_store::published(&tx, &job, operation)?;
             let included = job
                 .tracks
                 .iter()
@@ -669,6 +825,7 @@ pub(crate) fn published(
                         .map(|checkpoint| (track.id.as_str(), checkpoint.sha.as_str()))
                 })
                 .collect::<Vec<_>>();
+            crate::lineage_store::publish_head(&tx, &job, &included)?;
             crate::lineage_store::published(&tx, &job.lineage, &included)?;
             for commit in &job.candidate.as_ref().ok_or("Missing candidate.")?.commits {
                 let track = job
@@ -700,6 +857,7 @@ pub(crate) fn published(
                     )?;
                 }
             }
+            crate::publication_timeline::record(&tx, &job)?;
             job.status = Status::Done;
             job.error = None;
             tx.execute(
@@ -708,6 +866,7 @@ pub(crate) fn published(
             )?;
         }
         crate::publication::Outcome::NotPublished(error) => {
+            crate::path_retirement::finish(&tx, job.id, false)?;
             job.status = Status::Failed;
             job.error = Some(format!("Commit was not published · {error} · Refresh"));
             job.revision += 1;
@@ -842,12 +1001,45 @@ pub(crate) fn apply_candidate(
             }
             job.status = if candidate.state == crate::candidate::State::Checked {
                 Status::Checked
+            } else if candidate.state == crate::candidate::State::Conflict
+                && candidate.undo_conflict.is_some()
+            {
+                Status::MergeConflict
             } else {
                 Status::Failed
             };
             job.error = candidate.reason.clone();
             job.contributions = candidate.contributions.clone();
-            if !candidate.commits.is_empty()
+            job.fixes = candidate.fixes.clone();
+            if candidate.resolution.is_some()
+                && candidate.conflict.is_none()
+                && (candidate.state == crate::candidate::State::Checked
+                    || candidate.check.is_some())
+                && let Some(plan) = &mut job.plan
+            {
+                plan.tree = Some(candidate.tree.clone());
+                for row in &mut plan.rows {
+                    if job.tracks.iter().any(|track| {
+                        track.id == row.track && track.included && track.checkpoint.is_some()
+                    }) {
+                        if let Some(commit) = candidate
+                            .commits
+                            .iter()
+                            .find(|commit| commit.track == row.track)
+                        {
+                            row.state = crate::integration::RowState::Included;
+                            row.tree = Some(commit.tree.clone());
+                            row.changes = commit.changes.clone();
+                        } else {
+                            row.state = crate::integration::RowState::NoChanges;
+                            row.changes.clear();
+                        }
+                        row.conflicts.clear();
+                    }
+                }
+            }
+            if (!candidate.commits.is_empty() || candidate.undo.is_some())
+                && !candidate.pending_undo()
                 && let Some(plan) = &mut job.plan
             {
                 plan.expected_staging = Some(candidate.head.clone());
@@ -907,7 +1099,18 @@ pub(crate) fn frozen(db: &mut Connection, id: Uuid, revision: u64, plan: Plan) -
     if job.revision != revision || job.status != Status::Preparing || job.plan.is_some() {
         return Err("Integration inputs were superseded.".into());
     }
+    if plan.coverage.is_some() {
+        return Err(
+            "Published coverage is captured by the journal, not by the checkout inspector.".into(),
+        );
+    }
     job.plan = Some(plan);
+    let coverage = crate::lineage_store::capture_coverage(&tx, &job)?;
+    job.plan.as_mut().unwrap().coverage = Some(coverage);
+    crate::replacement_review_store::refresh(&tx, &mut job)?;
+    if job.path_state.as_ref().is_some_and(|state| !state.ready()) {
+        job.status = Status::Choosing;
+    }
     save(&tx, &job)?;
     tx.execute(
         "INSERT INTO events(ts,session_id,kind,payload) VALUES(?1,?2,'integration.frozen',?3)",
@@ -934,7 +1137,9 @@ pub(crate) fn planned(
     }
     match result {
         Ok(plan) => {
-            job.status = if plan.rows.iter().any(|row| row.state == RowState::Conflict) {
+            job.status = if plan.undo_conflict.is_some()
+                || plan.rows.iter().any(|row| row.state == RowState::Conflict)
+            {
                 Status::MergeConflict
             } else {
                 Status::Open
@@ -954,32 +1159,50 @@ pub(crate) fn planned(
 }
 
 pub(crate) fn snapshot(db: &Connection) -> Result<Value> {
-    let record: Option<String> = db
+    let session: Option<String> = db
         .query_row(
-            "SELECT record FROM integration_jobs ORDER BY rowid DESC LIMIT 1",
+            "SELECT value FROM settings WHERE key='session'",
             [],
             |row| row.get(0),
         )
         .optional()?;
-    let Some(record) = record else {
-        return Ok(Value::Null);
+    let Some(session) = session else {
+        return Ok(Value::Array(Vec::new()));
     };
-    let saved: Job = serde_json::from_str(&record)?;
-    let job = read(db, saved.id)?;
-    if job.status == Status::Discarded {
-        return Ok(Value::Null);
+    let session: Value = serde_json::from_str(&session)?;
+    let ids = db.prepare("SELECT id FROM integration_jobs WHERE session=?1 AND (active=1 OR rowid IN (SELECT max(rowid) FROM integration_jobs WHERE session=?1 GROUP BY json_extract(record,'$.project.id')) OR id IN (SELECT json_extract(m.value,'$.jobId') FROM commit_groups g,json_each(g.record,'$.members') m WHERE g.session=?1 AND json_extract(g.record,'$.status')<>'discarded' AND g.rowid=(SELECT max(rowid) FROM commit_groups WHERE session=?1))) ORDER BY rowid DESC")?
+        .query_map([session["id"].as_str().unwrap_or("")], |row|row.get::<_,String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut jobs = Vec::new();
+    for id in ids {
+        let job = read(db, Uuid::parse_str(&id)?)?;
+        if job.status != Status::Discarded {
+            jobs.push(project_snapshot(db, &job)?);
+        }
     }
+    Ok(Value::Array(jobs))
+}
+fn project_snapshot(db: &Connection, job: &Job) -> Result<Value> {
     let mut finished = 0;
     for track in &job.tracks {
         finished += checkpoint_count(db, &track.id)?.saturating_sub(track.checkpoint_count);
     }
-    let mut value = crate::integration::project(&job)?;
+    let mut value = crate::integration::project(job)?;
     value["finishedSinceOpen"] = finished.into();
     let captured = settings(db, job.id, job.revision)?;
-    let environment_revision = captured
-        .and_then(|settings| settings.environment)
-        .map_or(0, |environment| environment.selection.revision);
-    value["settingsChanged"] =
-        (environment_revision != crate::check_environment::selection(db)?.revision).into();
+    if let Some(captured) = captured {
+        let environment_revision = captured
+            .environment
+            .map_or(0, |environment| environment.selection.revision);
+        value["settingsChanged"] = (environment_revision
+            != crate::check_environment::selection(db)?.revision
+            || captured.checks_revision
+                != crate::check_settings::read(db)?
+                    .folder(&job.project.id)
+                    .revision)
+            .into();
+    } else {
+        value["settingsChanged"] = false.into();
+    }
     Ok(value)
 }

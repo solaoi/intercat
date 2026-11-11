@@ -60,7 +60,7 @@ test('real worker results reach proposals, continuation and the retained Editor 
     }, { timeout: 150_000, intervals: [250, 500, 1000] }).toBe(kind);
     await expect.poll(async () => {
       const proposal = (await status()).proposal;
-      return proposal && proposal.kind !== 'plan-conflict' && proposal.trackId === track ? proposal.options[0].action : null;
+      return proposal && 'trackId' in proposal && proposal.trackId === track ? proposal.options[0].action : null;
     }, { timeout: 30_000 }).toBe(kind === 'partial' ? 'continue' : 'commit');
   };
   const add = async (text: string) => {
@@ -120,9 +120,9 @@ test('real worker results reach proposals, continuation and the retained Editor 
     }
     await proposal.getByRole('button', { name: 'Review for commit', exact: true }).click();
     await expect(page!.locator('.commit-sheet')).toBeVisible({ timeout: 30_000 });
-    await expect.poll(async () => (await status()).integration?.tracks.map(track => track.id), { timeout: 30_000 }).toContain(first);
+    await expect.poll(async () => (await status()).integrations![0]?.tracks.map(track => track.id), { timeout: 30_000 }).toContain(first);
     const review = await snapshot('review');
-    expect(review.integration?.tracks.map(track => track.id)).toContain(first);
+    expect(review.integrations![0]?.tracks.map(track => track.id)).toContain(first);
     await page!.getByRole('button', { name: 'Hide commit review', exact: true }).click();
     await app!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(1));
     const second = await add('これは使い捨てプロジェクトの2段階の仕事です。全体の完了条件はfirst.txtとsecond.txtを両方作ることです。今回の処理予算はファイル追加1回だけなので、write_fileでfirst.txtへ「first」と改行を書いてターンを終えてください。second.txtへ「second」と改行を書く作業が残りますが、必要な情報はすべて揃っており、質問・確認・許可待ちはありません。残りは後続ターンで進められます。今回は全体が未完了なのでResultの種類をpartialとして残りを報告し、Waiting for youの行や相手への依頼・質問は付けないでください。コマンドやテストの実行、他のファイルの読取、コミット、ネットワーク利用は不要です。');

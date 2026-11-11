@@ -26,7 +26,7 @@ async fn finish(journal: &Journal, id: &str, state: Admission) -> Result<()> {
     Ok(())
 }
 pub async fn stage(job: &Job, candidate: &Candidate, journal: &Journal) -> Result<()> {
-    if candidate.commits.is_empty() {
+    if (candidate.commits.is_empty() && candidate.undo.is_none()) || candidate.pending_undo() {
         return Ok(());
     }
     let plan = job.plan.as_ref().ok_or("No integration plan.")?;

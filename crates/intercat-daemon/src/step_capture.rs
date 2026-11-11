@@ -151,11 +151,15 @@ async fn receive(stream: UnixStream, token: String) -> Result<(UnixStream, Reque
     Ok((UnixStream::from_std(stream)?, request))
 }
 
-async fn files(workspace: &Workspace) -> Result<(String, BTreeMap<String, SavedFile>)> {
+async fn files(
+    workspace: &Workspace,
+    journal: &Journal,
+) -> Result<(String, BTreeMap<String, SavedFile>)> {
     let captured = crate::checkpoint::capture(
         workspace,
         &workspace.base,
         "Intercat step file observation\n",
+        journal,
     )
     .await?;
     let root = workspace.path.clone();
@@ -254,7 +258,7 @@ async fn capture(
                 let before = if let Some(before) = restore_before(journal, track, &key).await? {
                     before
                 } else {
-                    let (sha, files) = files(&workspace).await?;
+                    let (sha, files) = files(&workspace, journal).await?;
                     Before {
                         sha,
                         files,
@@ -314,7 +318,7 @@ async fn capture(
                 {
                     return Err("The captured batch or workspace changed.".into());
                 }
-                match files(&workspace).await {
+                match files(&workspace, journal).await {
                     Ok((_, after)) => Some(
                         before
                             .files

@@ -377,6 +377,7 @@ async fn description_arriving_after_dispatch_remains_display_only() -> Result<()
             1,
             track,
             json!({"sessionId":"test"}),
+            None,
         )
         .await?;
     journal.finish_description(ticket, description()).await?;

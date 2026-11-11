@@ -42,6 +42,7 @@ async fn fixture() -> Result<(tempfile::TempDir, Journal, WorkerState, Request)>
     let turn = Uuid::now_v7();
     journal
         .workspace_result(intercat_daemon::preparation::Workspace {
+            denied_roots: Vec::new(),
             track_id: track.clone(),
             path: root.path().join("worker"),
             reference: "refs/intercat/reply/tracks/A".into(),

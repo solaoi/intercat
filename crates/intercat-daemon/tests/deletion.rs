@@ -37,12 +37,10 @@ async fn fixture(root: &Path) -> Result<(Workspace, Journal)> {
     );
     let base = git(&source, &["rev-parse", "HEAD"]);
     let path = root.join("worker");
-    worktree::GitTool::system()
-        .await?
-        .prepare_detached(&worktree::inspect(&source).await?, &path)
-        .await?;
+    worktree::prepare_detached(&worktree::inspect(&source).await?, &path).await?;
     Ok((
         Workspace {
+            denied_roots: Vec::new(),
             attachment_roots: Vec::new(),
             track_id: "track".into(),
             path,

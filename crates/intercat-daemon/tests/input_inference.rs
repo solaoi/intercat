@@ -76,6 +76,7 @@ async fn arrive(journal: &Journal, id: &str, track: &str) -> Result<()> {
             revision,
             track.into(),
             json!({"sessionId":format!("session-{track}"),"commandId":command}),
+            None,
         )
         .await?;
     journal.try_msp(track.into(),format!("session-{track}"),Stamp::now(),json!({"method":"item/updated","params":{"sessionId":format!("session-{track}"),"item":{"itemId":format!("user-{command}"),"commandId":command,"turnId":command,"kind":"userMessage","text":"Recorded test request","revision":1,"status":"completed"}}}),None,None)?.await??;

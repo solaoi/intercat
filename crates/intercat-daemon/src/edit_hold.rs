@@ -51,6 +51,11 @@ pub enum Action {
 pub enum Edit {
     Cancel,
     TakeBack,
+    TryTwoWays {
+        #[serde(rename = "opId")]
+        op_id: Uuid,
+        selection: crate::two_ways::Selection,
+    },
     Text {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,6 +173,9 @@ pub fn change(db: &mut Connection, request: Request, now: Stamp) -> Result<Optio
             input,
             revision,
         } => {
+            if crate::two_ways_store::fenced(&tx, &input)? {
+                return Err("Cancel the paired attempt before editing this instruction.".into());
+            }
             if crate::review_fix_store::for_input(&tx, &input)?.is_some() {
                 return Err("Review fixes keep their reviewed target. Take back the fix or use the review decision.".into());
             }
@@ -227,7 +235,7 @@ pub fn change(db: &mut Connection, request: Request, now: Stamp) -> Result<Optio
                 return Err("This request was already sent.".into());
             }
             tx.execute("UPDATE utterances SET revision=revision+1,state=CASE WHEN state='reading' THEN 'staged' ELSE state END WHERE id=?1", [&input])?;
-            crate::timeline_history::advance_lease_revision(&tx, &input, revision)?;
+            crate::timeline_history::advance_revision(&tx, &input, revision)?;
             crate::redirect::revise(&tx, &input, revision + 1)?;
             let lease = Lease {
                 owner: request.owner,
@@ -298,7 +306,11 @@ pub fn change(db: &mut Connection, request: Request, now: Stamp) -> Result<Optio
                     edit,
                     ..
                 } => {
-                    if op_id.get_version_num() != 7 || matches!(edit, Edit::Cancel | Edit::TakeBack)
+                    if op_id.get_version_num() != 7
+                        || matches!(
+                            edit,
+                            Edit::Cancel | Edit::TakeBack | Edit::TryTwoWays { .. }
+                        )
                     {
                         return Err("Invalid request edit.".into());
                     }
@@ -396,6 +408,17 @@ fn apply_edit(
     }
     match edit {
         Edit::Cancel => {}
+        Edit::TryTwoWays { op_id, selection } => {
+            crate::two_ways_store::prepare(
+                db,
+                crate::two_ways::Request {
+                    op_id: *op_id,
+                    input_id: input.into(),
+                    revision,
+                    selection: selection.clone(),
+                },
+            )?;
+        }
         Edit::TakeBack => {
             crate::journal::take_back(db, input)?;
         }

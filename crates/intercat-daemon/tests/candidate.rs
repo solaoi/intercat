@@ -1,3 +1,4 @@
+use intercat_daemon::check_run;
 use intercat_daemon::{
     Result,
     candidate::{self, Settings, State},
@@ -65,6 +66,7 @@ async fn repair_fixture(
         candidate.state,
         State::CheckFailed | State::SecretFound
     ));
+    let candidate_root = candidate.workspace.clone();
     f.job.candidate = Some(candidate);
     f.job.status = Status::Failed;
     let repair = intercat_daemon::repair::Workspace::prepare(
@@ -134,8 +136,10 @@ async fn repair_run_fixture(secret: bool) -> Result<(Fixture, intercat_daemon::j
 fn repair_request(f: &Fixture) -> intercat_daemon::repair_run::Request {
     intercat_daemon::repair_run::Request {
         op_id: Uuid::now_v7(),
-        job_id: f.job.id,
-        revision: f.job.revision,
+        owner: intercat_daemon::repair_run::Owner::Commit {
+            id: f.job.id,
+            revision: f.job.revision,
+        },
         track: f.job.tracks[0].id.clone(),
         purpose: intercat_daemon::repair_run::Purpose::Check,
     }
@@ -606,10 +610,6 @@ fn scheduler_candidate(f: &Fixture) -> Result<PathBuf> {
     let root = f.root.path().join("integration");
     let parent = root.join(f.job.id.to_string());
     fs::create_dir_all(&parent)?;
-    fs::rename(
-        f.root.path().join("candidate"),
-        parent.join(f.job.candidate.as_ref().unwrap().generation.to_string()),
-    )?;
     Ok(root)
 }
 
@@ -774,9 +774,7 @@ async fn repair_preparation_keeps_a_ready_workspaces_edits_on_resume() -> Result
         .join(format!("repair-{}", run.id));
     let workspace = repair::Workspace::prepare(
         &job,
-        &root
-            .join(f.job.id.to_string())
-            .join(f.job.candidate.as_ref().unwrap().generation.to_string()),
+        &f.job.candidate.as_ref().unwrap().workspace.clone(),
         &working,
         &run.track,
         &settings,
@@ -1066,13 +1064,13 @@ async fn real_repair_scheduler_shares_capacity_stops_follows_up_and_admits_check
             "The repair did not finish applying its candidate.",
         )?;
         let snapshot = journal.snapshot().await?;
-        let job: Job = serde_json::from_value(snapshot["integration"].clone())?;
+        let job: Job = serde_json::from_value(snapshot["integrations"][0].clone())?;
         require(
             job.status == Status::Checked,
             "The rebuilt candidate did not pass Check.",
         )?;
         require(
-            job.candidate.as_ref().unwrap().generation == run.job_revision,
+            job.candidate.as_ref().unwrap().build_revision == run.owner.revision(),
             "The candidate used the wrong generation.",
         )?;
         require(
@@ -1101,11 +1099,12 @@ async fn real_repair_scheduler_shares_capacity_stops_follows_up_and_admits_check
 async fn repair_application_rechecks_and_atomically_releases_the_candidate() -> Result<()> {
     use intercat_daemon::{repair, repair_application, repair_run::Phase};
     let (f, journal) = repair_run_fixture(false).await?;
+    select_fixture_session(&f)?;
     let run = captured_repair(&journal, journal.repair_start(repair_request(&f)).await?).await?;
     let (_, job, settings) = journal.repair_input(run.id).await?;
     let workspace = repair::Workspace::prepare(
         &job,
-        &f.root.path().join("candidate"),
+        &f.job.candidate.as_ref().unwrap().workspace,
         &f.root.path().join("repair"),
         &run.track,
         &settings,
@@ -1116,8 +1115,8 @@ async fn repair_application_rechecks_and_atomically_releases_the_candidate() -> 
     let done = repair_application::apply(
         &journal,
         &run,
-        std::sync::Arc::new(workspace),
-        f.root.path().join("candidate"),
+        std::sync::Arc::new(intercat_daemon::run_workspace::Workspace::Fix(workspace)),
+        f.job.candidate.as_ref().unwrap().workspace.clone(),
         f.root.path().join(job.revision.to_string()),
         f.root.path().join("downloads"),
         watch::channel(false).1,
@@ -1125,11 +1124,11 @@ async fn repair_application_rechecks_and_atomically_releases_the_candidate() -> 
     .await?;
     assert_eq!(done.phase, Phase::Done);
     let snapshot = journal.snapshot().await?;
-    let current: Job = serde_json::from_value(snapshot["integration"].clone())?;
+    let current: Job = serde_json::from_value(snapshot["integrations"][0].clone())?;
     assert_eq!(current.status, Status::Checked);
     let candidate = current.candidate.as_ref().unwrap();
     assert_eq!(candidate.state, State::Checked);
-    assert_eq!(candidate.generation, job.revision);
+    assert_eq!(candidate.build_revision, job.revision);
     assert_eq!(candidate.revision, job.revision);
     assert_eq!(
         candidate.repair.as_ref().unwrap().requested_track,
@@ -1157,16 +1156,24 @@ async fn repair_application_rechecks_and_atomically_releases_the_candidate() -> 
     Ok(())
 }
 
+fn select_fixture_session(f: &Fixture) -> Result<()> {
+    let db = rusqlite::Connection::open(f.root.path().join("events.sqlite"))?;
+    db.execute("INSERT INTO settings VALUES('session',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [serde_json::json!({"id":f.job.session_id}).to_string()])?;
+    Ok(())
+}
+
 async fn apply_fixture_edits(
     f: &Fixture,
     journal: &intercat_daemon::journal::Journal,
     files: &[(&str, &str)],
 ) -> Result<Job> {
+    select_fixture_session(f)?;
     let run = captured_repair(journal, journal.repair_start(repair_request(f)).await?).await?;
     let (_, job, settings) = journal.repair_input(run.id).await?;
     let workspace = intercat_daemon::repair::Workspace::prepare(
         &job,
-        &f.root.path().join("candidate"),
+        &f.job.candidate.as_ref().unwrap().workspace,
         &f.root.path().join("repair"),
         &run.track,
         &settings,
@@ -1179,8 +1186,8 @@ async fn apply_fixture_edits(
     let done = intercat_daemon::repair_application::apply(
         journal,
         &run,
-        std::sync::Arc::new(workspace),
-        f.root.path().join("candidate"),
+        std::sync::Arc::new(intercat_daemon::run_workspace::Workspace::Fix(workspace)),
+        f.job.candidate.as_ref().unwrap().workspace.clone(),
         f.root.path().join(job.revision.to_string()),
         f.root.path().join("downloads"),
         watch::channel(false).1,
@@ -1188,7 +1195,7 @@ async fn apply_fixture_edits(
     .await?;
     assert_eq!(done.phase, intercat_daemon::repair_run::Phase::Done);
     Ok(serde_json::from_value(
-        journal.snapshot().await?["integration"].clone(),
+        journal.snapshot().await?["integrations"][0].clone(),
     )?)
 }
 
@@ -1209,7 +1216,7 @@ async fn rebuild_fixture(
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 let job: Job =
-                    serde_json::from_value(journal.snapshot().await?["integration"].clone())?;
+                    serde_json::from_value(journal.snapshot().await?["integrations"][0].clone())?;
                 if !matches!(
                     job.status,
                     Status::Preparing | Status::Building | Status::Staging
@@ -1371,8 +1378,8 @@ async fn repaired_secret_tree_stays_private_when_its_message_is_rebuilt() -> Res
         blocked.tree
     );
     assert_ne!(
-        candidate.generation,
-        repaired.candidate.as_ref().unwrap().generation
+        candidate.build_revision,
+        repaired.candidate.as_ref().unwrap().build_revision
     );
     assert!(Repository::open(&f.source)?.saved_bytes(&secret).is_err());
     assert_eq!(repaired.kept_secrets.len(), 0);
@@ -1385,11 +1392,19 @@ async fn repair_application_rejects_forged_results_and_survives_restart_without_
 -> Result<()> {
     use intercat_daemon::repair_run::{Command, Control, Phase};
     let (f, journal) = repair_run_fixture(false).await?;
-    rusqlite::Connection::open(f.root.path().join("events.sqlite"))?.execute(
-        "INSERT INTO settings VALUES('session',?1)",
-        [serde_json::json!({"id":f.job.session_id}).to_string()],
-    )?;
+    select_fixture_session(&f)?;
     let run = captured_repair(&journal, journal.repair_start(repair_request(&f)).await?).await?;
+    // The closed fake host has no secret context. Select the folder only now,
+    // for Open's current project scope, without changing that host's setup.
+    let project = project::Project {
+        id: Uuid::now_v7(),
+        name: "Dummy project".into(),
+        folders: vec![f.job.project.clone()],
+    };
+    rusqlite::Connection::open(f.root.path().join("events.sqlite"))?.execute(
+        "INSERT INTO settings VALUES('project',?1)",
+        [serde_json::to_string(&project)?],
+    )?;
     assert!(
         journal
             .repair_begin_apply(run.id, run.revision - 1)
@@ -1416,7 +1431,7 @@ async fn repair_application_rejects_forged_results_and_survives_restart_without_
     );
     let mut forged = input.candidate.clone().unwrap();
     forged.revision = input.revision;
-    forged.generation = input.revision;
+    forged.build_revision = input.revision;
     assert!(
         journal
             .repair_applied(applying.id, applying.revision, Ok(forged))
@@ -1492,6 +1507,19 @@ async fn repair_run_reserves_the_candidate_and_never_changes_the_main_worker() -
     };
     journal.worker_state(main.clone()).await?;
     let request = repair_request(&f);
+    let mut wrong_kind = request.clone();
+    wrong_kind.op_id = Uuid::now_v7();
+    wrong_kind.owner = intercat_daemon::repair_run::Owner::Realign {
+        id: f.job.id,
+        revision: f.job.revision,
+    };
+    assert!(journal.repair_start(wrong_kind.clone()).await.is_err());
+    assert!(journal.operation(wrong_kind.op_id).await?.is_none());
+    let mut extra = serde_json::to_value(&request)?;
+    extra["owner"]["path"] = serde_json::json!("/dummy/not-an-owner");
+    assert!(serde_json::from_value::<intercat_daemon::repair_run::Request>(extra).is_err());
+    let old = serde_json::json!({"opId":request.op_id,"jobId":f.job.id,"revision":f.job.revision,"track":request.track,"purpose":request.purpose});
+    assert!(serde_json::from_value::<intercat_daemon::repair_run::Request>(old).is_err());
     let run = journal.repair_start(request.clone()).await?;
     assert_eq!(run.phase, Phase::Queued);
     assert_eq!(journal.repair_start(request.clone()).await?.id, run.id);
@@ -1504,7 +1532,10 @@ async fn repair_run_reserves_the_candidate_and_never_changes_the_main_worker() -
     );
     let mut duplicate = request.clone();
     duplicate.op_id = Uuid::now_v7();
-    duplicate.revision = job.revision;
+    duplicate.owner = intercat_daemon::repair_run::Owner::Commit {
+        id: job.id,
+        revision: job.revision,
+    };
     assert!(journal.repair_start(duplicate).await.is_err());
     assert!(
         journal
@@ -1530,6 +1561,7 @@ async fn repair_run_reserves_the_candidate_and_never_changes_the_main_worker() -
     let current = journal.snapshot().await?;
     let mut expected = serde_json::to_value(main)?;
     expected["model"] = serde_json::Value::Null;
+    expected["pairedInstruction"] = serde_json::Value::Null;
     assert_eq!(current["workers"][0], expected);
     assert_eq!(current["repairRuns"][0]["id"], run.id.to_string());
     let discarded = journal
@@ -1855,11 +1887,11 @@ async fn repair_host_rejects_an_unverified_program_before_starting_it() -> Resul
     let mut run = journal.repair_start(repair_request(&f)).await?;
     run = advance_repair(&journal, &run, Event::Prepare).await?;
     let (_, job, settings) = journal.repair_input(run.id).await?;
-    let workspace = intercat_daemon::repair::Workspace::prepare(
+    let workspace = intercat_daemon::run_workspace::Workspace::prepare(
         &job,
-        &f.root.path().join("candidate"),
+        &f.job.candidate.as_ref().unwrap().workspace,
         &f.root.path().join("unverified-workspace"),
-        &run.track,
+        &run,
         &settings,
         watch::channel(false).1,
     )
@@ -1878,13 +1910,14 @@ async fn repair_host_rejects_an_unverified_program_before_starting_it() -> Resul
     };
     let wrong = intercat_daemon::repair::Workspace::prepare(
         &job,
-        &f.root.path().join("candidate"),
+        &f.job.candidate.as_ref().unwrap().workspace,
         &f.root.path().join("wrong-owner"),
         &job.tracks[1].id,
         &settings,
         watch::channel(false).1,
     )
     .await?;
+    let wrong = intercat_daemon::run_workspace::Workspace::Fix(wrong);
     assert!(
         repair_host::open(
             &journal,
@@ -1937,11 +1970,11 @@ async fn repair_host_does_not_launch_if_stop_was_saved_during_preparation() -> R
     let mut run = journal.repair_start(repair_request(&f)).await?;
     run = advance_repair(&journal, &run, Event::Prepare).await?;
     let (_, job, settings) = journal.repair_input(run.id).await?;
-    let workspace = intercat_daemon::repair::Workspace::prepare(
+    let workspace = intercat_daemon::run_workspace::Workspace::prepare(
         &job,
-        &f.root.path().join("candidate"),
+        &f.job.candidate.as_ref().unwrap().workspace,
         &f.root.path().join("stopped-workspace"),
-        &run.track,
+        &run,
         &settings,
         watch::channel(false).1,
     )
@@ -2001,11 +2034,11 @@ async fn real_repair_host_registers_its_session_and_closes_without_stopping_anot
     let mut run = journal.repair_start(repair_request(&f)).await?;
     run = advance_repair(&journal, &run, Event::Prepare).await?;
     let (_, job, settings) = journal.repair_input(run.id).await?;
-    let workspace = intercat_daemon::repair::Workspace::prepare(
+    let workspace = intercat_daemon::run_workspace::Workspace::prepare(
         &job,
-        &f.root.path().join("candidate"),
+        &f.job.candidate.as_ref().unwrap().workspace,
         &f.root.path().join("repair"),
-        &run.track,
+        &run,
         &settings,
         watch::channel(false).1,
     )
@@ -2036,7 +2069,10 @@ async fn real_repair_host_registers_its_session_and_closes_without_stopping_anot
     .await?;
     main.connection.client.initialize().await?;
     let main_identity = main.identity;
-    let denied = vec![f.source.clone(), f.root.path().join("candidate")];
+    let denied = vec![
+        f.source.clone(),
+        f.job.candidate.as_ref().unwrap().workspace.clone(),
+    ];
     let host_a = f.root.path().join("fix-host-a");
     let host_b = f.root.path().join("fix-host-b");
     let mut competing = run.clone();
@@ -2102,20 +2138,20 @@ async fn real_repair_host_registers_its_session_and_closes_without_stopping_anot
     assert!(!intercat_daemon::process::is_alive(fix_identity));
     assert!(intercat_daemon::process::is_alive(main_identity));
     fs::write(
-        workspace.checkout.workdir.join("resume-proof.txt"),
+        workspace.checkout().workdir.join("resume-proof.txt"),
         "Keep the held repair edits.\n",
     )?;
     drop(workspace);
-    let workspace = intercat_daemon::repair::Workspace::resume(
+    let workspace = intercat_daemon::run_workspace::Workspace::resume(
         &job,
-        &f.root.path().join("candidate"),
+        &f.job.candidate.as_ref().unwrap().workspace,
         &f.root.path().join("repair"),
-        &run.track,
+        &run,
         &settings,
     )
     .await?;
     assert_eq!(
-        fs::read_to_string(workspace.checkout.workdir.join("resume-proof.txt"))?,
+        fs::read_to_string(workspace.checkout().workdir.join("resume-proof.txt"))?,
         "Keep the held repair edits.\n"
     );
     run = journal
@@ -2333,11 +2369,11 @@ async fn real_repair_uses_project_secrets_and_resumes_without_a_removed_value() 
     run = advance_repair(&journal, &run, Event::Prepare).await?;
     let (_, job, settings) = journal.repair_input(run.id).await?;
     let workspace = std::sync::Arc::new(
-        intercat_daemon::repair::Workspace::prepare(
+        intercat_daemon::run_workspace::Workspace::prepare(
             &job,
-            &f.root.path().join("candidate"),
+            &f.job.candidate.as_ref().unwrap().workspace,
             &f.root.path().join("repair"),
-            &run.track,
+            &run,
             &settings,
             watch::channel(false).1,
         )
@@ -2348,13 +2384,13 @@ async fn real_repair_uses_project_secrets_and_resumes_without_a_removed_value() 
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
     fs::write(
-        workspace.checkout.workdir.join("verify_token.py"),
+        workspace.checkout().workdir.join("verify_token.py"),
         format!(
             "import os,hashlib\nfrom pathlib import Path\nv=os.environ.get('DEMO_TOKEN','')\nassert hashlib.sha256(v.encode()).hexdigest()=='{digest}'\nprint(v)\nPath('verified.txt').write_text('verified\\n')\n"
         ),
     )?;
     fs::write(
-        workspace.checkout.workdir.join("verify_absent.py"),
+        workspace.checkout().workdir.join("verify_absent.py"),
         "import os\nfrom pathlib import Path\nassert 'DEMO_TOKEN' not in os.environ\nPath('absent.txt').write_text('absent\\n')\nprint('absent')\n",
     )?;
     let mut session = None;
@@ -2457,7 +2493,7 @@ async fn real_repair_uses_project_secrets_and_resumes_without_a_removed_value() 
             *identities.last().unwrap()
         ));
         assert_eq!(
-            fs::read_to_string(workspace.checkout.workdir.join(if pass == 1 {
+            fs::read_to_string(workspace.checkout().workdir.join(if pass == 1 {
                 "verified.txt"
             } else {
                 "absent.txt"
@@ -2528,7 +2564,7 @@ impl Drop for RepairEvidence {
 
 struct LiveRepair {
     run: intercat_daemon::repair_run::Run,
-    workspace: std::sync::Arc<intercat_daemon::repair::Workspace>,
+    workspace: std::sync::Arc<intercat_daemon::run_workspace::Workspace>,
     hosted: intercat_daemon::repair_host::Hosted,
     config: intercat_daemon::runtime::Config,
 }
@@ -2544,11 +2580,11 @@ async fn live_repair(
     run = advance_repair(journal, &run, Event::Prepare).await?;
     let (_, job, settings) = journal.repair_input(run.id).await?;
     let workspace = std::sync::Arc::new(
-        intercat_daemon::repair::Workspace::prepare(
+        intercat_daemon::run_workspace::Workspace::prepare(
             &job,
-            &f.root.path().join("candidate"),
+            &f.job.candidate.as_ref().unwrap().workspace,
             &f.root.path().join("repair"),
-            &run.track,
+            &run,
             &settings,
             watch::channel(false).1,
         )
@@ -2627,7 +2663,13 @@ async fn real_repair_stop_interrupts_its_shell_and_preserves_another_host() -> R
     });
     let observed = tokio::time::timeout(std::time::Duration::from_secs(110), async {
         loop {
-            if live.workspace.checkout.workdir.join("stop-marker").exists() {
+            if live
+                .workspace
+                .checkout()
+                .workdir
+                .join("stop-marker")
+                .exists()
+            {
                 let children = tracker
                     .refresh()?
                     .processes
@@ -2775,11 +2817,11 @@ async fn real_repair_turn_fixes_candidate_and_rechecks_without_changing_original
     run = advance_repair(&journal, &run, Event::Prepare).await?;
     let (_, job, settings) = journal.repair_input(run.id).await?;
     let workspace = std::sync::Arc::new(
-        intercat_daemon::repair::Workspace::prepare(
+        intercat_daemon::run_workspace::Workspace::prepare(
             &job,
-            &f.root.path().join("candidate"),
+            &f.job.candidate.as_ref().unwrap().workspace,
             &f.root.path().join("repair"),
-            &run.track,
+            &run,
             &settings,
             watch::channel(false).1,
         )
@@ -2866,22 +2908,25 @@ async fn real_repair_turn_fixes_candidate_and_rechecks_without_changing_original
             .is_some_and(|text| !text.is_empty())
     );
     assert_eq!(
-        fs::read_to_string(workspace.checkout.workdir.join("file.txt"))?,
+        fs::read_to_string(workspace.checkout().workdir.join("file.txt"))?,
         "fixed\n"
     );
     assert_eq!(
-        fs::read_to_string(workspace.checkout.workdir.join("other.txt"))?,
+        fs::read_to_string(workspace.checkout().workdir.join("other.txt"))?,
         "B\n"
     );
-    let plan = workspace
+    let intercat_daemon::run_workspace::Workspace::Fix(fix_workspace) = workspace.as_ref() else {
+        panic!("Expected a fix workspace");
+    };
+    let plan = fix_workspace
         .finish(
             &job,
-            &f.root.path().join("candidate"),
+            &f.job.candidate.as_ref().unwrap().workspace,
             &settings,
             watch::channel(false).1,
         )
         .await?;
-    let rebuilt = workspace
+    let rebuilt = fix_workspace
         .rebuild(
             &job,
             &plan,
@@ -3394,7 +3439,7 @@ async fn repair_rejects_stale_inputs_unchanged_results_and_changed_heads() -> Re
             .is_err()
     );
     let mut changed = settings.clone();
-    changed.command = candidate::CheckCommand::Disabled;
+    changed.command = check_run::CheckCommand::Disabled;
     assert!(plan.validate(&f.job, &changed).is_err());
     let mut tampered = plan.clone();
     tampered.steps[0].tree = plan.basis.tree.clone();
@@ -3508,6 +3553,9 @@ impl Fixture {
         let job = Job {
             lineage: Default::default(),
             omitted_conflicts: Default::default(),
+            path_review: Default::default(),
+            path_state: None,
+            retirements: Vec::new(),
             order_review: None,
             assumptions: Vec::new(),
             assumptions_changed: false,
@@ -3523,12 +3571,14 @@ impl Fixture {
             project,
             tracks: vec![],
             plan: None,
+            undo: None,
             error: None,
             candidate: None,
             messages: std::collections::BTreeMap::new(),
             publication: None,
             kept_secrets: Default::default(),
             contributions: Default::default(),
+            fixes: Default::default(),
         };
         Ok(Self {
             root,
@@ -3591,6 +3641,8 @@ impl Fixture {
             .lineage
             .points
             .push(intercat_daemon::lineage::Point {
+                views: Vec::new(),
+                parents: Default::default(),
                 track: track.id.clone(),
                 number: 1,
                 sha: sha.to_string(),
@@ -3602,15 +3654,18 @@ impl Fixture {
     }
     fn settings(&mut self, command: Option<&str>) -> Result<Settings> {
         self.job.plan = Some(integration::freeze(&self.job)?);
+        self.job.plan.as_mut().unwrap().coverage = Some(Default::default());
         self.job.plan = Some(integration::plan(&self.job)?);
         Ok(Settings {
+            checks_revision: 0,
+            history: false,
             environment: None,
             scanner: intercat_daemon::secret_scan::Engine::capture()?,
             npm: None,
             registry_origins: vec!["https://registry.npmjs.org/".into()],
             command: command
-                .map(|command| candidate::CheckCommand::Run(command.into()))
-                .unwrap_or(candidate::CheckCommand::Disabled),
+                .map(|command| check_run::CheckCommand::Run(command.into()))
+                .unwrap_or(check_run::CheckCommand::Disabled),
             timeout_ms: 10000,
             path: "/usr/bin:/bin:/usr/sbin:/sbin".into(),
             toolchain: vec![],
@@ -3680,6 +3735,135 @@ async fn creates_one_real_commit_per_track_with_author_trailer_and_matching_chec
     let repo = Repository::open(&f.source)?;
     assert_eq!(repo.tree_id(result.head.parse()?)?.to_string(), result.tree);
     f.unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lfs_check_reports_missing_payload_known_secret_and_binary_scan_scope() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let known = "agent-created-lfs-check-value-17";
+    for case in ["missing", "filter-missing", "secret", "binary"] {
+        let mut f = Fixture::new(&[]).await?;
+        let tool = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.tools/git-lfs-3.8.1/git-lfs")
+            .canonicalize()?;
+        for (field, command) in [
+            ("clean", "clean -- %f"),
+            ("smudge", "smudge -- %f"),
+            ("process", "filter-process"),
+        ] {
+            git(
+                &f.source,
+                &[
+                    "config",
+                    &format!("filter.lfs.{field}"),
+                    &format!("'{}' {command}", tool.display()),
+                ],
+                None,
+            );
+        }
+        git(&f.source, &["config", "filter.lfs.required", "true"], None);
+        if case == "filter-missing" {
+            git(
+                &f.source,
+                &[
+                    "config",
+                    "filter.lfs.process",
+                    "intercat-dummy-missing-lfs-process",
+                ],
+                None,
+            );
+        }
+        let bytes = if case == "binary" {
+            b"\0agent-created binary bytes\0".to_vec()
+        } else {
+            format!("dummy value = '{known}'\n").into_bytes()
+        };
+        let oid = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n",
+            bytes.len()
+        );
+        if case != "missing" {
+            let object = f
+                .source
+                .join(".git/lfs/objects")
+                .join(&oid[..2])
+                .join(&oid[2..4])
+                .join(&oid);
+            fs::create_dir_all(object.parent().unwrap())?;
+            fs::write(object, &bytes)?;
+        }
+        f.track(
+            "A",
+            &[
+                (".gitattributes", Some("*.lfs filter=lfs -text\n"), false),
+                ("dummy.lfs", Some(&pointer), false),
+            ],
+        )?;
+        let mut settings = f.settings(Some("test -s dummy.lfs"))?;
+        settings
+            .toolchain
+            .push(tool.parent().unwrap().to_path_buf());
+        if case == "secret" {
+            let file = f.source.join(".env.test");
+            fs::write(&file, format!("DEMO_TOKEN={known}\n"))?;
+            settings.environment = Some(intercat_daemon::check_environment::Frozen::capture(
+                intercat_daemon::check_environment::Selection {
+                    revision: 0,
+                    file: Some(file),
+                },
+            )?);
+        }
+        let candidate = f.build(&settings).await?;
+        match case {
+            "missing" => {
+                assert_eq!(candidate.state, State::EnvFailed, "{candidate:?}");
+                assert!(
+                    candidate
+                        .reason
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("LFS objects missing locally · fetch them in your checkout")
+                );
+                assert!(candidate.check.is_none());
+                assert!(candidate.commits.is_empty());
+            }
+            "secret" => {
+                assert_eq!(candidate.state, State::SecretFound, "{candidate:?}");
+                assert!(
+                    candidate.secret_scans[0]
+                        .findings
+                        .iter()
+                        .any(|finding| finding.path == "dummy.lfs"
+                            && finding.rule == "check-environment-value")
+                );
+                assert!(!serde_json::to_string(&candidate)?.contains(known));
+                assert!(candidate.commits.is_empty());
+            }
+            "binary" => {
+                assert_eq!(candidate.state, State::Checked, "{candidate:?}");
+                assert_eq!(candidate.secret_scans[0].unscanned_lfs, ["dummy.lfs"]);
+            }
+            "filter-missing" => {
+                assert_eq!(candidate.state, State::EnvFailed, "{candidate:?}");
+                assert!(
+                    candidate
+                        .reason
+                        .as_deref()
+                        .unwrap()
+                        .contains("intercat-dummy-missing-lfs-process")
+                );
+                assert!(candidate.check.is_none());
+                assert!(candidate.commits.is_empty());
+            }
+            _ => unreachable!(),
+        }
+        f.unchanged()?;
+    }
     Ok(())
 }
 
@@ -3821,7 +4005,7 @@ async fn check_failure_and_check_mutation_are_bound_to_the_candidate_tree() -> R
     assert_eq!(failed.state, State::CheckFailed);
     assert_eq!(failed.check.as_ref().unwrap().code, Some(7));
     let mut settings = settings;
-    settings.command = candidate::CheckCommand::Run("printf rewritten > file.txt".into());
+    settings.command = check_run::CheckCommand::Run("printf rewritten > file.txt".into());
     let mutated = f.build(&settings).await?;
     assert_eq!(mutated.state, State::CheckMutated);
     assert_eq!(mutated.check.as_ref().unwrap().code, Some(0));
@@ -3921,7 +4105,7 @@ async fn automatic_check_uses_the_manifest_after_hooks_have_changed_it() -> Resu
     )?;
     f.track("A", &[("file.txt", Some("A\n"), false)])?;
     let mut settings = f.settings(None)?;
-    settings.command = candidate::CheckCommand::Auto;
+    settings.command = check_run::CheckCommand::Auto;
     let path = std::env::var("PATH")?;
     settings.path = path.clone();
     let node = std::env::split_paths(&path)
@@ -3991,7 +4175,7 @@ async fn hook_final_message_is_scanned_and_check_logs_are_redacted() -> Result<(
     );
     assert!(!serde_json::to_string(&rejected)?.contains(token));
     settings.skip_hooks = true;
-    settings.command = candidate::CheckCommand::Run(format!("printf '%s\\n' '{token}'; exit 1"));
+    settings.command = check_run::CheckCommand::Run(format!("printf '%s\\n' '{token}'; exit 1"));
     let failed = f.build(&settings).await?;
     assert_eq!(failed.state, State::CheckFailed, "{failed:?}");
     assert!(failed.check.as_ref().unwrap().stdout.contains("[redacted]"));
@@ -4412,8 +4596,8 @@ async fn real_repair_secret(msp_question: bool) -> Result<()> {
         let ready=wait_repair(&journal,run.id,|run|run.session_ready||run.phase==Phase::Failed).await?;
         assert_eq!(ready.phase,Phase::Preparing);
         // The checkout implementation supplies its own fixed private directory.
-        let actual=root.join(run.job_id.to_string()).join(format!("repair-{}",run.id));
-        let workspace=intercat_daemon::repair::Workspace::resume(&journal.repair_input(run.id).await?.1,&root.join(run.job_id.to_string()).join(f.job.candidate.as_ref().unwrap().generation.to_string()),&actual,&run.track,&journal.repair_input(run.id).await?.2).await?;
+        let actual=root.join(run.owner.id().to_string()).join(format!("repair-{}",run.id));
+        let workspace=intercat_daemon::repair::Workspace::resume(&journal.repair_input(run.id).await?.1,&f.job.candidate.as_ref().unwrap().workspace,&actual,&run.track,&journal.repair_input(run.id).await?.2).await?;
         let work=&workspace.checkout.workdir;
         let digest=Sha256::digest(value.as_bytes()).iter().map(|b|format!("{b:02x}")).collect::<String>();
         fs::write(work.join("verify_token.py"),format!("import os,hashlib\nfrom pathlib import Path\nv=os.environ.get('DEMO_TOKEN','')\nassert hashlib.sha256(v.encode()).hexdigest()=='{digest}'\nprint(v)\nPath('verified.txt').write_text('verified\\n')\n"))?;
@@ -4548,7 +4732,7 @@ async fn repair_secret_host_failure_keeps_checkpoint_and_requires_reentry() -> R
     let parent = root.join(job.id.to_string());
     let workspace = intercat_daemon::repair::Workspace::prepare(
         &job,
-        &parent.join(job.candidate.as_ref().unwrap().generation.to_string()),
+        &job.candidate.as_ref().unwrap().workspace.clone(),
         &parent.join(format!("repair-{}", held.id)),
         &held.track,
         &settings,
@@ -4628,7 +4812,7 @@ async fn repair_secret_retry_captures_restored_edits_in_a_new_immutable_snapshot
     let (_, job, settings) = journal.repair_input(run.id).await?;
     let workspace = intercat_daemon::repair::Workspace::prepare(
         &job,
-        &f.root.path().join("candidate"),
+        &f.job.candidate.as_ref().unwrap().workspace,
         &f.root.path().join("retry-checkpoint"),
         &run.track,
         &settings,
@@ -5006,5 +5190,389 @@ async fn selected_environment_file_is_not_copied_with_untracked_hook_helpers() -
         },
     )?);
     assert_eq!(f.build(&settings).await?.state, State::Checked);
+    Ok(())
+}
+
+#[tokio::test]
+async fn repairing_a_secret_blocked_lfs_commit_uses_only_its_private_payload() -> Result<()> {
+    let mut f = Fixture::new(&[(".gitattributes", "*.lfs filter=lfs -text\n", false)]).await?;
+    let tool = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.tools/git-lfs-3.8.1/git-lfs")
+        .canonicalize()?;
+    let tools = f.root.path().join("dummy-shared-tools");
+    let store = tools.join("source-lfs");
+    fs::create_dir_all(&store)?;
+    let store = store.canonicalize()?;
+    let old = store.join("history-only-dummy");
+    fs::write(&old, "agent-created old payload\n")?;
+    git(
+        &f.source,
+        &["config", "lfs.storage", store.to_str().unwrap()],
+        None,
+    );
+    git(
+        &f.source,
+        &[
+            "config",
+            "filter.lfs.process",
+            &format!("'{}' filter-process", tool.display()),
+        ],
+        None,
+    );
+    git(&f.source, &["config", "filter.lfs.required", "true"], None);
+    let value = "agent-created-private-lfs-only-7294";
+    executable(
+        &f.source.join(".git/hooks/pre-commit"),
+        &format!(
+            "#!/bin/sh\nif [ ! -e private.lfs ]; then printf '%s\\n' '{value}' > private.lfs; git add private.lfs; fi\n"
+        ),
+    )?;
+    f.track("A", &[("file.txt", Some("A\n"), false)])?;
+    let mut settings = f.settings(None)?;
+    let environment = f.source.join(".env.test");
+    fs::write(&environment, format!("CHECK_VALUE={value}\n"))?;
+    settings.environment = Some(intercat_daemon::check_environment::Frozen::capture(
+        intercat_daemon::check_environment::Selection {
+            revision: 1,
+            file: Some(environment),
+        },
+    )?);
+    settings.toolchain.push(tools.canonicalize()?);
+    let candidate = f.build(&settings).await?;
+    assert_eq!(candidate.state, State::SecretFound);
+    let pending = candidate.blocked_commit.as_ref().unwrap();
+    let private_repo = Repository::open(candidate.workspace.join("repo"))?;
+    let entries = private_repo.lfs_entries(pending.tree.parse()?)?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        private_repo
+            .saved_bytes(
+                private_repo
+                    .tree_files(pending.tree.parse()?)?
+                    .get("private.lfs")
+                    .unwrap()
+            )?
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap(),
+        b"version https://git-lfs.github.com/spec/v1"
+    );
+    let oid = entries[0].pointer.oid();
+    assert!(
+        !store
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(oid)
+            .exists()
+    );
+    let pending_sha = pending.sha.clone();
+    let root = candidate.workspace.clone();
+    f.job.candidate = Some(candidate);
+    f.job.status = Status::Failed;
+    let workspace = intercat_daemon::repair::Workspace::prepare(
+        &f.job,
+        &root,
+        &f.root.path().join("lfs-repair"),
+        &f.job.tracks[0].id,
+        &settings,
+        watch::channel(false).1,
+    )
+    .await?;
+    assert_eq!(
+        fs::read_to_string(workspace.checkout.workdir.join("private.lfs"))?,
+        format!("{value}\n")
+    );
+    let output = workspace
+        .checkout
+        .run_check(
+            &format!("! cat '{}' >/dev/null 2>&1", old.display()),
+            &Default::default(),
+            watch::channel(false).1,
+            std::time::Duration::from_secs(5),
+        )
+        .await?;
+    assert!(output.success());
+    // The later checkpoint runs filters through a separate snapshot boundary.
+    // It must inherit the same original-store restrictions as the repair.
+    git(
+        &workspace.checkout.workdir,
+        &[
+            "config",
+            "filter.lfs.process",
+            &format!(
+                "if cat '{}' >/dev/null 2>&1; then exit 73; fi; exec '{}' filter-process",
+                old.display(),
+                tool.display()
+            ),
+        ],
+        None,
+    );
+    let journal = intercat_daemon::journal::Journal::open(
+        f.root.path().join("lfs-repair.sqlite"),
+        intercat_daemon::secrets::Key::new([7; 32]),
+    )
+    .await?;
+    let checkpoint = intercat_daemon::repair_checkpoint::save(
+        workspace.snapshot_workspace(Uuid::now_v7()),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        None,
+        &journal,
+    )
+    .await?;
+    assert!(
+        Repository::open(&workspace.checkout.workdir)?
+            .commit_details(checkpoint.sha.parse()?)
+            .is_ok()
+    );
+    assert!(
+        !store
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(oid)
+            .exists()
+    );
+    fs::write(
+        workspace.checkout.workdir.join("private.lfs"),
+        "fixed dummy payload\n",
+    )?;
+    let plan = workspace
+        .finish(&f.job, &root, &settings, watch::channel(false).1)
+        .await?;
+    let rebuilt = workspace
+        .rebuild(
+            &f.job,
+            &plan,
+            &f.root.path().join("lfs-rebuilt"),
+            &f.root.path().join("downloads"),
+            &settings,
+            watch::channel(false).1,
+        )
+        .await?;
+    assert_eq!(rebuilt.state, State::Checked, "{rebuilt:?}");
+    assert!(
+        Repository::open(&f.source)?
+            .commit_details(pending_sha.parse()?)
+            .is_err()
+    );
+    assert!(
+        !store
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(oid)
+            .exists()
+    );
+    f.unchanged()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn remaining_process_decisions_do_not_invalidate_an_applying_repair_or_depend_on_its_review()
+-> Result<()> {
+    use intercat_daemon::{
+        repair, repair_application,
+        repair_run::{Control, Event, Phase},
+        run_processes::{
+            Action as ProcessAction, Command as ProcessCommand, Remaining, State as ProcessState,
+        },
+    };
+    let (f, journal) = repair_run_fixture(false).await?;
+    executable(
+        &f.source.join(".git/hooks/pre-commit"),
+        "#!/bin/sh\nsleep 1\n",
+    )?;
+    let mut run = journal.repair_start(repair_request(&f)).await?;
+    let nonce = Uuid::now_v7();
+    let identity = intercat_daemon::process::Identity {
+        pid: 42,
+        started_seconds: 1,
+        started_micros: 1,
+    };
+    let command = Uuid::now_v7();
+    for event in [
+        Event::Prepare,
+        Event::WorkspaceReady,
+        Event::HostStarted {
+            host: identity,
+            nonce,
+            secret_revision: Some(0),
+        },
+        Event::SessionReady {
+            session: "dummy-retired-session".into(),
+        },
+        Event::ReserveStart { command },
+        Event::Started {
+            command,
+            turn: Uuid::now_v7(),
+        },
+    ] {
+        run = advance_repair(&journal, &run, event).await?;
+    }
+    let remaining = Remaining {
+        nonce,
+        host: Some(identity),
+        directory: f.root.path().join("dummy-host"),
+        workspace: f.root.path().join("dummy-workspace"),
+        label: "A".into(),
+        session_name: "Dummy session".into(),
+        created_at: 1,
+        revision: 0,
+        state: ProcessState::Waiting,
+        error: None,
+    };
+    let mut wrong = remaining.clone();
+    wrong.nonce = Uuid::now_v7();
+    assert!(journal.repair_retired(run.id, wrong).await.is_err());
+    let captured = journal.repair_retired(run.id, remaining.clone()).await?;
+    assert_eq!(captured.phase, Phase::Captured);
+    assert!(captured.host.is_none());
+    assert_eq!(
+        journal.repair_retired(run.id, remaining).await?.revision,
+        captured.revision
+    );
+    let (_, job, settings) = journal.repair_input(run.id).await?;
+    let original = job.candidate.as_ref().unwrap().workspace.clone();
+    let workspace = repair::Workspace::prepare(
+        &job,
+        &original,
+        &f.root.path().join("resource-repair"),
+        &run.track,
+        &settings,
+        watch::channel(false).1,
+    )
+    .await?;
+    fs::write(workspace.checkout.workdir.join("file.txt"), "fixed\n")?;
+    let writer = journal.clone();
+    let applying_run = captured.clone();
+    let rebuilt_root = f.root.path().join("resource-rebuilt");
+    let cache = f.root.path().join("downloads");
+    let task = tokio::spawn(async move {
+        repair_application::apply(
+            &writer,
+            &applying_run,
+            std::sync::Arc::new(intercat_daemon::run_workspace::Workspace::Fix(workspace)),
+            original,
+            rebuilt_root,
+            cache,
+            watch::channel(false).1,
+        )
+        .await
+    });
+    let applying = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let current = journal.repair_input(run.id).await?.0;
+            if current.phase == Phase::Applying {
+                break Ok::<_, Box<dyn std::error::Error + Send + Sync>>(current);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let keep = ProcessCommand {
+        op_id: Uuid::now_v7(),
+        id: run.id,
+        nonce,
+        revision: 0,
+        action: ProcessAction::Keep,
+    };
+    let kept = journal.decide_repair_processes(keep.clone()).await?;
+    assert_eq!(kept.revision, applying.revision);
+    assert_eq!(kept.remaining.as_ref().unwrap().revision, 1);
+    assert_eq!(kept.remaining.as_ref().unwrap().state, ProcessState::Kept);
+    assert_eq!(
+        journal
+            .decide_repair_processes(keep.clone())
+            .await?
+            .remaining,
+        kept.remaining
+    );
+    assert!(
+        journal
+            .repair_control(intercat_daemon::repair_run::Command {
+                op_id: Uuid::now_v7(),
+                id: run.id,
+                revision: kept.revision,
+                action: Control::Resume
+            })
+            .await
+            .is_err()
+    );
+    let done = task.await??;
+    assert_eq!(done.phase, Phase::Done);
+    assert_eq!(done.remaining.as_ref().unwrap().state, ProcessState::Kept);
+    // Move the review on. A completed Run's resources still have their owner.
+    let current = journal.repair_input(run.id).await?.1;
+    journal
+        .integration_command(integration::Command {
+            op_id: Uuid::now_v7(),
+            action: integration::Action::EditMessage {
+                id: current.id,
+                revision: current.revision,
+                track: run.track.clone(),
+                message: "Updated dummy message".into(),
+            },
+        })
+        .await?;
+    assert!(journal.repair_input(run.id).await.is_err());
+    let stop = ProcessCommand {
+        op_id: Uuid::now_v7(),
+        id: run.id,
+        nonce,
+        revision: 1,
+        action: ProcessAction::Stop,
+    };
+    let stopped = journal.decide_repair_processes(stop.clone()).await?;
+    assert_eq!(
+        stopped.remaining.as_ref().unwrap().state,
+        ProcessState::Stopping
+    );
+    assert_eq!(stopped.revision, done.revision);
+    let db = rusqlite::Connection::open(f.root.path().join("events.sqlite"))?;
+    for _ in 0..101 {
+        let mut other = done.clone();
+        other.id = Uuid::now_v7();
+        other.owner = intercat_daemon::repair_run::Owner::Commit {
+            id: Uuid::now_v7(),
+            revision: other.owner.revision(),
+        };
+        other.remaining = None;
+        db.execute(
+            "INSERT INTO repair_runs VALUES(?1,?2,0,?3)",
+            rusqlite::params![
+                other.id.to_string(),
+                other.owner.id().to_string(),
+                serde_json::to_string(&other)?
+            ],
+        )?;
+    }
+    assert!(
+        journal.snapshot().await?["repairRuns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == run.id.to_string())
+    );
+    assert!(journal.repair_processes_clear(run.id, nonce).await.is_err());
+    journal.repair_processes_cleaning(run.id, nonce).await?;
+    journal.repair_processes_clear(run.id, nonce).await?;
+    assert!(
+        journal
+            .decide_repair_processes(stop)
+            .await?
+            .remaining
+            .is_none()
+    );
+    assert!(
+        journal
+            .decide_repair_processes(ProcessCommand {
+                op_id: Uuid::now_v7(),
+                ..keep
+            })
+            .await
+            .is_err()
+    );
     Ok(())
 }

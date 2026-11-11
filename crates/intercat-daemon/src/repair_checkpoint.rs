@@ -38,6 +38,7 @@ pub async fn save(
             &workspace,
             parent.as_deref().unwrap_or(&workspace.base),
             &format!("Intercat repair checkpoint {request}\n"),
+            journal,
         )
         .await?;
         let checkpoint = Checkpoint {

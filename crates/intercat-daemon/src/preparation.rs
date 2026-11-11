@@ -18,6 +18,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
+    pub denied_roots: Vec<PathBuf>,
     pub attachment_roots: Vec<String>,
     pub track_id: String,
     pub path: PathBuf,
@@ -291,6 +292,7 @@ async fn prepare_one(
             return Err(std::io::Error::other("Invalid track label.").into());
         }
         let mut workspace = Workspace {
+            denied_roots: Vec::new(),
             attachment_roots: Vec::new(),
             track_id: id.into(),
             path: root.join(session_id).join(id),
@@ -318,18 +320,11 @@ async fn prepare_one(
                 source.head = initial.head.parse()?;
                 workspace.base = initial.head.clone();
                 if workspace.path.exists() {
-                    let path = workspace.path.clone();
                     let expected = source.head;
-                    tokio::task::spawn_blocking(move || -> Result<()> {
-                        let saved = Repository::clean_project(&path)?;
-                        if saved.head != expected {
-                            return Err(
-                                "The inherited workspace has another starting point.".into()
-                            );
-                        }
-                        Ok(())
-                    })
-                    .await??;
+                    let saved = crate::source_snapshot::clean_project(&workspace.path).await?;
+                    if saved.head != expected {
+                        return Err("The inherited workspace has another starting point.".into());
+                    }
                 }
                 inherited = Some(initial);
             }

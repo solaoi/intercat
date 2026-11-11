@@ -16,6 +16,11 @@ pub struct Prepared {
     pub copied: Vec<PathBuf>,
 }
 
+pub enum Purpose {
+    Commit,
+    Push,
+}
+
 fn safe_target(root: &Path, relative: &Path) -> Result<PathBuf> {
     let mut current = root.to_path_buf();
     for component in relative.components() {
@@ -44,6 +49,7 @@ pub fn prepare(
     source: &WorktreeSource,
     tree: ObjectId,
     excluded: Option<&Path>,
+    purpose: Purpose,
 ) -> Result<Prepared> {
     checkout.verify_storage()?;
     let source_hook = &checkout.configuration.hooks_directory;
@@ -141,12 +147,16 @@ pub fn prepare(
         .join("control")
         .join(format!("hooks-{}", uuid::Uuid::now_v7()));
     fs::create_dir(&directory)?;
-    for name in [
-        "pre-commit",
-        "prepare-commit-msg",
-        "commit-msg",
-        "post-commit",
-    ] {
+    let names: &[&str] = match purpose {
+        Purpose::Commit => &[
+            "pre-commit",
+            "prepare-commit-msg",
+            "commit-msg",
+            "post-commit",
+        ],
+        Purpose::Push => &["pre-push"],
+    };
+    for name in names {
         let hook = real_hooks.join(name);
         let Ok(meta) = fs::metadata(&hook) else {
             continue;

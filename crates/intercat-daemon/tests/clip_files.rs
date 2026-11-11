@@ -94,6 +94,7 @@ impl Fixture {
                 rusqlite::params![track, if n == 0 { "A" } else { "B" }],
             )?;
             let space = Workspace {
+                denied_roots: Vec::new(),
                 track_id: track.clone(),
                 path: path.canonicalize()?,
                 reference: format!("refs/intercat/dummy-{n}"),
@@ -140,6 +141,7 @@ impl Fixture {
             &self.spaces[n],
             &self.spaces[n].base,
             "Dummy before\n",
+            &self.journal,
         )
         .await?
         .sha;

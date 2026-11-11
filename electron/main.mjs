@@ -1,10 +1,18 @@
+import { registerComparison } from './comparison.mjs';
+import {validateFresh} from './fresh-input.mjs';
+import { validatePush } from './push-input.mjs';
+import { validatePull,githubLink } from './pull-input.mjs';
 import { privacyPreview, privacyText } from './privacy.mjs';
 import { app, BrowserWindow, dialog, ipcMain, Menu, MenuItem, net, powerMonitor, protocol, session, shell } from 'electron';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { applyMergeInput } from './merge-input.mjs';
+import { promisify } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { connectDaemon, operationId, uiToken } from './daemon.mjs';
 import { registerFingerprint, validSecretName, receiptMismatch } from './secrets.mjs';
-import { branchFromCheckpoint } from './branches.mjs';
+import { branchFromCheckpoint, validateBranchRequest } from './branches.mjs';
+import { validateTwoWays,validateTwoWaysEdit,finishTwoWays } from './two-ways.mjs';
 import { pickupFromFiles, cancelFileRecovery } from './pickup.mjs';
 import { referenceImporter } from './attachments.mjs';
 import { rebuildProjectFingerprints, reviewBackup, applyBackup } from './fingerprint-recovery.mjs';
@@ -15,6 +23,7 @@ import { draftStore } from './drafts.mjs';
 import { pastedTextStore } from './pasted-text.mjs';
 import { editorPresentation } from './editor-presentation.mjs';
 import { commandPlan, observePlans, planWindowFocused, replyPlan } from './plans.mjs';
+import { ProjectSetup } from './project-setup.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const assets = path.join(root, 'dist');
@@ -27,12 +36,13 @@ if (!singleInstance) app.quit();
 const preview = process.argv.includes('--preview');
 const presentation = editorPresentation({ directory: app.getPath('userData') });
 const drafts = draftStore(connection);
+const projectSetup = new ProjectSetup(connection, operationId);
 const pastedText = pastedTextStore({ directory: path.join(app.getPath('userData'), 'pasted-text'), client: connection });
 let daemon;
 let blockedConnection;
 function connection() {
   if (blockedConnection) return Promise.reject(blockedConnection);
-  daemon ??= uiToken().then(token => connectDaemon(path.join(root, 'target/debug/intercatd'), path.join(app.getPath('userData'), 'daemon'), token, path.join(root, 'services/editor/src'), path.join(root, '.tools/gitleaks-8.30.1/gitleaks')));
+  daemon ??= uiToken().then(token => connectDaemon(path.join(root, 'target/debug/intercatd'), path.join(app.getPath('userData'), 'daemon'), token, path.join(root, 'services/editor/src'), path.join(root, '.tools/gitleaks-8.30.1/gitleaks'), path.join(root, '.tools/git-lfs-3.8.1/git-lfs')));
   return daemon;
 }
 const quitting = quitController({
@@ -98,7 +108,7 @@ async function status() {
 }
 ipcMain.handle('intercat:status', async event => {
   authorize(event);
-  return status();
+  return { ...(await status()), projectSelection: projectSetup.current(event.sender.id)?.selection ?? null };
 });
 ipcMain.handle('intercat:drafts-read', async (event, session) => {
   authorize(event);
@@ -168,24 +178,55 @@ ipcMain.handle('intercat:pickup', async (event, request) => {
     || ![request.opId, request.trackId, request.sessionId].every(value => typeof value === 'string' && value.length <= 128)) throw new Error('Invalid recovery request');
   return pickupFromFiles(await connection(), request);
 });
+for(const [channel,method] of [['fresh-prepare','worker.fresh.prepare'],['fresh-command','worker.fresh.command'],['fresh-read','worker.fresh.read']])ipcMain.handle(`intercat:${channel}`,async(event,request)=>{
+  authorize(event);
+  if(preview)throw new Error('Connect workers before starting a fresh conversation.');
+  return (await connection()).request(method,validateFresh(method,request));
+});
 ipcMain.handle('intercat:pickup-cancel', async (event, request) => {
   authorize(event);
   if (preview || !request || Object.keys(request).sort().join(',') !== 'opId,recoveryId,sessionId,trackId'
     || ![request.opId, request.recoveryId, request.trackId, request.sessionId].every(value => typeof value === 'string' && value.length <= 128)) throw new Error('Invalid cancellation request');
   return cancelFileRecovery(await connection(), request);
 });
+for(const [channel,method] of [['two-ways-read','two-ways.read'],['two-ways-command','two-ways.command'],['two-ways-options','two-ways.options']])ipcMain.handle(`intercat:${channel}`,async(event,request)=>{
+  authorize(event);if(preview)throw new Error('Connect to the daemon before preparing two paths.');
+  return (await connection()).request(method,validateTwoWays(method,request));
+});
+ipcMain.handle('intercat:two-ways-finish',async(event,request)=>{
+  authorize(event);if(preview)throw new Error('Connect to the daemon before confirming two paths.');
+  return finishTwoWays(await connection(),validateTwoWays('two-ways.read',request));
+});
 ipcMain.handle('intercat:branch-points', async (event, request) => {
   authorize(event);
-  if (preview || !request || Object.keys(request).sort().join(',') !== 'before,trackId'
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'before,range,trackId'
     || typeof request.trackId !== 'string' || !request.trackId.length || request.trackId.length > 128
-    || request.before !== null && (!Number.isSafeInteger(request.before) || request.before <= 0)) throw new Error('Invalid branch point query');
+    || request.before !== null && (!Number.isSafeInteger(request.before) || request.before <= 0)
+    || request.range !== null && (!request.range || Object.keys(request.range).sort().join(',') !== 'end,start' || !Number.isSafeInteger(request.range.start) || !Number.isSafeInteger(request.range.end) || request.range.start < 0 || request.range.end < request.range.start)) throw new Error('Invalid branch point query');
   return (await connection()).request('branch.points', request);
 });
 ipcMain.handle('intercat:branch', async (event, request) => {
   authorize(event);
-  if (preview || !request || Object.keys(request).sort().join(',') !== 'opId,parentTrackId,turnId'
-    || ![request.opId, request.parentTrackId, request.turnId].every(value => typeof value === 'string' && value.length <= 128)) throw new Error('Invalid branch request');
+  if (preview) throw new Error('Branching needs a connected daemon');
+  validateBranchRequest(request);
   return branchFromCheckpoint(await connection(), request);
+});
+ipcMain.handle('intercat:pull-github',async(event,request)=>{
+  authorize(event);
+  if(preview||!request||Object.keys(request).sort().join(',')!=='folderId,id,kind'||typeof request.folderId!=='string'||request.folderId.length>128||!['pull','branch'].includes(request.kind))throw new Error('Invalid saved GitHub link');
+  const job=await(await connection()).request('pull.read',validatePull('pull.read',{id:request.id}));
+  await shell.openExternal(githubLink(job,request.folderId,request.kind));
+});
+registerComparison({ ipcMain, authorize, preview, connection });
+for(const [channel,method] of [['pull-open','pull.open'],['pull-command','pull.command'],['pull-read','pull.read']])ipcMain.handle(`intercat:${channel}`,async(event,request)=>{
+  authorize(event);
+  if(preview)throw new Error('Connect to the local daemon before opening PR.');
+  return (await connection()).request(method,validatePull(method,request));
+});
+for (const [channel,method] of [['push-remotes','push.remotes'],['push-review','push.review'],['push-presentation','push.presentation'],['push-command','push.command']]) ipcMain.handle(`intercat:${channel}`,async(event,request)=>{
+  authorize(event);
+  if(preview)throw new Error('Connect to the local daemon before Push.');
+  return (await connection()).request(method,validatePush(method,request));
 });
 ipcMain.handle('intercat:integration-command', async (event, request) => {
   authorize(event);
@@ -194,21 +235,63 @@ ipcMain.handle('intercat:integration-command', async (event, request) => {
 });
 ipcMain.handle('intercat:integration-diff', async (event, request) => {
   authorize(event);
-  if (preview || !request || Object.keys(request).sort().join(',') !== 'id,path,revision,track' || typeof request.path !== 'string' || request.path.length > 16384 || typeof request.id !== 'string' || typeof request.track !== 'string' || !Number.isSafeInteger(request.revision)) throw new Error('Invalid diff request');
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'id,owner,path,revision' || typeof request.path !== 'string' || request.path.length > 16384 || typeof request.id !== 'string' || !Number.isSafeInteger(request.revision) || request.revision<1 || !request.owner || (request.owner.kind==='worker' ? Object.keys(request.owner).sort().join(',')!=='kind,track'||typeof request.owner.track!=='string' : request.owner.kind!=='undo'||Object.keys(request.owner).join(',')!=='kind')) throw new Error('Invalid diff request');
   return (await connection()).request('integration.diff', request);
 });
 for (const [channel, method, keys] of [
-  ['repair-start', 'repair.start', 'jobId,opId,purpose,revision,track'],
+  ['repair-start', 'repair.start', 'opId,owner,purpose,track'],
   ['repair-followup', 'repair.followup', 'id,opId,revision,selection,text'],
   ['repair-refresh', 'repair.refresh', 'jobId,opId,repairId,revision'],
   ['repair-control', 'repair.control', 'action,id,opId,revision'],
+  ['repair-processes', 'repair.processes', 'action,id,nonce,opId,revision'],
   ['repair-stop', 'repair.stop', 'id,opId'],
   ['repair-answer', 'repair.answer', 'approvalId,id,opId,requirement,response'],
   ['repair-respond', 'repair.respond', 'id,opId,promptId,response,revision'],
+  ['merge-begin', 'merge.begin', 'id,opId,revision'],
+  ['merge-start', 'merge.start', 'opId,owner,purpose,track'],
+  ['merge-return', 'merge.return', 'id,opId,revision'],
+  ['realign-request', 'realign.request', 'opId,source,trackId'],
+  ['realign-control', 'realign.control', 'action,id,opId,revision'],
+  ['path-restore','path.restore','opId,retirementId'],
+  ['path-restore-control','path.restore-control','action,id,opId,revision'],
+  ['path-restore-access','path.restore-access','fingerprint,opId,request'],
+  ['aside-process-stop','path.stop-processes','opId,retirementId'],
+  ['commit-group-open','commit.group.open','opId,tracks'],
+  ['commit-group-commit','commit.group.commit','id,opId,revision,targets'],
+  ['commit-group-discard','commit.group.discard','id,opId,revision'],
 ]) ipcMain.handle(`intercat:${channel}`, async (event, request) => {
   authorize(event);
   if (preview || !request || Object.keys(request).sort().join(',') !== keys || typeof request.opId !== 'string') throw new Error('Invalid repair request');
+  if(['repair-start','merge-start'].includes(channel)&&(!request.owner||Object.keys(request.owner).sort().join(',')!=='id,kind,revision'||!['commit','realign','undo','shared','restore'].includes(request.owner.kind)||typeof request.owner.id!=='string'||request.owner.id.length>128||!Number.isSafeInteger(request.owner.revision)||request.owner.revision<1))throw new Error('Invalid integration Run owner');
+  if (channel === 'repair-processes' && (typeof request.id !== 'string' || typeof request.nonce !== 'string' || !Number.isSafeInteger(request.revision) || request.revision < 0 || !['keep', 'stop', 'retry-cleanup'].includes(request.action))) throw new Error('Invalid Run process request');
+  if (channel === 'realign-request' && (typeof request.trackId !== 'string' || request.trackId.length > 128 || !request.source || !['commit','reparent'].includes(request.source.kind) || Object.keys(request.source).sort().join(',') !== (request.source.kind==='commit'?'jobId,kind,revision':'jobId,kind,parent,revision') || typeof request.source.jobId !== 'string' || request.source.jobId.length>128 || !Number.isSafeInteger(request.source.revision) || request.source.revision<1 || request.source.kind==='reparent' && (typeof request.source.parent!=='string'||request.source.parent.length>128))) throw new Error('Invalid realignment source');
+  if (channel === 'realign-control' && (!Number.isSafeInteger(request.revision)||request.revision<1||typeof request.id!=='string'||!request.action||typeof request.action!=='object')) throw new Error('Invalid realignment control');
+  if(channel==='commit-group-open'&&request.tracks!==null&&(!Array.isArray(request.tracks)||request.tracks.length>256||request.tracks.some(track=>typeof track!=='string'||track.length>128)))throw new Error('Invalid group tracks');
+  if(channel.startsWith('commit-group-')&&channel!=='commit-group-open'&&(typeof request.id!=='string'||!Number.isSafeInteger(request.revision)||request.revision<1))throw new Error('Invalid all-folder review');
+  if(channel==='commit-group-commit'&&(!Array.isArray(request.targets)||request.targets.length>8||request.targets.some(target=>!target||Object.keys(target).sort().join(',')!=='head,jobId,revision,settingsHash,tree'||!['head','jobId','settingsHash','tree'].every(key=>typeof target[key]==='string'&&target[key].length<=128)||!Number.isSafeInteger(target.revision)||target.revision<1)))throw new Error('Invalid all-folder candidate');
   return (await connection()).request(method, request);
+});
+ipcMain.handle('intercat:aside-processes',async(event,request)=>{
+  authorize(event);
+  if(preview||!request||Object.keys(request).join(',')!=='retirementId'||typeof request.retirementId!=='string'||request.retirementId.length>128)throw new Error('Invalid retired path');
+  return (await connection()).request('path.processes',request);
+});
+ipcMain.handle('intercat:merge-apply',async(event,request)=>{
+  authorize(event);
+  if(preview||!request||Object.keys(request).sort().join(',')!=='files,id,opId,revision')throw new Error('Invalid manual resolution');
+  return applyMergeInput({directory:path.join(app.getPath('userData'),'daemon','merge-inputs'),client:connection,request});
+});
+ipcMain.handle('intercat:merge-read', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'id,path,revision' || typeof request.id !== 'string' || !Number.isSafeInteger(request.revision) || request.path !== null && typeof request.path !== 'string') throw new Error('Invalid conflict query');
+  return (await connection()).request('merge.read',request);
+});
+ipcMain.handle('intercat:merge-open', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'id,opId,path,revision' || typeof request.path !== 'string' || typeof request.opId !== 'string') throw new Error('Invalid conflict editor request');
+  const file = await (await connection()).request('merge.open', request);
+  if (typeof file !== 'string' || !path.isAbsolute(file)) throw new Error('Invalid conflict editor path');
+  await promisify(execFile)('/usr/bin/open',['-t',file],{timeout:10000});
 });
 ipcMain.handle('intercat:editor-log', async (event, request) => {
   authorize(event);
@@ -322,6 +405,16 @@ ipcMain.handle('intercat:execution-limits-change', async (event, request) => {
   authorize(event);
   if (preview) return { revision: request.revision + 1, parallelWorkers: request.parallelWorkers, plannerReviewerTurns: request.plannerReviewerTurns };
   return (await connection()).request('execution-limits.change', request);
+});
+ipcMain.handle('intercat:checks', async event => {
+  authorize(event);
+  if (preview) return { setting: { revision: 0, folders: {} }, folders: [] };
+  return (await connection()).request('checks.get', {});
+});
+ipcMain.handle('intercat:checks-change', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'command,folder,history,opId,revision' || typeof request.folder !== 'string' || typeof request.history !== 'boolean' || !Number.isSafeInteger(request.revision)) throw new Error('Invalid Check settings change.');
+  return (await connection()).request('checks.change', request);
 });
 ipcMain.handle('intercat:check-environment', async event => {
   authorize(event);
@@ -454,15 +547,17 @@ ipcMain.handle('intercat:folder-assign', async (event, request) => { authorize(e
 ipcMain.handle('intercat:project-setup', async event => {
   authorize(event);
   if (preview) return { project: null };
+  const current = projectSetup.current(event.sender.id);
+  if (current) return current;
   const window = BrowserWindow.fromWebContents(event.sender);
   const selected = await dialog.showOpenDialog(window, { title: 'Choose project folders (up to 8)', properties: ['openDirectory', 'multiSelections'] });
   if (selected.canceled) return { project: null };
-  try {
-    const client = await connection();
-    const project = await client.request('project.configure', { opId: operationId(), name: path.basename(selected.filePaths[0]), paths: selected.filePaths });
-    await synchronizeProjectSecrets(client, operationId());
-    return { project };
-  } catch (error) { return { project: null, error: error.message }; }
+  return projectSetup.begin(event.sender.id, selected.filePaths);
+});
+ipcMain.handle('intercat:project-selection', async (event, request) => {
+  authorize(event);
+  if (preview) throw new Error('Folder selection is unavailable in preview.');
+  return projectSetup.resolve(event.sender.id, request);
 });
 ipcMain.handle('intercat:worker-setup', async event => {
   authorize(event);
@@ -483,6 +578,11 @@ ipcMain.handle('intercat:inheritance-finish', async (event, request) => {
   authorize(event);
   if (preview || !request || Object.keys(request).sort().join(',') !== 'applicationId,opId,trackId' || !['applicationId','opId','trackId'].every(key => typeof request[key] === 'string')) throw new Error('Invalid request');
   return (await connection()).request('inheritance.finish', request);
+});
+ipcMain.handle('intercat:checkpoint-exclude', async (event, request) => {
+  authorize(event);
+  if (preview || !request || Object.keys(request).sort().join(',') !== 'issueId,opId,revision' || typeof request.issueId !== 'string' || typeof request.opId !== 'string' || !Number.isSafeInteger(request.revision) || request.revision < 1) throw new Error('Invalid request');
+  return (await connection()).request('checkpoint.exclude', request);
 });
 ipcMain.handle('intercat:inheritance-issue', async (event, request) => {
   authorize(event);
@@ -608,6 +708,7 @@ ipcMain.handle('intercat:plan-edit', async (event, action) => {
 ipcMain.handle('intercat:edit-request', async (event, action) => {
   authorize(event);
   if (preview || !action || !['begin', 'renew', 'apply', 'end'].includes(action.kind)) throw new Error('Invalid request edit');
+  if(action.edit?.kind==='tryTwoWays')validateTwoWaysEdit(action);
   const contents = event.sender;
   const owner = windowOwner(contents);
   const client = await connection();
@@ -662,6 +763,8 @@ function createWindow() {
     backgroundColor: '#0c0d10', titleBarStyle: 'hiddenInset',
     webPreferences: { preload: path.join(root, 'electron/preload.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false, webSecurity: true, spellcheck: false },
   });
+  const projectOwner = window.webContents.id;
+  window.webContents.once('destroyed', () => projectSetup.forget(projectOwner));
   presentation.attach(window, state => {
     if (!window.webContents.isDestroyed()) window.webContents.send('intercat:editor-presentation-changed', state);
   });

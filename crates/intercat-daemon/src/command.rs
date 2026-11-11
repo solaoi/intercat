@@ -1,6 +1,6 @@
 //! Bounded, cancellable child execution shared by isolated tools and checks.
 use crate::{Result, process::Tracker};
-use std::{ffi::OsStr, process::Stdio, time::Duration};
+use std::{ffi::OsStr, path::Path, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -96,14 +96,15 @@ impl Drop for Children {
 
 /// A fixed, non-interactive launcher holds before exec until `run` has recorded
 /// its PID/start time and process group. Even an instant command cannot exit
-/// between spawn and registration. The payload receives /dev/null as stdin.
-pub(crate) fn gated_command(program: impl AsRef<OsStr>) -> Command {
+/// between spawn and registration. Input is a private file, or /dev/null.
+pub(crate) fn gated_command(program: impl AsRef<OsStr>, input: Option<&Path>) -> Command {
     let mut command = Command::new("/bin/sh");
     command
         .env_clear()
         .arg("-c")
-        .arg("IFS= read -r intercat_ready || exit 125\n[ \"$intercat_ready\" = start ] || exit 125\nexec \"$@\" < /dev/null")
+        .arg("IFS= read -r intercat_ready || exit 125\n[ \"$intercat_ready\" = start ] || exit 125\nintercat_input=$1\nshift\nexec \"$@\" < \"$intercat_input\"")
         .arg("intercat-command")
+        .arg(input.unwrap_or(Path::new("/dev/null")))
         .arg(program);
     command
 }
@@ -182,7 +183,7 @@ mod tests {
     async fn command_cannot_execute_before_tracking_and_keeps_arguments_literal() -> Result<()> {
         let root = tempfile::tempdir()?;
         let payload = root.path().join("literal; $(touch not-executed)");
-        let mut command = gated_command("/usr/bin/touch");
+        let mut command = gated_command("/usr/bin/touch", None);
         command
             .arg(&payload)
             .current_dir(root.path())
@@ -208,7 +209,7 @@ mod tests {
     #[tokio::test]
     async fn instant_commands_are_registered_before_they_can_exit() -> Result<()> {
         for code in [0, 7, 0, 23].into_iter().cycle().take(64) {
-            let mut command = gated_command("/bin/sh");
+            let mut command = gated_command("/bin/sh", None);
             command.args(["-c", &format!("exit {code}")]);
             let output = run(
                 &mut command,
@@ -219,6 +220,77 @@ mod tests {
             assert_eq!(output.code, Some(code));
             assert!(!output.cancelled);
             assert!(output.stdout.is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn input_file_reaches_payload_without_becoming_gate_commands() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let input = root.path().join("input; $(touch not-executed)");
+        let bytes = b"start\n$(touch not-executed)\nsecond\0line\n";
+        std::fs::write(&input, bytes)?;
+        let mut command = gated_command("/bin/cat", Some(&input));
+        command.current_dir(root.path());
+        let result = run(
+            &mut command,
+            watch::channel(false).1,
+            Duration::from_secs(5),
+        )
+        .await?;
+        assert!(result.success());
+        assert_eq!(result.stdout, bytes);
+        assert!(!root.path().join("not-executed").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_or_dropping_a_command_stops_its_children_and_keeps_other_hosts_alive()
+    -> Result<()> {
+        for abort in [false, true] {
+            let root = tempfile::tempdir()?;
+            let other = crate::test_host::IdleTestHost::new()?;
+            let record = root.path().join("own-processes.json");
+            let written = record.clone();
+            let (stop, stopping) = watch::channel(false);
+            let task = tokio::spawn(async move {
+                let mut command = gated_command("/usr/bin/python3", None);
+                command.args([
+                    "-c",
+                    "import json,os,subprocess,sys,time\np=subprocess.Popen(['/bin/sleep','30'])\nwith open(sys.argv[1],'w') as f: json.dump({'host':os.getpid(),'child':p.pid},f)\ntime.sleep(30)\n",
+                ]).arg(written);
+                run(&mut command, stopping, Duration::from_secs(30)).await
+            });
+            let identities = tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if let Ok(bytes) = std::fs::read(&record)
+                        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        && let (Some(host), Some(child)) =
+                            (value["host"].as_u64(), value["child"].as_u64())
+                    {
+                        break Ok::<_, Box<dyn std::error::Error + Send + Sync>>([
+                            crate::process::identity(host.try_into()?)?,
+                            crate::process::identity(child.try_into()?)?,
+                        ]);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await??;
+            if abort {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                stop.send(true)?;
+                assert!(task.await??.cancelled);
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while identities.into_iter().any(crate::process::is_alive) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            assert!(crate::process::is_alive(other.identity()?));
         }
         Ok(())
     }

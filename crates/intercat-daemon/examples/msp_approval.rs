@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     let (port, commands) = execution::Port::new(std::sync::Arc::new(
         intercat_daemon::dispatch_control::Gate::new(false),
     ));
-    port.attach(connection.client.clone(), fixture.session.clone());
+    port.attach(connection.client.clone(), fixture.session.clone(), None);
     let mut context = execution::Context {
         project_secrets: Default::default(),
         port,

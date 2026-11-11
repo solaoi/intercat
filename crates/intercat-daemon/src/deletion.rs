@@ -455,7 +455,8 @@ pub async fn prepare(
 ) -> Result<Snapshot> {
     validate_parent(&workspace.path, "")?;
     let captured =
-        crate::checkpoint::capture(&workspace, &parent, "Intercat before deletion\n").await?;
+        crate::checkpoint::capture(&workspace, &parent, "Intercat before deletion\n", &journal)
+            .await?;
     let path = workspace.path.clone();
     let sha = captured.sha.clone();
     let inspect = request.clone();
@@ -520,6 +521,7 @@ pub async fn before_restore(
         workspace,
         &source.sha,
         "Intercat before restoring saved files\n",
+        journal,
     )
     .await?;
     let path = workspace.path.clone();

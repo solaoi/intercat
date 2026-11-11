@@ -45,9 +45,9 @@ server=ThreadingHTTPServer(('127.0.0.1',0),Handler);print(json.dumps({'host':'12
       await app.evaluate(async (_electron, paths) => {
         const load = process.getBuiltinModule('module').createRequire(paths.module);
         const { connectDaemon, uiToken } = load(paths.module);
-        const client = await connectDaemon(paths.binary, paths.directory, await uiToken(), paths.editor, paths.gitleaks);
+        const client = await connectDaemon(paths.binary, paths.directory, await uiToken(), paths.editor, paths.gitleaks, paths.gitLfs);
         client.close();
-      }, { module: path.resolve('electron/daemon.mjs'), binary: process.env.INTERCAT_TEST_DAEMON, directory: path.join(data, 'daemon'), editor: path.resolve('services/editor/src'), gitleaks: path.resolve('.tools/gitleaks-8.30.1/gitleaks') });
+      }, { module: path.resolve('electron/daemon.mjs'), binary: process.env.INTERCAT_TEST_DAEMON, directory: path.join(data, 'daemon'), editor: path.resolve('services/editor/src'), gitleaks: path.resolve('.tools/gitleaks-8.30.1/gitleaks'), gitLfs: path.resolve('.tools/git-lfs-3.8.1/git-lfs') });
       await closeWindow(app);
       app = await electron.launch({ args: ['.', `--user-data-dir=${data}`] });
     }

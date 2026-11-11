@@ -126,20 +126,20 @@ pub fn from_view(db: &Connection, session: &str, view: &SessionView) -> Result<(
     )
 }
 
-pub fn read(db: &Connection, session: &str, turn: Option<&str>) -> Result<Option<Parameters>> {
-    let stored = load(db, session)?;
-    // A submitted turn can override the standing session default. Fresh MSP
-    // turns use their command ID as their turn ID, so this is a primary-key read.
-    let turn_effort = turn
-        .map(|turn| {
-            db.query_row(
+pub(crate) fn turn_effort(db: &Connection, session: &str, turn: &str) -> Result<Option<String>> {
+    // Fresh MSP turns use their command ID as their turn ID.
+    Ok(db.query_row(
                 "SELECT json_extract(payload,'$.reasoningEffort') FROM operations WHERE id=?1 AND kind='turn.start' AND json_extract(payload,'$.sessionId')=?2",
                 params![turn, session],
                 |row| row.get::<_, Option<String>>(0),
-            ).optional().map(Option::flatten)
-        })
-        .transpose()?;
-    let turn_effort = turn_effort.flatten();
+            ).optional()?.flatten())
+}
+pub fn read(db: &Connection, session: &str, turn: Option<&str>) -> Result<Option<Parameters>> {
+    let stored = load(db, session)?;
+    let turn_effort = turn
+        .map(|turn| turn_effort(db, session, turn))
+        .transpose()?
+        .flatten();
     if stored.model.is_none() && stored.effort.is_none() && turn_effort.is_none() {
         return Ok(None);
     }

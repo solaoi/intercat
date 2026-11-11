@@ -163,6 +163,7 @@ async fn a_started_request_stops_history_but_an_older_cut_can_be_restored_indivi
             revision,
             track,
             json!({"sessionId":"session"}),
+            None,
         )
         .await?;
     let started = journal.snapshot().await?;

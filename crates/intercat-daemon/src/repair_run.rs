@@ -13,6 +13,7 @@ use uuid::Uuid;
 )]
 pub enum Purpose {
     Check,
+    Merge,
     RemoveSecret {
         finding: String,
     },
@@ -45,12 +46,52 @@ pub struct Selection {
     pub end_line: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum Owner {
+    Commit { id: Uuid, revision: u64 },
+    Realign { id: Uuid, revision: u64 },
+    Undo { id: Uuid, revision: u64 },
+    Shared { id: Uuid, revision: u64 },
+    Restore { id: Uuid, revision: u64 },
+}
+impl Owner {
+    pub fn id(self) -> Uuid {
+        match self {
+            Self::Commit { id, .. }
+            | Self::Realign { id, .. }
+            | Self::Undo { id, .. }
+            | Self::Shared { id, .. }
+            | Self::Restore { id, .. } => id,
+        }
+    }
+    pub fn revision(self) -> u64 {
+        match self {
+            Self::Commit { revision, .. }
+            | Self::Realign { revision, .. }
+            | Self::Undo { revision, .. }
+            | Self::Shared { revision, .. }
+            | Self::Restore { revision, .. } => revision,
+        }
+    }
+    pub(crate) fn commit(self) -> Result<(Uuid, u64)> {
+        match self {
+            Self::Commit { id, revision } => Ok((id, revision)),
+            Self::Realign { .. }
+            | Self::Undo { .. }
+            | Self::Shared { .. }
+            | Self::Restore { .. } => {
+                Err(Rejected("This operation requires a Commit review.").into())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Request {
     pub op_id: Uuid,
-    pub job_id: Uuid,
-    pub revision: u64,
+    pub owner: Owner,
     pub track: String,
     pub purpose: Purpose,
 }
@@ -79,6 +120,7 @@ pub enum Phase {
     Running,
     Stopping,
     Held,
+    Manual,
     Captured,
     Applying,
     Done,
@@ -92,8 +134,7 @@ pub enum Phase {
 pub struct Run {
     pub id: Uuid,
     pub revision: u64,
-    pub job_id: Uuid,
-    pub job_revision: u64,
+    pub owner: Owner,
     pub track: String,
     pub purpose: Purpose,
     pub phase: Phase,
@@ -116,6 +157,9 @@ pub struct Run {
     pub selection: Option<Selection>,
     pub refresh: Option<Refresh>,
     pub restoring: Option<Uuid>,
+    pub remaining: Option<crate::run_processes::Remaining>,
+    pub manual: Option<crate::merge_manual::Snapshot>,
+    pub external_editor: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,6 +215,16 @@ pub struct Command {
     deny_unknown_fields
 )]
 pub enum Event {
+    BeginManual,
+    ManualFailed,
+    ExternalOpened {
+        path: String,
+    },
+    ExternalReturned,
+    CaptureManual {
+        snapshot: crate::merge_manual::Snapshot,
+        cleanup: Box<crate::run_processes::Remaining>,
+    },
     Prepare,
     WorkspaceReady,
     HostStarted {
@@ -213,18 +267,84 @@ pub enum Outcome {
 }
 
 impl Run {
+    pub(crate) fn new(request: Request, owner: Owner, manual: bool) -> Self {
+        Self {
+            id: Uuid::new_v5(&request.op_id, b"repair"),
+            revision: 1,
+            owner,
+            track: request.track,
+            selection: match &request.purpose {
+                crate::repair_run::Purpose::Edit { selection, .. } => Some(selection.clone()),
+                _ => None,
+            },
+            purpose: request.purpose,
+            phase: if manual { Phase::Manual } else { Phase::Queued },
+            created_at: crate::journal::timestamp(),
+            host: None,
+            host_nonce: None,
+            secret_revision: None,
+            secret_input: None,
+            checkpoint: None,
+            session: None,
+            session_ready: false,
+            workspace_ready: false,
+            start_command: None,
+            turn: None,
+            failure: None,
+            approvals: vec![],
+            prompts: vec![],
+            output: None,
+            instruction: None,
+            refresh: None,
+            restoring: None,
+            remaining: None,
+            manual: None,
+            external_editor: false,
+        }
+    }
+
+    pub(crate) fn retired(&mut self, mut remaining: crate::run_processes::Remaining) -> Result<()> {
+        if !matches!(self.phase, Phase::Running | Phase::Stopping)
+            || remaining.host.is_none()
+            || self.host != remaining.host
+            || self.host_nonce != Some(remaining.nonce)
+            || self.turn.is_none()
+            || self.remaining.is_some()
+        {
+            return Err("The retired host does not own the current repair Run.".into());
+        }
+        if self.phase == Phase::Stopping && remaining.state != crate::run_processes::State::Cleaning
+        {
+            remaining.state = crate::run_processes::State::Stopping;
+        }
+        if self.phase != Phase::Stopping {
+            self.phase = Phase::Captured;
+        }
+        self.remaining = Some(remaining);
+        self.transport_closed();
+        Ok(())
+    }
+    fn transport_closed(&mut self) {
+        self.host = None;
+        self.host_nonce = None;
+        self.secret_revision = None;
+        self.session_ready = false;
+        self.approvals.clear();
+        self.prompts.clear();
+    }
     pub(crate) fn validate_request(job: &integration::Job, request: &Request) -> Result<()> {
+        let (job_id, revision) = request.owner.commit()?;
         let candidate = job
             .candidate
             .as_ref()
             .ok_or(Rejected("No candidate to repair."))?;
-        if job.id != request.job_id
-            || job.revision != request.revision
+        if job.id != job_id
+            || job.revision != revision
             || !matches!(
                 job.status,
                 integration::Status::Failed | integration::Status::Checked
             )
-            || candidate.revision != request.revision
+            || candidate.revision != revision
             || candidate.job_id != job.id
         {
             return Err(Rejected("The candidate changed. Review it again.").into());
@@ -237,6 +357,16 @@ impl Run {
             return Err(Rejected("Choose a track included in this candidate.").into());
         }
         match &request.purpose {
+            Purpose::Merge
+                if candidate.state == State::Conflict
+                    && candidate.failed_track.as_deref() == Some(request.track.as_str())
+                    && matches!(
+                        candidate.conflict,
+                        Some(crate::merge_resolution::Conflict::Overlay { .. })
+                    ) =>
+            {
+                Ok(())
+            }
             Purpose::Check
                 if matches!(candidate.state, State::CheckFailed | State::CheckMutated)
                     && candidate.commits.iter().any(|c| c.track == request.track) =>
@@ -245,14 +375,18 @@ impl Run {
             }
             Purpose::RemoveSecret { finding }
                 if candidate.state == State::SecretFound
-                    && candidate
-                        .blocked_commit
-                        .as_ref()
-                        .is_some_and(|c| c.track == request.track)
-                    && candidate
-                        .secret_scans
-                        .last()
-                        .is_some_and(|s| s.findings.iter().any(|f| &f.id == finding))
+                    && candidate.secret_scans.last().is_some_and(|scan| {
+                        scan.findings.iter().any(|item| {
+                            &item.id == finding
+                                && item.rule != crate::secret_scan::BINARY_REVIEW_RULE
+                        }) && candidate
+                            .commits
+                            .iter()
+                            .chain(&candidate.blocked_commit)
+                            .any(|commit| {
+                                commit.track == request.track && commit.sha == scan.binding.commit
+                            })
+                    })
                     && !job.kept_secrets.contains(finding) =>
             {
                 Ok(())
@@ -323,6 +457,12 @@ impl Run {
     }
 
     pub(crate) fn control(&mut self, control: Control) -> Result<()> {
+        if self.external_editor && control != Control::Stop {
+            return Err("Files may still be open in your editor. Confirm Go ahead before changing this merge.".into());
+        }
+        if self.remaining.is_some() && control == Control::Resume {
+            return Err("Stop this Run's remaining processes before restarting it.".into());
+        }
         if self.restoring.is_some() && control != Control::Stop {
             return Err(
                 Rejected("Finish the saved-file restore before changing this repair.").into(),
@@ -344,20 +484,28 @@ impl Run {
                 Phase::Queued => self.phase = Phase::Held,
                 Phase::Preparing | Phase::Running => self.phase = Phase::Stopping,
                 Phase::Stopping | Phase::Held => {}
+                Phase::Manual => self.phase = Phase::Held,
                 _ => return Err("This repair Run cannot be stopped.".into()),
             },
-            Control::Resume if self.phase == Phase::Held && self.host.is_none() => {
+            Control::Resume
+                if self.host.is_none()
+                    && (matches!(self.phase, Phase::Held | Phase::Manual)
+                        || self.phase == Phase::Failed
+                            && matches!(self.purpose, Purpose::Merge)
+                            && self.failure == Some(Failure::Capture)) =>
+            {
                 self.secret_input = None;
                 self.phase = Phase::Queued;
                 self.start_command = None;
                 self.turn = None;
                 self.failure = None;
                 self.session_ready = false;
+                self.manual = None;
             }
             Control::Discard
                 if matches!(
                     self.phase,
-                    Phase::Queued | Phase::Held | Phase::Captured | Phase::Failed
+                    Phase::Queued | Phase::Held | Phase::Manual | Phase::Captured | Phase::Failed
                 ) && self.host.is_none() =>
             {
                 self.phase = Phase::Discarded
@@ -369,10 +517,58 @@ impl Run {
 
     pub(crate) fn transition(&mut self, event: &Event) -> Result<()> {
         match event {
+            Event::ExternalOpened { .. } if self.phase == Phase::Manual && self.host.is_none() => {
+                self.external_editor = true
+            }
+            Event::ExternalReturned if self.phase == Phase::Manual && self.external_editor => {
+                self.external_editor = false
+            }
+            Event::ManualFailed if self.phase == Phase::Captured && self.manual.is_some() => {
+                self.phase = Phase::Failed;
+                self.failure = Some(Failure::Capture);
+            }
+            Event::BeginManual
+                if matches!(self.purpose, Purpose::Merge)
+                    && matches!(self.phase, Phase::Held | Phase::Manual | Phase::Failed)
+                    && self.host.is_none()
+                    && self.remaining.is_none()
+                    && self.refresh.is_none()
+                    && self.restoring.is_none() =>
+            {
+                self.phase = Phase::Manual;
+                self.failure = None;
+                self.manual = None;
+            }
+            Event::CaptureManual { snapshot, cleanup }
+                if self.phase == Phase::Manual
+                    && self.workspace_ready
+                    && self.host.is_none()
+                    && self.remaining.is_none()
+                    && self.refresh.is_none()
+                    && self.restoring.is_none()
+                    && !self.external_editor =>
+            {
+                if snapshot.reference
+                    != format!("refs/intercat/manual/{}/{}", self.id, snapshot.operation)
+                {
+                    return Err("The manual resolution belongs to another Run.".into());
+                }
+                let _: intercat_git::ObjectId = snapshot.sha.parse()?;
+                cleanup.validate()?;
+                if cleanup.host.is_some() || cleanup.state != crate::run_processes::State::Cleaning
+                {
+                    return Err("Manual resolution cleanup cannot own a model host.".into());
+                }
+                self.manual = Some(snapshot.clone());
+                self.remaining = Some((**cleanup).clone());
+                self.phase = Phase::Captured;
+            }
             Event::Prepare if self.phase == Phase::Queued => self.phase = Phase::Preparing,
             Event::WorkspaceReady
-                if matches!(self.phase, Phase::Preparing | Phase::Stopping)
-                    && !self.workspace_ready
+                if matches!(
+                    self.phase,
+                    Phase::Preparing | Phase::Stopping | Phase::Manual
+                ) && !self.workspace_ready
                     && self.host.is_none()
                     && self.session.is_none() =>
             {
@@ -456,12 +652,7 @@ impl Run {
                     }
                     _ => return Err("The repair has no completed turn to capture.".into()),
                 };
-                self.host = None;
-                self.host_nonce = None;
-                self.secret_revision = None;
-                self.session_ready = false;
-                self.approvals.clear();
-                self.prompts.clear();
+                self.transport_closed();
             }
             _ => return Err("The repair event does not match the current Run state.".into()),
         }

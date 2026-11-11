@@ -53,8 +53,8 @@ def verify(directory, previous):
     assert first['workers'][0]['checkpoint']['turnId'] != pushed['workers'][0]['checkpoint']['turnId']
     assert any(word['state'] == 'cut' for word in first['utterances'])
     assert any(effect['kind'] == 'push' and effect['outcome'] == 'done' for effect in pushed['effects'])
-    assert committed['integration']['status'] == restored['integration']['status'] == 'done'
-    assert committed['integration']['id'] == restored['integration']['id']
+    assert committed['integrations'][0]['status'] == restored['integrations'][0]['status'] == 'done'
+    assert committed['integrations'][0]['id'] == restored['integrations'][0]['id']
     assert all(worker['phase'] == 'stopped' and worker['activeTurn'] is None for worker in restored['workers'])
     assert 'Intercat:' in value['commitMessage']
     order = approval_order(directory / 'events.sqlite')

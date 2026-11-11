@@ -11,6 +11,21 @@ const PAGE_SIZE: usize = 50;
 pub struct Query {
     pub track_id: String,
     pub before: Option<i64>,
+    pub range: Option<Range>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Range {
+    pub start: i64,
+    pub end: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Origin {
+    pub ended_at: Option<i64>,
+    pub timeline_at: Option<i64>,
+    pub turn_number: i64,
 }
 
 #[derive(Serialize)]
@@ -23,6 +38,7 @@ pub struct Point {
     pub timeline_at: Option<i64>,
     pub shell_was_running: bool,
     pub available: bool,
+    pub turn_number: i64,
 }
 
 #[derive(Serialize)]
@@ -41,6 +57,10 @@ pub(crate) fn read(db: &Connection, query: &Query) -> Result<Page> {
     if query.track_id.is_empty()
         || query.track_id.len() > 128
         || query.before.is_some_and(|n| n <= 0)
+        || query
+            .range
+            .as_ref()
+            .is_some_and(|range| range.start < 0 || range.end < range.start)
     {
         return Err("Invalid branch point query.".into());
     }
@@ -51,10 +71,16 @@ pub(crate) fn read(db: &Connection, query: &Query) -> Result<Page> {
     )? {
         return Err("This track is no longer available.".into());
     }
-    let mut statement = db.prepare("SELECT rowid,payload FROM operations WHERE kind='checkpoint.save' AND state='complete' AND json_extract(payload,'$.trackId')=?1 AND (?2 IS NULL OR rowid<?2) ORDER BY rowid DESC LIMIT ?3")?;
+    let mut statement = db.prepare("SELECT rowid,payload FROM operations WHERE kind='checkpoint.save' AND state='complete' AND json_extract(payload,'$.trackId')=?1 AND (?2 IS NULL OR rowid<?2) AND (?4 IS NULL OR (SELECT max(json_extract(record,'$.end.timelineMs')) FROM timeline_clips WHERE track=?1 AND json_extract(record,'$.turnId')=json_extract(payload,'$.checkpoint.turnId') AND json_extract(record,'$.repairRunId') IS NULL) BETWEEN ?4 AND ?5) ORDER BY rowid DESC LIMIT ?3")?;
     let mut rows = statement
         .query_map(
-            params![query.track_id, query.before, (PAGE_SIZE + 1) as i64],
+            params![
+                query.track_id,
+                query.before,
+                (PAGE_SIZE + 1) as i64,
+                query.range.as_ref().map(|range| range.start),
+                query.range.as_ref().map(|range| range.end)
+            ],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -70,16 +96,33 @@ pub(crate) fn read(db: &Connection, query: &Query) -> Result<Page> {
             .as_ref()
             .ok()
             .map(|source| source.session_id.as_str());
-        let (ended_at,timeline_at,unknown_time) = db.query_row("SELECT max(json_extract(record,'$.end.epochMs')),max(json_extract(record,'$.end.timelineMs')),coalesce(max(coalesce(json_extract(record,'$.recovered'),0) OR coalesce(json_extract(record,'$.start.bootId')<>json_extract(record,'$.end.bootId'),1)),1) FROM timeline_clips WHERE track=?1 AND json_extract(record,'$.turnId')=?2 AND json_extract(record,'$.repairRunId') IS NULL AND (?3 IS NULL OR json_extract(record,'$.sessionId')=?3)",params![query.track_id,checkpoint.turn_id.to_string(),session],|row|Ok((row.get(0)?,row.get(1)?,row.get::<_,bool>(2)?)))?;
+        let origin = origin(db, &query.track_id, checkpoint.turn_id, session)?;
         points.push(Point {
             id,
             turn_id: checkpoint.turn_id,
             checkpoint: checkpoint.sha,
-            ended_at: if unknown_time { None } else { ended_at },
-            timeline_at: if unknown_time { None } else { timeline_at },
+            ended_at: origin.ended_at,
+            timeline_at: origin.timeline_at,
             shell_was_running: checkpoint.live_processes,
             available: source.is_ok(),
+            turn_number: origin.turn_number,
         });
     }
     Ok(Page { points, before })
+}
+
+pub(crate) fn origin(
+    db: &Connection,
+    track: &str,
+    turn: uuid::Uuid,
+    session: Option<&str>,
+) -> Result<Origin> {
+    let (ended_at,timeline_at,unknown_time) = db.query_row("SELECT max(json_extract(record,'$.end.epochMs')),max(json_extract(record,'$.end.timelineMs')),coalesce(max(coalesce(json_extract(record,'$.recovered'),0) OR coalesce(json_extract(record,'$.start.bootId')<>json_extract(record,'$.end.bootId'),1)),1) FROM timeline_clips WHERE track=?1 AND json_extract(record,'$.turnId')=?2 AND json_extract(record,'$.repairRunId') IS NULL AND (?3 IS NULL OR json_extract(record,'$.sessionId')=?3)",params![track,turn.to_string(),session],|row|Ok((row.get(0)?,row.get(1)?,row.get::<_,bool>(2)?)))?;
+    let id = uuid::Uuid::new_v5(&turn, b"checkpoint");
+    let turn_number = db.query_row("SELECT count(*) FROM operations WHERE kind='checkpoint.save' AND state='complete' AND json_extract(payload,'$.trackId')=?1 AND rowid<=(SELECT rowid FROM operations WHERE id=?2)", params![track,id.to_string()], |row|row.get(0))?;
+    Ok(Origin {
+        ended_at: if unknown_time { None } else { ended_at },
+        timeline_at: if unknown_time { None } else { timeline_at },
+        turn_number,
+    })
 }

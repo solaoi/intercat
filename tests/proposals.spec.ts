@@ -1,5 +1,5 @@
 import { _electron as electron, expect, test, type ElectronApplication, type Page } from '@playwright/test';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import type { DaemonStatus, Proposal, ProposalCommand, ProposalResponse, Utterance } from '../src/bridge';
 import type { IntegrationJob } from '../src/commit/types';
 import { mockDrafts } from './support/drafts';
@@ -17,7 +17,7 @@ test.beforeEach(async () => {
 });
 test.afterEach(async () => { await closeWindow(app); await rm(directory, { recursive: true, force: true }); });
 
-async function mount(kind: 'done' | 'partial' | 'quiet' | 'overlap', zoom = 1, age = 0, lose = false, bound = false) {
+async function mount(kind: 'done' | 'partial' | 'quiet' | 'overlap' | 'fix', zoom = 1, age = 0, lose = false, bound = false) {
   await app.evaluate(({ ipcMain, BrowserWindow }, input) => {
     const proposal: Proposal = { id: 'dummy-proposal', kind: input.kind === 'quiet' ? 'quiet-changes' : 'work-completed', trackId: 'A', label: 'A',
       createdAt: input.now - input.age,
@@ -26,6 +26,11 @@ async function mount(kind: 'done' | 'partial' | 'quiet' | 'overlap', zoom = 1, a
       options: input.kind !== 'partial' ? [{ action: 'commit', text: 'Review for commit' }, { action: 'later', text: 'Not now' }]
         : [{ action: 'continue', text: 'Ask A to continue' }, { action: 'commit', text: 'Commit what’s there' }],
     };
+    if(input.kind==='fix') {
+      proposal.kind='integration-fix';proposal.text='Integration fixed A’s committed changes · Realign?';
+      proposal.detail='The dummy integration fix is committed. Worker A’s files have not changed.';
+      proposal.options=[{action:'realign',text:'Realign A'},{action:'later',text:'Not now'}];
+    }
     if (input.kind === 'overlap') {
       proposal.kind = 'work-overlap'; proposal.label = 'A + B'; proposal.text = 'A and B touch the same files';
       proposal.detail = 'Five quiet minutes. Saved changes overlap in shared.ts. Review the track order before committing.';
@@ -55,6 +60,10 @@ async function mount(kind: 'done' | 'partial' | 'quiet' | 'overlap', zoom = 1, a
         if (input.kind === 'overlap') word.presentation!.commitTracks = ['A', 'B'];
         state.utterances!.push(word);
       }
+      if(command.action==='realign') {
+        response.realignment={request:{opId:'dummy-realign-request',trackId:'A',source:{kind:'commit',jobId:'dummy-commit',revision:2}},sessionId:'dummy-worker-session',revision:1,phase:'queued',mergeInput:null,mergeBoundary:null,sharedInput:null,resolutions:[],keepProcesses:false,waitForAccess:false,stopCommand:null,stopCheckpoint:null,inspection:null,error:null};
+        state.realignments=[response.realignment];
+      }
       if (command.action === 'continue') {
         response.inputId = 'dummy-continuation';
         if (input.bound) state.utterances!.push({id:response.inputId,text:'Internal dummy continuation instructions.',attachments:[],createdAt:input.now,
@@ -74,9 +83,9 @@ async function mount(kind: 'done' | 'partial' | 'quiet' | 'overlap', zoom = 1, a
       memory.integrations.push(request);
       const job: IntegrationJob = { id: 'dummy-job', revision: 1, status: 'open', sessionName: 'Dummy review', slug: 'dummy',
         project: { id: 'dummy-folder', name: 'Dummy', root: '/dummy', path: '/dummy', commonDir: '/dummy/.git', base: 'a'.repeat(40), baseBranch: 'refs/heads/main' },
-        exclusions: [], assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0,
+        pathReview:{families:[],choices:{}},pathState:null,retirements:[],exclusions: [], assumptions: [], assumptionsChanged: false, assumptionsPending: 0, assumptionsFailed: 0,
         tracks: [], plan: null, candidate: null, messages: {}, keptSecrets: [], contributions: {}, error: null };
-      state.integration = job; return job;
+      state.integrations = [job]; return job;
     });
     BrowserWindow.getAllWindows()[0].setSize(1040, 900);
     BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(input.zoom);
@@ -336,4 +345,23 @@ for (const zoom of [1, 2]) test(`mixed M2 answers preserve a locked draft throug
   await page.reload(); await page.clock.runFor(1100);
   await expect(draft).toHaveValue(text); await expect(destination).toHaveValue('B');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+for(const zoom of [1,2])test(`integration fix proposes explicit realignment and retries the saved choice at ${zoom*100}%`,async()=>{
+  await mount('fix',zoom,0,true);
+  await expect(card()).toContainText('Integration fixed A’s committed changes');
+  await expect(card().getByRole('button',{name:'Realign A',exact:true})).toBeInViewport({ratio:1});
+  await page.clock.runFor(100);
+  const output=process.cwd()+'/research/verify/m4-integration-followup-ui-20261109-01';await mkdir(output,{recursive:true});
+  const pixels=await app.evaluate(async({BrowserWindow})=>(await BrowserWindow.getAllWindows()[0].webContents.capturePage()).toPNG().toString('base64'));
+  await writeFile(`${output}/proposal-${zoom*100}.png`,Buffer.from(pixels,'base64'));
+
+  await card().getByRole('button',{name:'Realign A',exact:true}).click();
+  await expect(card().getByRole('alert')).toContainText('Dummy lost acknowledgement');
+  await card().getByRole('button',{name:'Retry saving choice',exact:true}).click();
+  await page.getByRole('textbox',{name:'Request draft'}).focus();await page.mouse.move(5,5);await page.clock.fastForward(2000);
+  await expect(page.locator('.realignment')).toContainText('Realignment queued for A');
+  const saved=await app.evaluate(()=>(globalThis as any).proposalFixture);
+  expect(saved.requests).toHaveLength(2);expect(saved.requests[0]).toEqual(saved.requests[1]);expect(saved.requests[0].action).toBe('realign');
+  expect(saved.integrations).toEqual([]);expect(saved.state.utterances).toEqual([]);
 });

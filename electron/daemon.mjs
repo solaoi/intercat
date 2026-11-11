@@ -30,7 +30,7 @@ export function operationId() {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-export async function connectDaemon(binary, directory, token, editorSource, gitleaks) {
+export async function connectDaemon(binary, directory, token, editorSource, gitleaks, gitLfs) {
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
   const metadata = await fs.lstat(directory);
   if (!metadata.isDirectory() || metadata.uid !== process.getuid()) throw new Error('Unsafe daemon directory');
@@ -47,11 +47,12 @@ export async function connectDaemon(binary, directory, token, editorSource, gitl
     if (!['ENOENT', 'ECONNREFUSED'].includes(error.code)) throw error;
   }
   await fs.access(binary, fs.constants.X_OK);
+  await fs.access(gitLfs, fs.constants.X_OK);
   const secretKey = await fingerprintKey();
   const log = await fs.open(path.join(directory, 'daemon.log'), 'a', 0o600);
   const child = spawn(binary, ['serve', directory, editorSource], {
     detached: true, stdio: ['pipe', 'pipe', log.fd],
-    env: { ...Object.fromEntries(['HOME', 'PATH', 'LANG', 'SHELL'].filter(key => process.env[key]).map(key => [key, process.env[key]])), INTERCAT_GITLEAKS: gitleaks },
+    env: { ...Object.fromEntries(['HOME', 'LANG', 'SHELL', 'SSH_AUTH_SOCK', 'XDG_CONFIG_HOME', 'GH_CONFIG_DIR'].filter(key => process.env[key]).map(key => [key, process.env[key]])), PATH: [path.dirname(gitLfs), process.env.PATH].filter(Boolean).join(path.delimiter), INTERCAT_GITLEAKS: gitleaks, INTERCAT_GIT_LFS: gitLfs },
   });
   child.stdin.on('error', () => {});
   const started = new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });

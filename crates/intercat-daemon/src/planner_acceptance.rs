@@ -172,6 +172,7 @@ impl Fixture {
                 crate::folders::bind(&db, &track, &folder)?;
                 journal
                     .workspace_result(crate::preparation::Workspace {
+                        denied_roots: Vec::new(),
                         track_id: track.clone(),
                         path,
                         reference: format!("refs/intercat/{slug}/tracks/{label}"),

@@ -807,7 +807,8 @@ async fn candidate_fixture(
     intercat_daemon::candidate::Settings,
 )> {
     use intercat_daemon::{
-        candidate::{CheckCommand, Settings},
+        candidate::Settings,
+        check_run::CheckCommand,
         checkpoint::Checkpoint,
         integration::{self, Job, Status, Track},
     };
@@ -835,6 +836,9 @@ async fn candidate_fixture(
     let mut job = Job {
         lineage: Default::default(),
         omitted_conflicts: Default::default(),
+        path_review: Default::default(),
+        path_state: None,
+        retirements: Vec::new(),
         order_review: None,
         assumptions: Vec::new(),
         assumptions_changed: false,
@@ -873,14 +877,18 @@ async fn candidate_fixture(
             integration_count: 0,
         }],
         plan: None,
+        undo: None,
         error: None,
         candidate: None,
         messages: std::collections::BTreeMap::new(),
         publication: None,
         kept_secrets: Default::default(),
         contributions: Default::default(),
+        fixes: Default::default(),
     };
     job.lineage.points.push(intercat_daemon::lineage::Point {
+        views: Vec::new(),
+        parents: Default::default(),
         track: job.tracks[0].id.clone(),
         number: 1,
         sha: checkpoint.to_string(),
@@ -889,8 +897,11 @@ async fn candidate_fixture(
         inherits: Default::default(),
     });
     job.plan = Some(integration::freeze(&job)?);
+    job.plan.as_mut().unwrap().coverage = Some(Default::default());
     job.plan = Some(integration::plan(&job)?);
     let settings = Settings {
+        checks_revision: 0,
+        history: false,
         environment: None,
         scanner: intercat_daemon::secret_scan::Engine::capture()?,
         command: CheckCommand::Auto,

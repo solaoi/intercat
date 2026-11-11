@@ -107,6 +107,8 @@ pub(crate) fn retire(
         [session],
     )?;
     crate::proposals::retire(tx, session)?;
+    crate::handoff::retire(tx, track, session)?;
+    crate::fresh_store::retire(tx, track, session)?;
     tx.execute("INSERT INTO retired_inputs SELECT id,?1 FROM utterances WHERE id IN (SELECT input FROM timeline_marks WHERE session=?1 AND input IS NOT NULL) OR dispatch_command IN (SELECT command FROM attachment_turns WHERE session=?1) ON CONFLICT DO NOTHING",[session])?;
     crate::plan_store::retire_history(tx, session)?;
     tx.execute(

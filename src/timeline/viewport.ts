@@ -1,11 +1,11 @@
-import { REPAIR_ROW_HEIGHT, ROW_HEIGHT, type Clip, type Track } from './model';
+import { REPAIR_ROW_HEIGHT, ROW_HEIGHT, trackRowHeight, type Clip, type Track } from './model';
 
 export interface Lane { key: string; track: Track; repairId: string | null; top: number; height: number; index: number; clips: Clip[]; status: Track['status']; canStop: boolean }
 export function lanes(tracks: Track[], overview = false): Lane[] {
   const result: Lane[] = [];
   let top = 0;
   for (const track of tracks) {
-    const height = overview ? 12 : ROW_HEIGHT + Math.max(0,(track.reviewRows ?? 1)-1)*40;
+    const height = overview ? 12 : trackRowHeight(track);
     result.push({ key: `track-${track.id}`, track, repairId: null, top, height, index: result.length, clips: track.clips, status: track.status, canStop: false });
     top += height;
     for (const repair of track.repairs) {

@@ -32,6 +32,11 @@ pub enum Outcome {
 }
 
 pub fn intent(job: &Job, operation: Uuid) -> Result<Publication> {
+    if job.path_state.as_ref().is_some_and(|state| !state.ready()) {
+        return Err(
+            "Review the saved path choices and affected dependencies before committing.".into(),
+        );
+    }
     let candidate = job.candidate.as_ref().ok_or("No checked candidate.")?;
     let plan = job.plan.as_ref().ok_or("No frozen integration plan.")?;
     let check = candidate
@@ -45,7 +50,10 @@ pub fn intent(job: &Job, operation: Uuid) -> Result<Publication> {
         || check.settings_hash != candidate.settings_hash
         || (check.command.is_some() && check.code != Some(0))
         || candidate.secret_scans.len() != candidate.commits.len()
-        || candidate.secret_scans.iter().any(|scan| {
+        || plan.coverage.is_none()
+        || candidate.pending_undo()
+        || job.undo.is_some() != candidate.undo.is_some()
+        || candidate.scans().any(|scan| {
             scan.binding.ruleset != crate::secret_scan::ruleset()
                 || !scan.accepted(&job.kept_secrets)
         })
@@ -58,6 +66,9 @@ pub fn intent(job: &Job, operation: Uuid) -> Result<Publication> {
         .any(|track| track.included && track.checkpoint.is_some())
     {
         return Err("No saved tracks are selected for Commit.".into());
+    }
+    if let Some(undo) = &job.undo {
+        undo.validate(job)?;
     }
     let mut refs = vec![RefChange {
         name: plan.target_ref.clone(),
@@ -87,6 +98,13 @@ pub fn intent(job: &Job, operation: Uuid) -> Result<Publication> {
             name: row.base_ref.clone(),
             old: row.expected_base.clone(),
             new: sha,
+        });
+    }
+    if let Some(undo) = &candidate.undo {
+        refs.push(RefChange {
+            name: format!("refs/intercat/{}/undo/{}", job.slug, job.id),
+            old: None,
+            new: undo.sha.clone(),
         });
     }
     for commit in &candidate.commits {
@@ -132,6 +150,28 @@ fn verify(
         return Err("The Check settings changed.".into());
     }
     let mut parent: ObjectId = plan.target_head.parse()?;
+    let expected_values = crate::secret_scan::value_fingerprints(
+        &settings
+            .environment_values()?
+            .into_values()
+            .collect::<Vec<_>>(),
+    );
+    if let Some(undo) = &candidate.undo {
+        job.undo
+            .as_ref()
+            .ok_or("Missing undo plan.")?
+            .verify_records(repository)?;
+        undo.verify(
+            repository,
+            job.undo.as_ref().ok_or("Missing undo plan.")?,
+            settings,
+        )?;
+        crate::lfs_store::sync(
+            &settings.checkout.lfs_directory,
+            &repository.lfs_entries(undo.tree.parse()?)?,
+        )?;
+        parent = undo.sha.parse()?;
+    }
     let mut tracks = std::collections::HashSet::new();
     for (commit, scan) in candidate.commits.iter().zip(&candidate.secret_scans) {
         let sha = commit.sha.parse()?;
@@ -150,40 +190,25 @@ fn verify(
             || scan.binding.parent_tree != repository.tree_id(parent)?
             || scan.binding.message_hash != message_hash
             || scan.binding.ruleset != crate::secret_scan::ruleset()
-            || !scan.binding.value_fingerprints.is_empty()
+            || scan.binding.value_fingerprints != expected_values
         {
             return Err("The candidate no longer matches its reviewed secret scan.".into());
         }
-        for (path, file) in repository.saved_files(sha)? {
-            if path.rsplit('/').next() == Some(".lfsconfig") {
-                return Err("Git LFS object handling is not available for this Commit.".into());
-            }
-            if path.rsplit('/').next() == Some(".gitattributes") {
-                let content = repository.saved_bytes(&file)?;
-                if String::from_utf8_lossy(&content)
-                    .lines()
-                    .filter(|line| !line.trim_start().starts_with('#'))
-                    .any(|line| line.split_whitespace().any(|part| part == "filter=lfs"))
-                {
-                    return Err("Git LFS object handling is not available for this Commit.".into());
-                }
-            }
-            if repository.saved_size(&file)? <= 2048 {
-                let content = repository.saved_bytes(&file)?;
-                if content.starts_with(b"version https://git-lfs.github.com/spec/v1\n")
-                    || content.starts_with(b"version https://git-lfs.github.com/spec/v1\r\n")
-                {
-                    return Err("An LFS pointer has no validated object for Commit.".into());
-                }
-            }
-        }
+        crate::lfs_store::sync(
+            &settings.checkout.lfs_directory,
+            &repository.lfs_entries(actual.tree)?,
+        )?;
         parent = sha;
     }
     if parent != candidate.head || repository.tree_id(parent)? != candidate.tree {
         return Err("The candidate chain or tree changed.".into());
     }
+    crate::lfs_store::sync(
+        &settings.checkout.lfs_directory,
+        &repository.lfs_entries(repository.tree_id(parent)?)?,
+    )?;
     if !published
-        && !candidate.commits.is_empty()
+        && (!candidate.commits.is_empty() || candidate.undo.is_some())
         && repository.reference_target(&format!("refs/intercat/{}/staging", job.slug))?
             != Some(parent)
     {
@@ -258,7 +283,21 @@ fn apply(job: &Job, settings: &candidate::Settings) -> Result<()> {
     Ok(())
 }
 
-pub async fn publish(job: Job, journal: Journal) -> Result<Job> {
+pub async fn publish(
+    job: Job,
+    journal: Journal,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<Job> {
+    let mut changes = journal.subscribe();
+    while journal.pending_path_retirement(job.id).await? {
+        if *cancel.borrow() {
+            return journal.integration_job(job.id).await;
+        }
+        tokio::select! {
+            _=changes.changed()=>{},
+            changed=cancel.changed()=>{if changed.is_err()||*cancel.borrow(){return journal.integration_job(job.id).await;}},
+        }
+    }
     let settings = journal
         .integration_settings(job.id, job.revision)
         .await?

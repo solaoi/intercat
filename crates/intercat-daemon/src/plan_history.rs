@@ -118,6 +118,24 @@ pub(crate) fn assign_tracks(
     Ok(())
 }
 
+/// Timeline configuration names a logical destination. On restore it follows
+/// a continuation; original turn receipts keep their recorded SDK owner.
+fn route(db: &Connection, entry: &mut Entry) -> Result<()> {
+    for item in entry.before.iter_mut().chain(&mut entry.after) {
+        if !item.track_ref.starts_with("new:") {
+            item.track_ref = crate::continuation::current(db, &item.track_ref)?;
+        }
+    }
+    if let Some(change) = &mut entry.lock_change {
+        for lock in [&mut change.before, &mut change.after]
+            .into_iter()
+            .flatten()
+        {
+            *lock = crate::continuation::current(db, lock)?;
+        }
+    }
+    Ok(())
+}
 fn blocked(db: &Connection, entry: &Entry) -> Result<Option<String>> {
     let plan = match crate::plan_store::read(db, entry.plan) {
         Ok(plan) => plan,
@@ -178,7 +196,8 @@ fn blocked(db: &Connection, entry: &Entry) -> Result<Option<String>> {
     Ok(None)
 }
 
-pub(crate) fn describe(db: &Connection, id: String, entry: Entry) -> Result<Value> {
+pub(crate) fn describe(db: &Connection, id: String, mut entry: Entry) -> Result<Value> {
+    route(db, &mut entry)?;
     let text = entry
         .before
         .first()
@@ -212,6 +231,7 @@ pub(crate) fn undo_cut(db: &Connection, before: &Plan, plan: &mut Plan, item: Uu
     ).optional()?;
     let (id, raw) = saved.ok_or("The original cut is no longer available in this session.")?;
     let mut entry: Entry = serde_json::from_str(&raw)?;
+    route(db, &mut entry)?;
     let removed = entry
         .after
         .iter()
@@ -247,6 +267,7 @@ pub(crate) fn undo_cut(db: &Connection, before: &Plan, plan: &mut Plan, item: Uu
 }
 
 pub(crate) fn restore(db: &Connection, id: &str, mut entry: Entry, redo: bool) -> Result<()> {
+    route(db, &mut entry)?;
     if let Some(reason) = blocked(db, &entry)? {
         return Err(reason.into());
     }

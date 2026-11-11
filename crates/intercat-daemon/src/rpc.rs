@@ -76,6 +76,9 @@ struct Context {
     preparation_status: tokio::sync::watch::Receiver<crate::preparation::Status>,
     runtime: crate::runtime::Service,
     integration: crate::integration::Service,
+    push: Arc<crate::push_api::Context>,
+    pull: Arc<crate::pull_api::Context>,
+    comparison: crate::comparison_service::Service,
     repair: crate::repair_service::Service,
     paused: Arc<crate::dispatch_control::Gate>,
     pause_lock: Arc<tokio::sync::Mutex<()>>,
@@ -222,7 +225,22 @@ impl Server {
             paused.clone(),
         );
         tokio::pin!(shutdown);
+        self.journal.recover_push_jobs().await?;
+        self.journal.recover_pulls().await?;
         let context = Context {
+            comparison: crate::comparison_service::Service::new(
+                self.journal.clone(),
+                self.workspace_root.parent().unwrap().join("comparisons"),
+            )
+            .await?,
+            pull: Arc::new(crate::pull_api::Context::new(
+                self.journal.clone(),
+                self.editor.clone(),
+            )),
+            push: Arc::new(crate::push_api::Context::new(
+                self.journal.clone(),
+                self.workspace_root.parent().unwrap().join("pushes"),
+            )),
             external: crate::external_content::Service::new()?,
             journal: self.journal.clone(),
             editor: self.editor.clone(),
@@ -273,6 +291,9 @@ impl Server {
         clients.shutdown().await;
         tokio::join!(
             context.integration.shutdown(),
+            context.push.shutdown(),
+            context.pull.shutdown(),
+            context.comparison.shutdown(),
             runtime.shutdown(),
             repairs.shutdown(),
             quiet_proposals.stop(),
@@ -370,7 +391,17 @@ async fn change_pause(context: &Context, id: uuid::Uuid, pause: bool) -> Result<
     }
     if pause {
         let (saved, (_, repairs)) = tokio::join!(context.journal.pause_dispatch(id, true), async {
-            tokio::join!(context.integration.shutdown(), context.repair.stop_all(id))
+            tokio::join!(
+                async {
+                    tokio::join!(
+                        context.integration.shutdown(),
+                        context.push.shutdown(),
+                        context.pull.shutdown(),
+                        context.comparison.shutdown()
+                    );
+                },
+                context.repair.stop_all(id)
+            )
         });
         saved?;
         repairs?;
@@ -425,7 +456,7 @@ async fn connection(stream: UnixStream, token: Arc<Token>, context: Context) -> 
             result=requests.join_next(),if !requests.is_empty()=>{if let Some(result)=result { result??; }},
             request=read_frame(&mut reader)=>{
                 let request=request?;
-                let slot=if matches!(request.method.as_str(), "worker.stop" | "utterance.stop" | "repair.stop" | "system.pause" | "system.shutdown" | "system.outputFlows") || (matches!(request.method.as_str(), "worker.respond" | "repair.respond") && request.params["response"]["action"]=="stop") {None}else{Some(permits.clone().try_acquire_owned().map_err(|_|io::Error::other("Too many concurrent requests."))?)};
+                let slot=if matches!(request.method.as_str(), "worker.stop" | "utterance.stop" | "repair.stop" | "system.pause" | "system.shutdown" | "system.outputFlows") || (matches!(request.method.as_str(), "worker.respond" | "repair.respond") && request.params["response"]["action"]=="stop") || (request.method=="worker.fresh.command" && request.params["action"]["kind"]=="cancel") || (request.method=="two-ways.command" && request.params["action"]=="cancel") {None}else{Some(permits.clone().try_acquire_owned().map_err(|_|io::Error::other("Too many concurrent requests."))?)};
                 let context=context.clone();let write=write.clone();
                 requests.spawn(async move {
                     let _slot=slot;
@@ -458,6 +489,9 @@ async fn dispatch(
         preparation_status,
         runtime,
         integration,
+        push,
+        pull,
+        comparison,
         repair,
         paused,
         ..
@@ -467,16 +501,34 @@ async fn dispatch(
         && (matches!(
             request.method.as_str(),
             "worker.start"
+                | "worker.fresh.prepare"
                 | "worker.answer"
                 | "utterance.start"
                 | "repair.start"
                 | "repair.followup"
                 | "repair.answer"
+                | "merge.start"
+                | "merge.begin"
+                | "merge.apply"
                 | "external.confirm"
                 | "project.configure"
+                | "commit.group.open"
+                | "commit.group.commit"
         ) || request.method == "utterance.resolve"
             && request.params["resolution"]["action"] == "retry"
             || request.method == "repair.control" && request.params["action"] == "resume"
+            || request.method == "push.command" && request.params["action"]["action"] != "cancel"
+            || request.method == "comparison.open"
+            || request.method == "worker.fresh.command"
+                && request.params["action"]["kind"] != "cancel"
+            || request.method == "two-ways.command" && request.params["action"] != "cancel"
+            || request.method == "comparison.control" && request.params["action"] != "hold"
+            || request.method == "pull.open"
+            || request.method == "pull.command"
+                && !matches!(
+                    request.params["action"]["action"].as_str(),
+                    Some("stop" | "discard")
+                )
             || request.method == "integration.command"
                 && !matches!(request.params["action"]["action"].as_str(), Some("discard")))
     {
@@ -559,6 +611,29 @@ async fn dispatch(
                 .map_err(|error| (-32005, error.to_string()))?;
             runtime.set_capacity(&setting);
             Ok(serde_json::to_value(setting).unwrap())
+        }
+        "checks.get" => {
+            let setting = journal
+                .check_settings()
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            let snapshot = journal
+                .snapshot()
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            let folders = snapshot["project"]["folders"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            Ok(json!({"setting":setting,"folders":folders}))
+        }
+        "checks.change" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .change_check_settings(params)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
         }
         "check-environment.get" => {
             let selection = journal
@@ -705,6 +780,95 @@ async fn dispatch(
                 Err(error) => Err((-32005, error.to_string())),
             }
         }
+        "repair.processes" => {
+            let params: crate::run_processes::Command =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.op_id.get_version_num() != 7 {
+                return Err(invalid());
+            }
+            repair
+                .decide_processes(params)
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            Ok(json!({"accepted":true}))
+        }
+        "merge.begin" => {
+            let params: crate::merge_manual::Begin =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.op_id.get_version_num() != 7 {
+                return Err(invalid());
+            }
+            repair
+                .begin_manual(params)
+                .await
+                .and_then(|run| Ok(serde_json::to_value(run)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "merge.start" => {
+            let params: crate::repair_run::Request =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.op_id.get_version_num() != 7
+                || !matches!(params.purpose, crate::repair_run::Purpose::Merge)
+            {
+                return Err(invalid());
+            }
+            repair
+                .start_manual(params)
+                .await
+                .and_then(|run| Ok(serde_json::to_value(run)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "merge.read" => {
+            let params: crate::merge_manual::Read =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            repair
+                .read_manual(params)
+                .await
+                .and_then(|view| Ok(serde_json::to_value(view)?))
+                .map_err(|_| {
+                    (
+                        -32005,
+                        "The conflict files could not be read. Their contents were withheld."
+                            .into(),
+                    )
+                })
+        }
+        "merge.apply" => {
+            let params: crate::merge_transport::Uploaded =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.op_id.get_version_num() != 7 {
+                return Err(invalid());
+            }
+            repair
+                .apply_uploaded(params)
+                .await
+                .and_then(|run| Ok(serde_json::to_value(run)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "merge.open" => {
+            let params: crate::merge_manual::Open =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.op_id.get_version_num() != 7 {
+                return Err(invalid());
+            }
+            repair
+                .open_manual(params)
+                .await
+                .and_then(|path| Ok(serde_json::to_value(path)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "merge.return" => {
+            let params: crate::merge_manual::Begin =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.op_id.get_version_num() != 7 {
+                return Err(invalid());
+            }
+            repair
+                .return_manual(params)
+                .await
+                .and_then(|run| Ok(serde_json::to_value(run)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
         "repair.control" => {
             let params: crate::repair_run::Command =
                 serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
@@ -800,6 +964,165 @@ async fn dispatch(
                 .await
                 .and_then(|value| Ok(serde_json::to_value(value)?))
                 .map_err(|error| (-32000, error.to_string()))
+        }
+        "comparison.open" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            comparison
+                .open(params)
+                .await
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "comparison.control" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            comparison
+                .control(params)
+                .await
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "comparison.read" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                id: uuid::Uuid,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            comparison
+                .read(params.id)
+                .await
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "comparison.evidence" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                id: uuid::Uuid,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            comparison
+                .evidence(params.id)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "comparison.diff" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            comparison
+                .diff(params)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "pull.open" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            pull.open(params)
+                .await
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "pull.command" => {
+            let params = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            pull.command(params)
+                .await
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "pull.read" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                id: uuid::Uuid,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            pull.read(params.id)
+                .await
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "push.remotes" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct Params {
+                folder_id: String,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            push.remotes(params.folder_id)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "push.review" => {
+            let params: crate::push_review::Request =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            push.review(params)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "push.presentation" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                id: uuid::Uuid,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            push.presentation(params.id)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "push.command" => {
+            let params: crate::push_job::Command =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            push.command(params)
+                .await
+                .and_then(|value| Ok(serde_json::to_value(value)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "commit.group.open" => {
+            let params: crate::commit_group::Open =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.op_id.get_version_num() != 7
+                || params
+                    .tracks
+                    .as_ref()
+                    .is_some_and(|tracks| tracks.len() > 256)
+            {
+                return Err(invalid());
+            }
+            integration
+                .open_group(params)
+                .await
+                .and_then(|group| Ok(serde_json::to_value(group)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "commit.group.commit" => {
+            let params: crate::commit_group::Commit =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.op_id.get_version_num() != 7
+                || params.revision == 0
+                || params.targets.len() > 8
+            {
+                return Err(invalid());
+            }
+            integration
+                .commit_group(params)
+                .await
+                .and_then(|group| Ok(serde_json::to_value(group)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "commit.group.discard" => {
+            let params: crate::commit_group::Discard =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.op_id.get_version_num() != 7 || params.revision == 0 {
+                return Err(invalid());
+            }
+            integration
+                .discard_group(params)
+                .await
+                .and_then(|group| Ok(serde_json::to_value(group)?))
+                .map_err(|error| (-32005, error.to_string()))
         }
         "integration.command" => {
             let params: crate::integration::Command =
@@ -1174,6 +1497,15 @@ async fn dispatch(
                 .map_err(|error| (-32005, error.to_string()))?;
             Ok(Value::Null)
         }
+        "checkpoint.exclude" => {
+            let command: crate::checkpoint_scope::Exclude =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            runtime
+                .exclude_checkpoint(command)
+                .await
+                .map_err(|error| (-32005, error.to_string()))?;
+            Ok(Value::Null)
+        }
         "inheritance.issue" => {
             let command: crate::inheritance_issue::Command =
                 serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
@@ -1202,6 +1534,74 @@ async fn dispatch(
                     .map_err(|error| (-32005, error.to_string()))?;
             }
             Ok(Value::Null)
+        }
+        "path.restore" => {
+            let params: crate::path_restore::Request =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            runtime
+                .restore_path(params)
+                .await
+                .and_then(|job| Ok(serde_json::to_value(job)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "path.restore-control" => {
+            let control: crate::path_restore::Control =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            runtime
+                .control_path_restore(control)
+                .await
+                .and_then(|job| Ok(serde_json::to_value(job)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "path.processes" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct Params {
+                retirement_id: uuid::Uuid,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            runtime
+                .aside_processes(params.retirement_id)
+                .await
+                .and_then(|info| Ok(serde_json::to_value(info)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "path.stop-processes" => {
+            let params: crate::aside_processes::Request =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            runtime
+                .stop_aside_processes(params)
+                .await
+                .and_then(|info| Ok(serde_json::to_value(info)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "path.restore-access" => {
+            let params: crate::path_restore::AccessConsent =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .approve_path_restore_access(params)
+                .await
+                .and_then(|job| Ok(serde_json::to_value(job)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "realign.request" => {
+            let params: crate::realign::Request =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            runtime
+                .request_realign(params)
+                .await
+                .and_then(|job| Ok(serde_json::to_value(job)?))
+                .map_err(|error| (-32005, error.to_string()))
+        }
+        "realign.control" => {
+            let params: crate::realign::Control =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            runtime
+                .control_realign(params)
+                .await
+                .and_then(|job| Ok(serde_json::to_value(job)?))
+                .map_err(|error| (-32005, error.to_string()))
         }
         "inheritance.finish" => {
             #[derive(Deserialize)]
@@ -1338,6 +1738,25 @@ async fn dispatch(
                 .await
                 .map_err(|error| (-32002, error.to_string()))?;
             Ok(Value::Null)
+        }
+        "project.selection" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                paths: Vec<PathBuf>,
+            }
+            let params: Params =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if params.paths.is_empty()
+                || params.paths.len() > 8
+                || params.paths.iter().any(|path| !path.is_absolute())
+            {
+                return Err(invalid());
+            }
+            crate::project_selection::inspect(params.paths)
+                .await
+                .and_then(|issue| Ok(serde_json::to_value(issue)?))
+                .map_err(|error| (-32004, error.to_string()))
         }
         "project.configure" => {
             #[derive(Deserialize)]
@@ -1487,6 +1906,67 @@ async fn dispatch(
             };
             result.map_err(|error| (-32002, error.to_string()))?;
             Ok(json!({"accepted":true}))
+        }
+        "two-ways.options" => {
+            let query: crate::two_ways::OptionsQuery =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            runtime
+                .two_ways_options(query)
+                .await
+                .and_then(|options| Ok(serde_json::to_value(options)?))
+                .map_err(|e| (-32002, e.to_string()))
+        }
+        "two-ways.command" => {
+            let command: crate::two_ways::Command =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .two_ways(crate::two_ways::Change::Command(command))
+                .await
+                .and_then(|job| Ok(serde_json::to_value(job)?))
+                .map_err(|e| (-32002, e.to_string()))
+        }
+        "two-ways.read" => {
+            let query: crate::two_ways::Read =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            if query.id.get_version_num() != 7 {
+                return Err(invalid());
+            }
+            journal
+                .two_ways_job(query.id)
+                .await
+                .map_err(|e| (-32002, e.to_string()))?
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| (-32002, e.to_string()))?
+                .ok_or_else(|| (-32002, "This paired request is unavailable.".into()))
+        }
+        "worker.fresh.prepare" => {
+            let params: crate::fresh::Request =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            runtime
+                .prepare_fresh(params)
+                .await
+                .map(|job| job.status())
+                .map_err(|e| (-32002, e.to_string()))
+        }
+        "worker.fresh.command" => {
+            let params: crate::fresh::Command =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            runtime
+                .fresh_command(params)
+                .await
+                .map(|job| job.status())
+                .map_err(|e| (-32002, e.to_string()))
+        }
+        "worker.fresh.read" => {
+            let params: crate::fresh::Read =
+                serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;
+            journal
+                .fresh_job(params.id)
+                .await
+                .map_err(|e| (-32002, e.to_string()))?
+                .map(|job| job.status())
+                .ok_or_else(|| (-32002, "This Start fresh request is unavailable.".into()))
         }
         "worker.pickup.prepare" => {
             let recovery = serde_json::from_value(request.params.clone()).map_err(|_| invalid())?;

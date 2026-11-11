@@ -5,7 +5,7 @@ import { closeWindow } from './support/close';
 import type { DaemonStatus, Folder } from '../src/bridge';
 import type { IntegrationJob, IntegrationRequest } from '../src/commit/types';
 
-for (const zoom of [1, 2]) test(`Folder choice survives a lost reply and Commit selects one folder at ${zoom * 100}%`, async ({}, info) => {
+for (const zoom of [1, 2]) test(`Folder choice survives a lost reply and the Commit menu selects one folder at ${zoom * 100}%`, async ({}, info) => {
   const directory = await mkdtemp('/private/tmp/ic-folder-ui-');
   const app = await electron.launch({ args: ['.', '--preview', '--user-data-dir=' + directory] });
   await mockDrafts(app);
@@ -23,7 +23,7 @@ for (const zoom of [1, 2]) test(`Folder choice survives a lost reply and Commit 
         memory.choices.push(request);
         if (memory.choices.length === 1) throw new Error('Saved reply lost');
         state.trackFolders!['track-A'] = request.folderId;
-        state.workspaces = tracks.map(track => ({ trackId: track.id, path: `/dummy/${track.id}`, reference: '', base: '', attachmentRoots: [], state: 'ready', error: null }));
+        state.workspaces = tracks.map(track => ({ trackId: track.id, path: `/dummy/${track.id}`, reference: '', base: '', deniedRoots: [], attachmentRoots: [], state: 'ready', error: null }));
         state.sequence!++;
       });
       ipcMain.removeHandler('intercat:integration-command'); ipcMain.handle('intercat:integration-command', (_event, request: IntegrationRequest) => {
@@ -33,8 +33,8 @@ for (const zoom of [1, 2]) test(`Folder choice survives a lost reply and Commit 
         const folder = folders.find(folder => folder.id === state.trackFolders![selected[0].id])!;
         const job: IntegrationJob = { id: 'review', revision: 1, status: 'open', slug: 'dummy', sessionName: 'Dummy review', project: folder,
           tracks: selected.map(track => ({ ...track, included: true, checkpointCount: 1, lastClip: null, checkpoint: { sha: 'b'.repeat(40) } })),
-          plan: null, error: null, candidate: null, messages: {}, keptSecrets: [], contributions: {}, exclusions: [], assumptions: [], assumptionsPending: 0, assumptionsFailed: 0, assumptionsChanged: false };
-        state.integration = job; state.sequence!++; return job;
+          plan: null, error: null, candidate: null, messages: {}, keptSecrets: [], contributions: {}, pathReview:{families:[],choices:{}},pathState:null,retirements:[],exclusions: [], assumptions: [], assumptionsPending: 0, assumptionsFailed: 0, assumptionsChanged: false };
+        state.integrations = [job]; state.sequence!++; return job;
       });
       BrowserWindow.getAllWindows()[0].setSize(1040, 760);
       BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(zoom);
@@ -56,14 +56,14 @@ for (const zoom of [1, 2]) test(`Folder choice survives a lost reply and Commit 
     await page.getByRole('textbox', { name: 'Request draft' }).focus();
     await page.mouse.move(5, 5);
     await expect(choice).toHaveCount(0);
-    await page.getByRole('button', { name: 'Commit', exact: true }).first().click();
-    const review = page.getByRole('complementary', { name: 'Commit review' });
-    await expect(review).toContainText('Choose a folder to review');
-    const select = review.getByRole('button', { name: 'Review Dummy B', exact: true });
-    await expect(select).toBeInViewport({ ratio: 1 });
+    await page.getByLabel('More project actions',{exact:true}).click();
+    const select=page.getByRole('button',{name:'Review Dummy B',exact:true});
+    await expect(select).toBeInViewport({ratio:1});
     await capture('folder-picker.png');
+    const review=page.getByRole('complementary',{name:'Commit review'});
     await select.click();
-    await expect(review.locator('.commit-heading').getByText('Dummy B', { exact: true })).toBeVisible();
+    await expect(review.getByRole('combobox',{name:'Commit review folder',exact:true})).toBeVisible();
+    await expect(review.getByRole('combobox',{name:'Commit review folder',exact:true})).toHaveValue('folder-B');
     await expect(review.getByRole('checkbox', { name: 'Include Worker A' })).toBeVisible();
     await expect(review.getByRole('checkbox', { name: 'Include Worker B' })).toHaveCount(0);
     const captured = await app.evaluate(() => (globalThis as typeof globalThis & { folderFixture: { choices: unknown[]; commits: IntegrationRequest[] } }).folderFixture);

@@ -8,7 +8,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub(crate) fn install(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS track_lineage(track TEXT PRIMARY KEY REFERENCES tracks(id),record TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS checkpoint_lineage(operation TEXT PRIMARY KEY,track TEXT NOT NULL REFERENCES tracks(id),number INTEGER NOT NULL,sha TEXT NOT NULL,record TEXT NOT NULL,complete INTEGER NOT NULL CHECK(complete IN (0,1)),UNIQUE(track,number),UNIQUE(track,sha));
-        CREATE TABLE IF NOT EXISTS integrated_lineage(track TEXT PRIMARY KEY REFERENCES tracks(id),record TEXT NOT NULL);")?;
+        CREATE TABLE IF NOT EXISTS integrated_lineage(track TEXT PRIMARY KEY REFERENCES tracks(id),record TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS published_lineage(reference TEXT PRIMARY KEY,head TEXT NOT NULL,coverage TEXT NOT NULL);")?;
     Ok(())
 }
 pub(crate) fn initialize(db: &Connection, track: &str, basis: &Basis) -> Result<()> {
@@ -26,13 +27,7 @@ pub(crate) fn basis(db: &Connection, track: &str) -> Result<Basis> {
     )?;
     Ok(serde_json::from_str(&raw)?)
 }
-pub(crate) fn reserve(db: &Connection, operation: &str, payload: &serde_json::Value) -> Result<()> {
-    let track = payload["trackId"]
-        .as_str()
-        .ok_or("Missing checkpoint track.")?;
-    let sha = payload["checkpoint"]["sha"]
-        .as_str()
-        .ok_or("Missing checkpoint tree.")?;
+pub(crate) fn reserve(db: &Connection, operation: &str, track: &str, sha: &str) -> Result<()> {
     let basis = basis(db, track)?;
     let number: i64 = db.query_row(
         "SELECT coalesce(max(number),0)+1 FROM checkpoint_lineage WHERE track=?1",
@@ -40,6 +35,8 @@ pub(crate) fn reserve(db: &Connection, operation: &str, payload: &serde_json::Va
         |row| row.get(0),
     )?;
     let point = Point {
+        views: basis.views,
+        parents: basis.parents,
         track: track.into(),
         number: number.try_into()?,
         sha: sha.into(),
@@ -113,6 +110,7 @@ pub(crate) fn published(db: &Connection, frozen: &Frozen, included: &[(&str, &st
         let mut current = basis(db, track)?;
         current.base = point.sha.clone();
         current.base_inherits = point.inherits.clone();
+        crate::lineage::include(&mut current.base_inherits, track, &point.inherited())?;
         set_basis(db, track, &current)?;
     }
     for (track, mark) in integrated {
@@ -134,6 +132,68 @@ pub(crate) fn published(db: &Connection, frozen: &Frozen, included: &[(&str, &st
     Ok(())
 }
 
+/// Coverage belongs to the exact published head of one session and folder.
+/// The global integrated map alone cannot identify what a realignment target
+/// contains, particularly after publishing only some tracks or folders.
+pub(crate) fn capture_coverage(
+    db: &Connection,
+    job: &crate::integration::Job,
+) -> Result<Ancestors> {
+    let plan = job.plan.as_ref().ok_or("Missing publication plan.")?;
+    let old: Option<(String, String)> = db
+        .query_row(
+            "SELECT head,coverage FROM published_lineage WHERE reference=?1",
+            [&plan.target_ref],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((head, coverage)) = old {
+        if head != plan.target_head {
+            return Err("The session branch does not match its saved checkpoint coverage.".into());
+        }
+        Ok(serde_json::from_str(&coverage)?)
+    } else if plan.target_head == job.project.base {
+        Ok(Ancestors::new())
+    } else {
+        Err("The session branch has no saved checkpoint coverage.".into())
+    }
+}
+pub(crate) fn coverage_before_publication(
+    db: &Connection,
+    job: &crate::integration::Job,
+) -> Result<Ancestors> {
+    let coverage = capture_coverage(db, job)?;
+    if job.plan.as_ref().and_then(|plan| plan.coverage.as_ref()) != Some(&coverage) {
+        return Err("The published checkpoint coverage changed. Refresh the Commit review.".into());
+    }
+    Ok(coverage)
+}
+
+pub(crate) fn publish_head(
+    db: &Connection,
+    job: &crate::integration::Job,
+    included: &[(&str, &str)],
+) -> Result<()> {
+    let plan = job.plan.as_ref().ok_or("Missing publication plan.")?;
+    let candidate = job
+        .candidate
+        .as_ref()
+        .ok_or("Missing published candidate.")?;
+    let mut coverage = coverage_before_publication(db, job)?;
+    if let Some(undo) = &job.undo {
+        crate::replacement_delta::rewind(&undo.records, &mut coverage);
+    }
+    for (track, sha) in included {
+        job.lineage
+            .incorporate(&mut coverage, job.lineage.by_sha(track, sha)?)?;
+    }
+    db.execute(
+        "INSERT INTO published_lineage VALUES(?1,?2,?3) ON CONFLICT(reference) DO UPDATE SET head=excluded.head,coverage=excluded.coverage",
+        params![plan.target_ref, candidate.head, serde_json::to_string(&coverage)?],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,11 +210,28 @@ mod tests {
     }
     fn checkpoint(db: &Connection, id: &str, track: &str, sha: &str) -> Result<()> {
         db.execute("INSERT INTO operations VALUES(?1,'prepared')", [id])?;
-        reserve(
-            db,
-            id,
-            &serde_json::json!({"trackId":track,"checkpoint":{"sha":sha}}),
-        )
+        reserve(db, id, track, sha)
+    }
+    #[test]
+    fn the_next_checkpoint_freezes_own_published_coverage_without_rewriting_older_points()
+    -> Result<()> {
+        let db = db()?;
+        checkpoint(&db, "first", "A", &"1".repeat(40))?;
+        complete(&db, "first")?;
+        let first = point(&db, "A", &"1".repeat(40))?;
+        published(&db, &freeze(&db)?, &[("A", &"1".repeat(40))])?;
+        checkpoint(&db, "second", "A", &"2".repeat(40))?;
+        complete(&db, "second")?;
+        let second = point(&db, "A", &"2".repeat(40))?;
+        assert_eq!(second.number, 2);
+        assert_eq!(second.base_at, first.sha);
+        assert_eq!(second.base_inherits_at["A"], first.inherited());
+        assert!(
+            point(&db, "A", &"1".repeat(40))?
+                .base_inherits_at
+                .is_empty()
+        );
+        Ok(())
     }
     #[test]
     fn checkpoint_metadata_is_frozen_with_its_intent_and_visible_only_when_complete() -> Result<()>
@@ -184,10 +261,15 @@ mod tests {
         let parent = point(&db, "A", &"1".repeat(40))?;
         let mut child = parent.basis();
         include(&mut child.inherits, "A", &parent.inherited())?;
+        include(&mut child.parents, "A", &parent.inherited())?;
         set_basis(&db, "B", &child)?;
         checkpoint(&db, "two", "B", &"2".repeat(40))?;
         complete(&db, "two")?;
         let frozen = freeze(&db)?;
+        assert_eq!(
+            frozen.by_sha("B", &"2".repeat(40))?.parents,
+            crate::lineage::Ancestors::from([("A".into(), parent.inherited())])
+        );
         published(&db, &frozen, &[("B", &"2".repeat(40))])?;
         let after = freeze(&db)?;
         assert_eq!(after.integrated["A"], parent.inherited());
@@ -195,6 +277,35 @@ mod tests {
         assert_eq!(basis(&db, "A")?.base, "0".repeat(40));
         assert_eq!(basis(&db, "B")?.base, "2".repeat(40));
         assert_eq!(basis(&db, "B")?.base_inherits["A"], parent.inherited());
+        assert_eq!(basis(&db, "B")?.parents["A"], parent.inherited());
+        Ok(())
+    }
+
+    #[test]
+    fn a_checkpoint_keeps_its_direct_parent_when_the_live_dependency_advances() -> Result<()> {
+        let db = db()?;
+        checkpoint(&db, "a1", "A", &"1".repeat(40))?;
+        complete(&db, "a1")?;
+        let a1 = point(&db, "A", &"1".repeat(40))?;
+        checkpoint(&db, "a2", "A", &"2".repeat(40))?;
+        complete(&db, "a2")?;
+        let a2 = point(&db, "A", &"2".repeat(40))?;
+        let mut child = basis(&db, "B")?;
+        child.parents.insert("A".into(), a1.inherited());
+        child.inherits = child.parents.clone();
+        set_basis(&db, "B", &child)?;
+        checkpoint(&db, "b1", "B", &"3".repeat(40))?;
+        complete(&db, "b1")?;
+        child.parents.insert("A".into(), a2.inherited());
+        child.inherits = child.parents.clone();
+        set_basis(&db, "B", &child)?;
+        checkpoint(&db, "b2", "B", &"4".repeat(40))?;
+        complete(&db, "b2")?;
+        let graph = freeze(&db)?;
+        assert_eq!(graph.point("B", 1)?.parents["A"], a1.inherited());
+        assert_eq!(graph.point("B", 2)?.parents["A"], a2.inherited());
+        assert_eq!(graph.point("B", 1)?.basis().parents["A"], a1.inherited());
+        assert_eq!(basis(&db, "B")?.parents["A"], a2.inherited());
         Ok(())
     }
 }

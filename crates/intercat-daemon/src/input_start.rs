@@ -40,11 +40,28 @@ pub(crate) fn unavailable(
         return Ok(Some("Confirm this interpretation before starting it."));
     }
     let parsed: crate::decision::Decision = serde_json::from_str(&decision)?;
+    if let Some(track) = &parsed.track_id
+        && crate::path_retirement::holds(db, track)?
+    {
+        return Ok(Some("Restore this path before starting a request."));
+    }
     if crate::start_condition::projection(db, input, &parsed)?
         .is_some_and(|value| value["ready"] != true)
     {
         return Ok(Some(
             "The selected work has not finished. Change Read as to choose another start time.",
+        ));
+    }
+    if let Some(track) = &parsed.track_id
+        && crate::fresh_store::holds(db, track)?
+    {
+        return Ok(Some("Start fresh holds this worker’s future requests."));
+    }
+    if let Some(track) = &parsed.track_id
+        && !crate::continuation::allowed(db, track, input)?
+    {
+        return Ok(Some(
+            "Wait for the new conversation’s first saved handoff turn.",
         ));
     }
     let decision: Value = serde_json::from_str(&decision)?;

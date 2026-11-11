@@ -85,7 +85,8 @@ async fn late_question_keeps_its_turn_and_blocks_only_future_work_through_checkp
                 normal.clone(),
                 1,
                 track.clone(),
-                json!({"sessionId":"session"})
+                json!({"sessionId":"session"}),
+                None,
             )
             .await
             .is_err()
@@ -132,7 +133,8 @@ async fn late_question_keeps_its_turn_and_blocks_only_future_work_through_checkp
                 normal.clone(),
                 1,
                 track.clone(),
-                json!({"sessionId":"session"})
+                json!({"sessionId":"session"}),
+                None,
             )
             .await
             .is_err()
@@ -160,6 +162,7 @@ async fn late_question_keeps_its_turn_and_blocks_only_future_work_through_checkp
             1,
             track.clone(),
             json!({"sessionId":"session"}),
+            None,
         )
         .await?;
     assert_eq!(
@@ -176,6 +179,7 @@ async fn late_question_keeps_its_turn_and_blocks_only_future_work_through_checkp
             1,
             track,
             json!({"sessionId":"session"}),
+            None,
         )
         .await?;
 
@@ -283,7 +287,8 @@ async fn queued_replies_hold_until_sent_and_follow_question_order() -> Result<()
             normal.clone(),
             1,
             track.clone(),
-            json!({"sessionId":"session"})
+            json!({"sessionId":"session"}),
+            None,
         )
         .await
         .is_err()
@@ -316,7 +321,8 @@ async fn queued_replies_hold_until_sent_and_follow_question_order() -> Result<()
             id2.to_string(),
             1,
             track.clone(),
-            json!({"sessionId":"session"})
+            json!({"sessionId":"session"}),
+            None,
         )
         .await
         .is_err()
@@ -327,6 +333,7 @@ async fn queued_replies_hold_until_sent_and_follow_question_order() -> Result<()
         1,
         track.clone(),
         json!({"sessionId":"session"}),
+        None,
     )
     .await?;
     assert_eq!(
@@ -350,7 +357,8 @@ async fn queued_replies_hold_until_sent_and_follow_question_order() -> Result<()
             normal.clone(),
             1,
             track.clone(),
-            json!({"sessionId":"session"})
+            json!({"sessionId":"session"}),
+            None,
         )
         .await
         .is_err()
@@ -374,6 +382,7 @@ async fn queued_replies_hold_until_sent_and_follow_question_order() -> Result<()
         1,
         track.clone(),
         json!({"sessionId":"session"}),
+        None,
     )
     .await?;
     j.input_execution(id.clone(), 1, "held").await?;
@@ -396,6 +405,7 @@ async fn queued_replies_hold_until_sent_and_follow_question_order() -> Result<()
         2,
         track.clone(),
         json!({"sessionId":"session"}),
+        None,
     )
     .await?;
     j.input_execution(id, 2, "sent").await?;
@@ -411,6 +421,7 @@ async fn queued_replies_hold_until_sent_and_follow_question_order() -> Result<()
         1,
         track,
         json!({"sessionId":"session"}),
+        None,
     )
     .await?;
     j.observe_report(report).await?;
@@ -474,7 +485,8 @@ async fn changed_questions_orphan_old_replies_and_ignore_stale_analysis() -> Res
             normal,
             1,
             track,
-            json!({"sessionId":"session"})
+            json!({"sessionId":"session"}),
+            None,
         )
         .await
         .is_err()
@@ -501,7 +513,8 @@ async fn unclear_reports_survive_restart_and_require_review() -> Result<()> {
             normal.clone(),
             1,
             track.clone(),
-            json!({"sessionId":"session"})
+            json!({"sessionId":"session"}),
+            None,
         )
         .await
         .is_err()
@@ -528,7 +541,8 @@ async fn unclear_reports_survive_restart_and_require_review() -> Result<()> {
             normal.clone(),
             1,
             track.clone(),
-            json!({"sessionId":"session"})
+            json!({"sessionId":"session"}),
+            None,
         )
         .await
         .is_err()
@@ -546,6 +560,7 @@ async fn unclear_reports_survive_restart_and_require_review() -> Result<()> {
         1,
         track,
         json!({"sessionId":"session"}),
+        None,
     )
     .await?;
     Ok(())
@@ -600,7 +615,8 @@ async fn a_replaced_reply_is_orphaned_and_a_changed_starting_reply_can_be_releas
             first_id.to_string(),
             1,
             track.clone(),
-            json!({"sessionId":"session"})
+            json!({"sessionId":"session"}),
+            None,
         )
         .await
         .is_err()
@@ -611,6 +627,7 @@ async fn a_replaced_reply_is_orphaned_and_a_changed_starting_reply_can_be_releas
         1,
         track,
         json!({"sessionId":"session"}),
+        None,
     )
     .await?;
     report.text = "Waiting for you: A different choice?".into();
@@ -653,6 +670,7 @@ async fn stale_drafts_keep_the_original_question_and_replay_after_restart() -> R
                     1,
                     track.clone(),
                     json!({"sessionId":"session"}),
+                    None,
                 )
                 .await?;
             journal.input_execution(sent.to_string(), 1, "sent").await?;
@@ -689,7 +707,8 @@ async fn stale_drafts_keep_the_original_question_and_replay_after_restart() -> R
                     operation.to_string(),
                     1,
                     track,
-                    json!({"sessionId":"session"})
+                    json!({"sessionId":"session"}),
+                    None,
                 )
                 .await
                 .is_err()
@@ -820,6 +839,7 @@ async fn an_orphaned_reply_can_be_placed_explicitly_without_reusing_the_question
             2,
             new_track,
             json!({"sessionId":"other-session"}),
+            None,
         )
         .await?;
     assert_eq!(

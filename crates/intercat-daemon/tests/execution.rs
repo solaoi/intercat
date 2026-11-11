@@ -15,7 +15,8 @@ async fn stop_reaches_the_priority_pipe_without_waiting_for_control_consumption(
     let (port, mut controls) = Port::new(std::sync::Arc::new(
         intercat_daemon::dispatch_control::Gate::new(false),
     ));
-    port.attach(connection.client.clone(), "session".into());
+    let turn = Uuid::now_v7();
+    port.attach(connection.client.clone(), "session".into(), Some(turn));
     port.stop(Uuid::now_v7()).unwrap();
     assert!(port.stopped.load(std::sync::atomic::Ordering::Acquire));
     let mut reader = BufReader::new(read_server);
@@ -30,6 +31,10 @@ async fn stop_reaches_the_priority_pipe_without_waiting_for_control_consumption(
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&line).unwrap()["method"],
         "turn/interrupt"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["params"]["turnId"],
+        turn.to_string()
     );
     assert!(matches!(
         controls.try_recv().unwrap(),
@@ -83,7 +88,8 @@ async fn a_cut_request_cannot_reserve_a_turn_and_a_started_request_cannot_be_cut
                 input.id,
                 input.revision,
                 track.clone(),
-                json!({"sessionId":"session"})
+                json!({"sessionId":"session"}),
+                None,
             )
             .await
             .is_err()
@@ -124,6 +130,7 @@ async fn a_cut_request_cannot_reserve_a_turn_and_a_started_request_cannot_be_cut
             input.revision,
             track,
             json!({"sessionId":"session"}),
+            None,
         )
         .await
         .unwrap();
@@ -139,7 +146,7 @@ async fn boundary_hold_never_interrupts_the_running_host() {
     let (port, mut controls) = Port::new(std::sync::Arc::new(
         intercat_daemon::dispatch_control::Gate::new(false),
     ));
-    port.attach(connection.client.clone(), "session".into());
+    port.attach(connection.client.clone(), "session".into(), None);
     port.hold(Uuid::now_v7()).unwrap();
     assert!(!port.stopped.load(std::sync::atomic::Ordering::Acquire));
     assert!(matches!(
@@ -167,7 +174,7 @@ async fn immediate_stop_sends_only_the_captured_turn_and_an_empty_capture_sends_
     let (port, _controls) = Port::new(std::sync::Arc::new(
         intercat_daemon::dispatch_control::Gate::new(false),
     ));
-    port.attach(connection.client.clone(), "session".into());
+    port.attach(connection.client.clone(), "session".into(), None);
     let turn = Uuid::now_v7();
     port.stop_captured(Uuid::now_v7(), Some(turn)).unwrap();
     let mut reader = BufReader::new(read_server);
@@ -329,8 +336,20 @@ async fn boundary_hold_survives_reopen_and_start_releases_only_the_chosen_input(
         journal.snapshot().await.unwrap()["utterances"][0]["state"],
         "held"
     );
-    assert_eq!(journal.snapshot().await.unwrap()["localResumes"], json!({}));
     let track = held["tracks"][0]["id"].as_str().unwrap().to_owned();
+    // Starting one input preserves the worker-wide hold. The resume projection
+    // allows its host to reopen while only that explicitly chosen input runs.
+    let snapshot = journal.snapshot().await.unwrap();
+    assert_eq!(snapshot["localResumes"][&track], json!(hold));
+    assert_eq!(snapshot["workerHolds"][&track], json!(hold));
+    assert_eq!(
+        journal.read_utterance(ids[0].clone()).await.unwrap()["dispatchRunnable"],
+        false
+    );
+    assert_eq!(
+        journal.read_utterance(ids[1].clone()).await.unwrap()["dispatchRunnable"],
+        true
+    );
     journal
         .stage_utterance(
             Uuid::now_v7(),

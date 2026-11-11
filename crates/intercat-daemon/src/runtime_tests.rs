@@ -9,6 +9,52 @@ mod host_memory_native;
 #[path = "runtime_native_queue.rs"]
 mod queue_acceptance;
 
+// Run the normal worker actor under a task-local offline provider. The runtime
+// itself stays unconfigured, so it cannot start a second, paid-provider host.
+pub(crate) async fn fixture_echo_worker(
+    service: &Service,
+    config: Config,
+    editor: crate::editor::Manager,
+    workspace: crate::preparation::Workspace,
+) -> Result<tokio::task::JoinHandle<()>> {
+    if service.journal.worker_config().await?.is_some()
+        || service.journal.snapshot().await?["workers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|worker| worker["trackId"] == workspace.track_id)
+    {
+        return Err("The offline fixture requires an unconfigured, new worker.".into());
+    }
+    let (port, commands) = crate::execution::Port::new(service.global_pause.clone());
+    assert!(
+        service
+            .ports
+            .lock()
+            .unwrap()
+            .insert(workspace.track_id.clone(), port.clone())
+            .is_none()
+    );
+    let launch = Launch {
+        host_memory: service.host_memory.clone(),
+        config,
+        data: service.data.clone(),
+        rpc: service.rpc.clone(),
+        journal: service.journal.clone(),
+        workspace: serde_json::to_value(workspace)?,
+        previous: None,
+        stopping: service.stopping.clone(),
+        execution: crate::execution::Context {
+            project_secrets: service.project_secrets(),
+            port,
+            commands,
+            editor,
+            capacity: service.capacity.clone(),
+        },
+    };
+    Ok(tokio::spawn(host::OFFLINE_ECHO.scope((), run_host(launch))))
+}
+
 #[test]
 fn reopening_keeps_unresolved_progress_until_reconciliation_succeeds() {
     let mut previous = WorkerState::starting("track".into(), None);
@@ -79,6 +125,7 @@ async fn reconnect_fixture(
         data: root.path().into(),
         rpc: root.path().join("rpc"),
         branches: Arc::new(tokio::sync::Mutex::new(())),
+        global_pause: Arc::new(crate::dispatch_control::Gate::new(false)),
         recoveries: crate::pickup_run::Runs::default(),
         stopping: stopping.clone(),
         journal: journal.clone(),
@@ -113,6 +160,231 @@ async fn reconnect_fixture(
         secret: None,
     };
     Ok((root, runner, port, service, retrying, stop))
+}
+
+#[tokio::test]
+async fn realignment_driver_retries_a_failed_outcome_write_without_reexecuting_the_claim()
+-> Result<()> {
+    use crate::realign::{Job, Phase, Request};
+    use std::time::Duration;
+    let (root, runner, _port, service, _scheduled, stop) =
+        reconnect_fixture("DUMMY_REALIGN_WRITE_FAILURE").await?;
+    let journal = runner.journal.clone();
+    let track = runner.state.track_id.clone();
+    let mut worker = runner.state.clone();
+    worker.phase = "ready".into();
+    worker.active_turn = None;
+    worker.checkpoint_pending = false;
+    worker.identity = Some(crate::process::identity(std::process::id())?);
+    journal.worker_state(worker.clone()).await?;
+    let id = Uuid::now_v7();
+    let job = Job {
+        merge_input: None,
+        merge_boundary: None,
+        shared_input: None,
+        resolutions: vec![],
+        request: Request {
+            op_id: id,
+            track_id: track.clone(),
+            source: crate::realign::Source::Commit {
+                job_id: Uuid::now_v7(),
+                revision: 1,
+            },
+        },
+        session_id: worker.session_id.unwrap(),
+        revision: 1,
+        phase: Phase::Queued,
+        keep_processes: false,
+        wait_for_access: false,
+        stop_command: None,
+        stop_checkpoint: None,
+        inspection: None,
+        error: None,
+    };
+    let db = rusqlite::Connection::open(root.path().join("db"))?;
+    db.execute(
+        "INSERT INTO realign_jobs VALUES(?1,?2,'queued',?3)",
+        rusqlite::params![id.to_string(), track, serde_json::to_string(&job)?],
+    )?;
+    db.execute_batch("CREATE TRIGGER dummy_realign_write_failure BEFORE UPDATE ON realign_jobs WHEN NEW.phase='waiting-for-worker' BEGIN SELECT RAISE(ABORT,'Dummy outcome storage unavailable'); END;")?;
+    let driver = crate::realign_driver::Driver::start(service, journal.clone(), stop.subscribe());
+    let result=async {
+        let read=||async {let rows:Vec<Job>=serde_json::from_value(journal.snapshot().await?["realignments"].clone())?;rows.into_iter().find(|job|job.request.op_id==id).ok_or_else(||->Box<dyn std::error::Error+Send+Sync>{"Missing dummy realignment".into()})};
+        tokio::time::timeout(Duration::from_secs(3),async {loop {if read().await?.phase==Phase::Preparing {return Ok::<_,Box<dyn std::error::Error+Send+Sync>>(());}tokio::time::sleep(Duration::from_millis(20)).await;}}).await??;
+        // The fixture has no attached SDK. Its first execution returns Waiting;
+        // the injected write failure must retain that outcome for retry.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(read().await?.phase,Phase::Preparing);
+        assert_eq!(db.query_row("SELECT count(*) FROM events WHERE kind='realign.job' AND json_extract(payload,'$.id')=?1 AND json_extract(payload,'$.phase')='preparing'",[id.to_string()],|row|row.get::<_,i64>(0))?,1);
+        db.execute_batch("DROP TRIGGER dummy_realign_write_failure;")?;
+        tokio::time::timeout(Duration::from_secs(3),async {loop {let current=read().await?;if current.phase==Phase::WaitingForWorker {assert_eq!(current.revision,3);return Ok::<_,Box<dyn std::error::Error+Send+Sync>>(());}tokio::time::sleep(Duration::from_millis(20)).await;}}).await??;
+        assert_eq!(db.query_row("SELECT count(*) FROM events WHERE kind='realign.job' AND json_extract(payload,'$.id')=?1 AND json_extract(payload,'$.phase')='preparing'",[id.to_string()],|row|row.get::<_,i64>(0))?,1);
+        assert_eq!(db.query_row("SELECT count(*) FROM operations WHERE kind IN ('workspace.realign','turn.start')",[],|row|row.get::<_,i64>(0))?,0);
+        Ok::<_,Box<dyn std::error::Error+Send+Sync>>(())
+    }.await;
+    driver.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn realignment_wait_observes_closed_apps_without_reopening_a_sleeping_host() -> Result<()> {
+    use crate::realign::{Job, Phase, Request};
+    use std::time::Duration;
+    for phase in [Phase::WaitingAccess, Phase::WaitingProcesses] {
+        let (root, runner, _port, service, _scheduled, stop) =
+            reconnect_fixture("DUMMY_REALIGN_WAIT").await?;
+        let journal = runner.journal.clone();
+        let track = runner.state.track_id.clone();
+        let workspace = root.path().join("dummy-workspace");
+        std::fs::create_dir(&workspace)?;
+        journal
+            .workspace_result(crate::preparation::Workspace {
+                track_id: track.clone(),
+                path: workspace.clone(),
+                reference: "refs/intercat/dummy/A".into(),
+                base: "a".repeat(40),
+                state: "ready".into(),
+                error: None,
+                denied_roots: vec![],
+                attachment_roots: vec![],
+            })
+            .await?;
+        let mut worker = runner.state.clone();
+        worker.phase = if phase == Phase::WaitingAccess {
+            "sleeping"
+        } else {
+            "needs-recovery"
+        }
+        .into();
+        worker.identity = None;
+        worker.active_turn = None;
+        worker.checkpoint_pending = false;
+        journal.worker_state(worker.clone()).await?;
+        journal.pause_dispatch(Uuid::now_v7(), true).await?;
+        let id = Uuid::now_v7();
+        let job = Job {
+            merge_input: None,
+            merge_boundary: None,
+            shared_input: None,
+            resolutions: vec![],
+            request: Request {
+                op_id: id,
+                track_id: track.clone(),
+                source: crate::realign::Source::Commit {
+                    job_id: Uuid::now_v7(),
+                    revision: 1,
+                },
+            },
+            session_id: worker.session_id.clone().unwrap(),
+            revision: 1,
+            phase,
+            keep_processes: phase == Phase::WaitingProcesses,
+            wait_for_access: phase == Phase::WaitingAccess,
+            stop_command: None,
+            stop_checkpoint: None,
+            inspection: None,
+            error: None,
+        };
+        // Recreate the durable wait boundary, with no running SDK and no model.
+        let db = rusqlite::Connection::open(root.path().join("db"))?;
+        db.execute(
+            "INSERT INTO realign_jobs VALUES(?1,?2,?3,?4)",
+            rusqlite::params![
+                id.to_string(),
+                track,
+                serde_json::to_value(phase)?.as_str().unwrap(),
+                serde_json::to_string(&job)?
+            ],
+        )?;
+        let mut external = if phase == Phase::WaitingAccess {
+            Some(
+                tokio::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .current_dir(&workspace)
+                    .kill_on_drop(true)
+                    .spawn()?,
+            )
+        } else {
+            None
+        };
+        let driver =
+            crate::realign_driver::Driver::start(service, journal.clone(), stop.subscribe());
+        let read = || async {
+            let jobs: Vec<Job> =
+                serde_json::from_value(journal.snapshot().await?["realignments"].clone())?;
+            jobs.into_iter()
+                .find(|job| job.request.op_id == id)
+                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                    "Missing dummy realignment".into()
+                })
+        };
+        if let Some(child) = external.as_mut() {
+            let pid = child.id().unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let inspected = crate::workspace_access::inspect(
+                &workspace,
+                &[crate::process::identity(std::process::id())?],
+            )?;
+            assert!(
+                inspected.processes.iter().any(|p| p.identity.pid == pid),
+                "Own dummy app missing from direct inspection: {inspected:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let current: Job = read().await?;
+                    if current
+                        .inspection
+                        .is_some_and(|value| value.processes.iter().any(|p| p.identity.pid == pid))
+                    {
+                        return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .map_err(|error| {
+                format!("The sleeping wait did not inspect its dummy app: {error}")
+            })??;
+            assert_eq!(read().await?.phase, phase);
+            assert_eq!(journal.snapshot().await?["workers"][0]["phase"], "sleeping");
+            child.kill().await?;
+            child.wait().await?;
+        } else {
+            // A lost host does not prove that its owned processes ended.
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            assert_eq!(read().await?.phase, phase);
+            worker.phase = "sleeping".into();
+            journal.worker_state(worker).await?;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = read().await?;
+                if current.phase == Phase::Queued {
+                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+                }
+                if phase == Phase::WaitingAccess
+                    && current
+                        .inspection
+                        .as_ref()
+                        .is_some_and(|value| value.processes.is_empty() && value.unreadable > 0)
+                {
+                    // Other same-user apps can deny metadata inspection. Their
+                    // unknown state still needs consent, even after our app exits.
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|error| format!("The ended {phase:?} did not update: {error}"))??;
+        let snapshot = journal.snapshot().await?;
+        assert_eq!(snapshot["dispatchPaused"], true);
+        assert_eq!(snapshot["workers"][0]["phase"], "sleeping");
+        let turns:i64=db.query_row("SELECT count(*) FROM operations WHERE kind IN ('turn.start','session/start','session/resume')",[],|row|row.get(0))?;
+        assert_eq!(turns, 0, "Waiting must not launch or dispatch an SDK host");
+        driver.shutdown().await;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -454,6 +726,7 @@ async fn a_restarted_daemon_stops_recorded_hosts_and_keeps_unfinished_work_held(
     service
         .journal
         .workspace_result(crate::preparation::Workspace {
+            denied_roots: Vec::new(),
             attachment_roots: Vec::new(),
             track_id: track.clone(),
             path: root.path().into(),
@@ -537,6 +810,7 @@ async fn cancellation_interrupts_a_locked_recovery_and_retries_recorded_host_cle
     service
         .journal
         .workspace_result(crate::preparation::Workspace {
+            denied_roots: Vec::new(),
             attachment_roots: Vec::new(),
             track_id: state.track_id.clone(),
             path: root.path().into(),
@@ -578,7 +852,14 @@ async fn cancellation_interrupts_a_locked_recovery_and_retries_recorded_host_cle
         .await?;
     service
         .journal
-        .summary_plan(request.op_id, recovery.context.clone())
+        .summary_plan(crate::handoff::Source {
+            id: request.op_id,
+            identity: crate::handoff::Identity {
+                track_id: recovery.request.track_id.clone(),
+                session_id: recovery.request.session_id.clone(),
+            },
+            context: recovery.context.clone(),
+        })
         .await?;
     let crate::handoff::Next::Task(task) = service.journal.summary_next(request.op_id).await?
     else {
@@ -835,11 +1116,9 @@ async fn real_file_pickup_preserves_edits_and_runs_one_handoff_in_a_new_session(
     let base = native_git(&source, &["rev-parse", "HEAD"])?;
     let path = root.path().join("worker");
     let inspected = crate::worktree::inspect(&source).await?;
-    crate::worktree::GitTool::system()
-        .await?
-        .prepare_detached(&inspected, &path)
-        .await?;
+    crate::worktree::prepare_detached(&inspected, &path).await?;
     let workspace = crate::preparation::Workspace {
+        denied_roots: Vec::new(),
         attachment_roots: crate::attachments::reserve(&path, &base)?,
         track_id: track.clone(),
         path: path.clone(),
@@ -911,6 +1190,7 @@ async fn real_file_pickup_preserves_edits_and_runs_one_handoff_in_a_new_session(
             1,
             track.clone(),
             json!({"commandId":command,"sessionId":previous,"input":[]}),
+            None,
         )
         .await?;
     journal.try_msp(track.clone(),previous.clone(),crate::clock::Stamp{epoch_ms:999,mono_ms:0,boot_id:"fixture".into(),timeline_ms:999},json!({"method":"turn/started","params":{"sessionId":previous,"turnId":turn,"commandId":command}}),None,None)?.await??;
@@ -968,7 +1248,7 @@ async fn real_file_pickup_preserves_edits_and_runs_one_handoff_in_a_new_session(
 secrets:&[],rpc:&rpc,denied:&[]}).await?;
         replay.connection.client.initialize().await?;
         let response=replay.connection.client.request("session/start",json!({"commandId":recovery.start_command,"sessionId":recovery.session_id,"workspaceRoot":path,"approvalMode":"promptUnmatched","providerId":"meta","modelId":"muse-spark-1.3-contributor","recoveryMode":"on"})).await;
-        if response.is_ok() {crate::pickup_run::release_new_session(&mut replay,&recovery.session_id).await?;}
+        if response.is_ok() {replay.release_session(&recovery.session_id, true).await?;}
         replay.shutdown().await?;
         assert_eq!(response?["session"]["sessionId"],recovery.session_id);
         assert!(runtime.service.activate_pickup(request.op_id).await.is_err());
@@ -1022,7 +1302,15 @@ class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
   body=json.dumps({'accepting':True,'modelLoaded':True}).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
  def do_POST(self):
-  self.rfile.read(int(self.headers['Content-Length']));body=json.dumps({'cachePrefix':False,'stages':{'decision':{'selected':' A'}},'inferenceMs':1}).encode();self.send_response(200);self.send_header('X-Intercat-Inference','started');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+  request=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+  stages={}
+  for stage in request.get('stages',[]):
+   if stage['name'].startswith('question'):
+    stages[stage['name']]={'selected':'0','logprobs':{'0':0,'1':-100,'2':-100},'probabilities':{'0':1,'1':0,'2':0}}
+  if self.path=='/tokens': response={'tokens':1}
+  elif self.path=='/generate': response={'preempted':False,'text':json.dumps({'assumptions':[]}),'tokens':1}
+  else: response={'cachePrefix':False,'stages':stages or {'decision':{'selected':' A'}},'inferenceMs':1}
+  body=json.dumps(response).encode();self.send_response(200);self.send_header('X-Intercat-Inference','started');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
 server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
 print(json.dumps({'host':'127.0.0.1','port':server.server_port}),flush=True)
 server.serve_forever()
@@ -1495,7 +1783,7 @@ async fn real_local_dependency_reaches_a_checked_commit() -> Result<()> {
         integration.command(Command{op_id:Uuid::now_v7(),action:Action::Prepare{id:opened.id,revision:opened.revision}}).await?;
         let built=tokio::time::timeout(std::time::Duration::from_secs(60),async {
             loop {
-                let job:crate::integration::Job=serde_json::from_value(journal.snapshot().await?["integration"].clone())?;
+                let job:crate::integration::Job=serde_json::from_value(journal.snapshot().await?["integrations"][0].clone())?;
                 if !matches!(job.status,Status::Building|Status::Staging) {return Ok::<_,Box<dyn std::error::Error+Send+Sync>>(job);}
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
@@ -1505,7 +1793,7 @@ async fn real_local_dependency_reaches_a_checked_commit() -> Result<()> {
         integration.command(Command{op_id:Uuid::now_v7(),action:Action::Commit{id:built.id,revision:built.revision,head:candidate.head.clone(),tree:candidate.tree.clone(),settings_hash:candidate.settings_hash.clone()}}).await?;
         let done=tokio::time::timeout(std::time::Duration::from_secs(30),async {
             loop {
-                let job:crate::integration::Job=serde_json::from_value(journal.snapshot().await?["integration"].clone())?;
+                let job:crate::integration::Job=serde_json::from_value(journal.snapshot().await?["integrations"][0].clone())?;
                 if job.status!=Status::Committing{return Ok::<_,Box<dyn std::error::Error+Send+Sync>>(job);}
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
@@ -1599,11 +1887,9 @@ async fn real_attachment_original_is_copied_and_read_without_entering_the_checkp
         .await?;
     let path = root.path().join("worker");
     let inspected = crate::worktree::inspect(&source).await?;
-    crate::worktree::GitTool::system()
-        .await?
-        .prepare_detached(&inspected, &path)
-        .await?;
+    crate::worktree::prepare_detached(&inspected, &path).await?;
     let workspace = crate::preparation::Workspace {
+        denied_roots: Vec::new(),
         attachment_roots: crate::attachments::reserve(&path, &project.only_folder()?.base)?,
         track_id: track.clone(),
         path: path.clone(),
@@ -1708,6 +1994,7 @@ async fn real_active_host_crash_recovers_without_replaying_its_turn_or_approval(
     runner
         .journal
         .workspace_result(crate::preparation::Workspace {
+            denied_roots: Vec::new(),
             attachment_roots: Vec::new(),
             track_id: runner.state.track_id.clone(),
             path: project,
@@ -1872,7 +2159,7 @@ async fn losing_the_secret_rpc_caller_cannot_strand_its_prepared_record() -> Res
     let (stream, _peer) = tokio::io::duplex(65536);
     let (reader, writer) = tokio::io::split(stream);
     let connection = crate::msp::Connection::new(reader, writer);
-    port.attach(connection.client.clone(), "retained".into());
+    port.attach(connection.client.clone(), "retained".into(), None);
     let (began, started) = tokio::sync::oneshot::channel();
     let caller = tokio::spawn(async move {
         let _ = began.send(());
@@ -1958,6 +2245,7 @@ async fn real_report_secret_restarts_the_host_and_runs_with_a_masked_environment
     runner
         .journal
         .workspace_result(crate::preparation::Workspace {
+            denied_roots: Vec::new(),
             attachment_roots: Vec::new(),
             track_id: runner.state.track_id.clone(),
             path: project.clone(),
@@ -2118,6 +2406,7 @@ async fn real_redirect_interrupts_then_runs_the_correction_once() -> Result<()> 
     runner
         .journal
         .workspace_result(crate::preparation::Workspace {
+            denied_roots: Vec::new(),
             attachment_roots: Vec::new(),
             track_id: runner.state.track_id.clone(),
             path: project.clone(),
@@ -2240,9 +2529,12 @@ async fn shutdown_does_not_admit_a_new_branch() -> Result<()> {
     assert!(
         service
             .prepare_branch(crate::branch::Request {
+                instructions: crate::branch::InstructionMode::Checkpoint,
                 op_id: Uuid::now_v7(),
                 parent_track_id: runner.state.track_id.clone(),
-                turn_id: Uuid::now_v7()
+                point: crate::branch_start::Selection::Turn {
+                    turn_id: Uuid::now_v7()
+                }
             })
             .await
             .is_err()
@@ -2402,6 +2694,7 @@ async fn real_branch_uses_the_early_tree_and_inherits_secret_fingerprints() -> R
     runner.path = source.clone();
     std::fs::create_dir(&runner.rpc)?;
     let workspace = crate::preparation::Workspace {
+        denied_roots: Vec::new(),
         attachment_roots: crate::attachments::reserve(&source, &project.only_folder()?.base)?,
         track_id: track.clone(),
         path: source.clone(),
@@ -2433,7 +2726,7 @@ async fn real_branch_uses_the_early_tree_and_inherits_secret_fingerprints() -> R
         branch_input(&journal,&track,"Run exactly `python3 late.py` once with bash. Do not use another command or tool. Report briefly and finish without a question.",vec![late_attachment.id]).await?;
         let late=branch_checkpoint(&journal,&track,Some(first.turn_id)).await?.checkpoint.unwrap();
         eprintln!("branch fixture: later checkpoint saved");
-        let request=crate::branch::Request {op_id:Uuid::now_v7(),parent_track_id:track.clone(),turn_id:first.turn_id};
+        let request=crate::branch::Request {op_id:Uuid::now_v7(),parent_track_id:track.clone(),point: crate::branch_start::Selection::Turn { turn_id: first.turn_id },instructions:crate::branch::InstructionMode::Checkpoint};
         let prepared=service.prepare_branch(request.clone()).await?;
         assert_eq!(prepared["branch"]["phase"],"awaiting-receipt");
         if service.activate_branch(request.op_id).await.is_ok() {return Err("Branch activated before the fingerprint receipt.".into());}
@@ -2495,4 +2788,202 @@ async fn real_branch_uses_the_early_tree_and_inherits_secret_fingerprints() -> R
         cleanup?;
     }
     verification
+}
+
+#[tokio::test]
+async fn a_fresh_release_after_daemon_restart_closes_only_its_source_and_preserves_future_words()
+-> Result<()> {
+    use crate::{
+        decision::Target,
+        fresh::{Change, Phase, Request},
+    };
+    use std::{fs, process::Stdio, time::Duration};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let (root, runner, _, _, _, _) = reconnect_fixture("OWN_COLD_FRESH_FUTURE").await?;
+    let journal = runner.journal.clone();
+    let track = runner.state.track_id.clone();
+    drop(runner);
+    let source = root.path().join("own-cold-source");
+    fs::create_dir(&source)?;
+    native_git(&source, &["init", "-q", "-b", "main"])?;
+    fs::write(source.join("own.txt"), "Own cold recovery base\n")?;
+    native_git(&source, &["add", "."])?;
+    native_git(&source, &["commit", "-qm", "Own cold base"])?;
+    journal
+        .configure_project(
+            Uuid::now_v7(),
+            crate::project::inspect(Uuid::now_v7(), "Own cold Fresh".into(), vec![source]).await?,
+        )
+        .await?;
+    let preparation =
+        crate::preparation::Preparation::start(&root.path().join("workspaces"), journal.clone())?;
+    let workspace = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(workspace) = journal.workspace(track.clone()).await
+                && workspace.state == "ready"
+            {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(workspace);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    preparation.shutdown().await;
+    let cp = crate::checkpoint::save(
+        workspace.clone(),
+        Uuid::now_v7(),
+        None,
+        false,
+        journal.clone(),
+    )
+    .await?;
+    let directory = root.path().join("hosts").join(&track).join("own-cold-host");
+    fs::create_dir_all(&directory)?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let nonce = Uuid::now_v7().to_string();
+    let mut tracker = crate::process::Tracker::prepare(&directory, &workspace.path, nonce.clone())?;
+    let mut child = tokio::process::Command::new("/usr/bin/python3")
+        .args([
+            "-I",
+            "-u",
+            "-c",
+            "import time\nprint('ready',flush=True)\nwhile True: time.sleep(.05)",
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("INTERCAT_HOST", nonce)
+        .current_dir(&workspace.path)
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let identity = crate::process::identity(child.id().unwrap())?;
+    tracker.attach_process_group(identity)?;
+    drop(tracker);
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .await?;
+    assert_eq!(line, "ready\n");
+    let mut worker = WorkerState::starting(track.clone(), None);
+    worker.phase = "ready".into();
+    worker.session_id = Some(Uuid::now_v7().to_string());
+    worker.identity = Some(identity);
+    worker.checkpoint = Some(cp);
+    journal.worker_state(worker.clone()).await?;
+    let request = Request {
+        op_id: Uuid::now_v7(),
+        track_id: track.clone(),
+        session_id: worker.session_id.clone().unwrap(),
+    };
+    journal.fresh(Change::Request(request.clone())).await?;
+    let captured = journal
+        .fresh(Change::Capture {
+            id: request.op_id,
+            revision: 1,
+        })
+        .await?;
+    journal
+        .fresh(Change::Release {
+            id: request.op_id,
+            revision: captured.revision,
+        })
+        .await?;
+    worker.phase = "fresh-releasing".into();
+    journal.worker_state(worker).await?;
+    let word = Uuid::now_v7();
+    journal
+        .stage_utterance(
+            word,
+            "Own cold future".into(),
+            Target::Lock(track.clone()),
+            None,
+            vec![],
+        )
+        .await?;
+    let input = journal.claim_input().await?.unwrap();
+    journal
+        .apply_input(
+            input.id,
+            input.revision,
+            crate::decision::Outcome::Classified(crate::decision::Decision {
+                kind: crate::decision::Kind::Extend,
+                track_id: Some(track.clone()),
+                boundary: Some("now".into()),
+                command: None,
+                confidence: 1.,
+                inference_ms: 1.,
+                timed_out: false,
+                scores: json!({}),
+            }),
+        )
+        .await?;
+    let before = journal.read_utterance(word.to_string()).await?;
+    assert_eq!(before["state"], "placed");
+    // Any accidental attempt to launch an SDK host would fail. Cold Fresh
+    // closure needs only its saved owner records, never a new authentication.
+    journal
+        .set_worker_config(
+            Uuid::now_v7(),
+            Config {
+                source: root.path().join("absent"),
+                binary: root.path().join("absent"),
+                credentials: root.path().join("absent-auth"),
+                path: "/usr/bin:/bin".into(),
+            },
+        )
+        .await?;
+    fs::create_dir(root.path().join("own-editor"))?;
+    let editor = crate::editor::Manager::new(
+        &root.path().join("own-editor"),
+        &root.path().join("own-editor.log"),
+    )?;
+    let runtime = Runtime::start(
+        crate::host_memory::Pool::fixed(crate::host_memory::Sample {
+            free_bytes: 1024 * 1024 * 1024,
+            pressured: false,
+        }),
+        root.path().into(),
+        root.path().join("rpc"),
+        journal.clone(),
+        editor.clone(),
+        Arc::new(crate::scheduler::Capacity::new(1)),
+        Arc::new(crate::dispatch_control::Gate::new(false)),
+    );
+    let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let job = journal.fresh_job(request.op_id).await?.unwrap();
+            if matches!(
+                job.phase,
+                Phase::Inspecting
+                    | Phase::NeedsAccess
+                    | Phase::CapturingFiles
+                    | Phase::PublishingFiles
+                    | Phase::SnapshotReady
+            ) {
+                assert!(!crate::process::is_alive(identity));
+                let after = journal.read_utterance(word.to_string()).await?;
+                for field in ["state", "revision", "decision"] {
+                    assert_eq!(after[field], before[field]);
+                }
+                let snapshot = journal.snapshot().await?;
+                assert!(!snapshot["workers"].as_array().unwrap().iter().any(
+                    |worker| worker["trackId"] == track && worker["phase"] == "needs-recovery"
+                ));
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            if let Some(error) = job.error {
+                return Err(format!("Own cold Fresh failed: {error}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    runtime.shutdown().await;
+    editor.stop().await;
+    tokio::time::timeout(Duration::from_secs(5), child.wait()).await??;
+    outcome??;
+    Ok(())
 }

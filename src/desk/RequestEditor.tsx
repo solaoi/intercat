@@ -5,6 +5,8 @@ import type { EditAction, LiveTrack, RequestEdit, Utterance, WorkerState, Timeli
 import { DecisionTiming } from './DecisionTiming';
 import { RequestTurn } from './RequestTurn';
 import { PrivacyText, usePrivacyLabels } from './PrivacyText';
+import '../twoWays/twoWays.css';
+import type { TwoWaysOptions } from '../twoWays/types';
 
 type PendingEdit = Extract<EditAction, { kind: 'apply' | 'end' }>;
 type Lease = NonNullable<Utterance['editHold']>;
@@ -32,6 +34,9 @@ export function RequestEditor({ word, tracks, workers, clips, plans, initialEdit
   const [lease, setLease] = useState<Lease | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [twoOptions,setTwoOptions]=useState<TwoWaysOptions|null>(null);
+  const [optionsError,setOptionsError]=useState('');
+  const [optionsRead,setOptionsRead]=useState(0);
   const [position, setPosition] = useState({ left: 8, top: 8 });
   const pending = useRef<PendingEdit | null>(null);
   const pendingMisread = useRef<{ opId: string; utteranceId: string; revision: number } | null>(null);
@@ -144,6 +149,17 @@ export function RequestEditor({ word, tracks, workers, clips, plans, initialEdit
     document.addEventListener('pointerdown', outside, true);
     return () => document.removeEventListener('pointerdown', outside, true);
   });
+
+  useEffect(()=>{
+    let disposed=false;setTwoOptions(null);setOptionsError('');
+    if(!lease||alreadySent||current.state!=='placed'||current.decision?.trackId!==track||!['fork','extend','schedule'].includes(current.decision?.kind??'')||current.reviewFix||current.planItemId||current.replyTo)return;
+    void window.intercat.readTwoWaysOptions({inputId:current.id,revision:current.revision}).then(value=>{
+      if(disposed)return;
+      if(value.inputId!==current.id||value.revision!==current.revision||value.selection.trackId!==track)throw new Error('The effort choices belong to another instruction.');
+      setTwoOptions(value);
+    }).catch(error=>{if(!disposed)setOptionsError(error instanceof Error?error.message:'The effort choices could not be read.');});
+    return ()=>{disposed=true;};
+  },[current.id,current.revision,current.state,lease?.token,alreadySent,track,optionsRead]);
 
   async function submit() {
     const action = pending.current;
@@ -280,6 +296,11 @@ export function RequestEditor({ word, tracks, workers, clips, plans, initialEdit
           <dt>Boundary</dt><dd>{current.decision.boundary ?? 'None'}</dd>
           {current.decision.command && <><dt>Command</dt><dd>{current.decision.command}</dd></>}
         </dl></details>}
+        {!alreadySent&&['fork','extend','schedule'].includes(current.decision?.kind??'')&&<div className="request-two-ways">
+          <button disabled={disabled||!twoOptions||current.state!=='placed'||!!current.reviewFix||!!current.planItemId||!!current.replyTo||!workers.some(worker=>worker.trackId===track&&worker.sessionId&&!['failed','lost','needs-recovery','after-connection-loss'].includes(worker.phase))} onClick={async()=>{if(busyRef.current||!leaseRef.current||!twoOptions)return;try{await finish({kind:'tryTwoWays',opId:await window.intercat.createOperationId(),selection:twoOptions.selection});}catch(error){setError(error instanceof Error?error.message:'The paired request could not be prepared.');}}}>Try it two ways<span>{twoOptions?`${label}′ at effort ${twoOptions.selection.variation.alternate}`:'Reading effort choices…'}</span></button>
+          {optionsError&&<><small role="alert"><PrivacyText text={optionsError}/></small><button disabled={busy} onClick={()=>setOptionsRead(value=>value+1)}>Read effort choices again</button></>}
+          <small>Uses about twice the usage. Both receive the same instruction and references. You compare the results and choose which path to keep.</small>
+        </div>}
         <DecisionTiming decision={current.decision} />
         {current.decision?.description && <section aria-label="Recorded Editor explanation"><h4>Editor explanation</h4><p><PrivacyText text={current.decision.description.detail} /></p></section>}
       </section>

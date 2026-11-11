@@ -7,7 +7,7 @@
   "scripts": {
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "setup:tools": "node tools/install-gitleaks.mjs",
+    "setup:tools": "node tools/install-gitleaks.mjs && node tools/install-git-lfs.mjs",
     "start": "npm run setup:tools && cargo build --offline --bin intercatd && npm run build && electron .",
     "preview": "npm run build && electron . --preview",
     "test:desktop": "npm run build && playwright test"
