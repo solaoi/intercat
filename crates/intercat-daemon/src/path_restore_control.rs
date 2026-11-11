@@ -45,11 +45,9 @@ fn followup(db: &Connection, job: &Job) -> Result<Option<Followup>> {
     let Some((app, _)) = crate::path_restore_store::application(db, &job.request)? else {
         return Err("A completed Restore has no saved file intent.".into());
     };
-    let target: String = db.query_row(
-        "SELECT head FROM published_lineage WHERE reference=?1",
-        [&app.source.target_ref],
-        |row| row.get(0),
-    )?;
+    let target = crate::lineage_store::read_published(db, &job.session_id, &job.folder_id)?
+        .ok_or("The Restore target has no published coverage.")?
+        .head;
     if target == restored.base {
         return Ok(None);
     }

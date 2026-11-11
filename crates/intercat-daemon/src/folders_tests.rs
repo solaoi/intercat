@@ -70,12 +70,12 @@ async fn workspaces(journal: &Journal, count: usize) -> Result<Vec<Workspace>> {
 
 #[tokio::test]
 async fn planned_tracks_keep_separate_roots_session_refs_and_commit_reviews() -> Result<()> {
-    for published_prefix in [true, false] {
+    for published_prefix in [None, Some(true), Some(false)] {
         group_scenario(published_prefix).await?;
     }
     Ok(())
 }
-async fn group_scenario(published_prefix: bool) -> Result<()> {
+async fn group_scenario(published_prefix: Option<bool>) -> Result<()> {
     let root = tempfile::tempdir()?;
     let a = source(root.path(), "a")?;
     let b = source(root.path(), "b")?;
@@ -157,16 +157,19 @@ async fn group_scenario(published_prefix: bool) -> Result<()> {
     journal.advance_plans().await?;
     let state = journal.snapshot().await?;
     let slug = state["session"]["slug"].as_str().unwrap();
-    let repo = Repository::open(&b)?;
-    let foreign = repo.write_blob(b"dummy foreign owner")?;
-    repo.compare_and_swap(&format!("refs/intercat/{slug}/foreign"), None, foreign)?;
+    if published_prefix.is_some() {
+        let repo = Repository::open(&b)?;
+        let foreign = repo.write_blob(b"dummy foreign owner")?;
+        repo.compare_and_swap(&format!("refs/intercat/{slug}/foreign"), None, foreign)?;
+    }
     let preparation = Preparation::start(&root.path().join("workspaces"), journal.clone())?;
-    let result = async {
+    let result = Box::pin(async {
         let work = workspaces(&journal, 2).await?;
         let state = journal.snapshot().await?;
         assert_eq!(state["sessionFolders"].as_array().unwrap().len(), 2);
         assert_eq!(state["sessionFolders"][0]["slug"], slug);
-        assert_eq!(state["sessionFolders"][1]["slug"], format!("{slug}-2"));
+        let second_slug = if published_prefix.is_some() { format!("{slug}-2") } else { slug.to_owned() };
+        assert_eq!(state["sessionFolders"][1]["slug"], second_slug);
         // Opening a group before any saved work must not invent candidates.
         let empty = journal.change_commit_group(crate::commit_group::Change::Open(crate::commit_group::Open {op_id:Uuid::now_v7(),tracks:None})).await?.group;
         assert_eq!(empty.members.len(),2);
@@ -383,48 +386,69 @@ async fn group_scenario(published_prefix: bool) -> Result<()> {
         let accepted=journal.change_commit_group(crate::commit_group::Change::Commit(request.clone())).await?;
         assert_eq!(accepted.group.status,crate::commit_group::Status::Committing);
         assert_eq!(journal.change_commit_group(crate::commit_group::Change::Commit(request)).await?.group.revision,accepted.group.revision);
-        // Simulate B's published branch prefix with its base still blocked.
-        // These are only the fixture's own Intercat refs, never its main branch.
-        let pending_b=journal.integration_job(reviews[1].id).await?;
-        let publication=pending_b.publication.as_ref().ok_or("Missing dummy publication")?;
-        let branch=&publication.refs[0];let base=&publication.refs[1];
-        assert!(branch.old.is_none()&&base.old.is_none());
-        let repo_b=Repository::open(&b)?;
-        if published_prefix {
-            repo_b.compare_and_swap(&branch.name,None,branch.new.parse()?)?;
-            repo_b.compare_and_swap(&base.name,None,project.folders[1].base.parse()?)?;
-        } else {repo_b.compare_and_swap(&branch.name,None,project.folders[1].base.parse()?)?;}
-        service.recover().await?;
-        tokio::time::timeout(Duration::from_secs(10),async {
-            loop {
-                let current=journal.change_commit_group(crate::commit_group::Change::Reconcile(group.id)).await?.group;
-                if current.status==crate::commit_group::Status::Partial {return Ok::<_,Box<dyn std::error::Error+Send+Sync>>(());}
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }).await??;
-        assert_eq!(journal.integration_job(reviews[0].id).await?.status,crate::integration::Status::Done);
-        let blocked=journal.integration_job(reviews[1].id).await?;
-        assert_eq!(db.query_row("SELECT count FROM integration_counts WHERE track=?1",[&tracks[0]],|row|row.get::<_,i64>(0))?,1);
-        if published_prefix {
-            assert_eq!(blocked.status,crate::integration::Status::CommitBlocked);
-            repo_b.delete_ref(&base.name,project.folders[1].base.parse()?)?;
-            service.command(CommitCommand{op_id:Uuid::now_v7(),action:CommitAction::RetryCommit{id:blocked.id,revision:blocked.revision}}).await?;
-        } else {
-            assert_eq!(blocked.status,crate::integration::Status::Failed);
-            assert!(blocked.candidate.is_none()&&blocked.publication.is_none());
-            git(&b,&["update-ref","-d",&branch.name,&project.folders[1].base])?;
-            let refreshed=service.command(CommitCommand{op_id:Uuid::now_v7(),action:CommitAction::Refresh{id:blocked.id,revision:blocked.revision}}).await?;
-            service.command(CommitCommand{op_id:Uuid::now_v7(),action:CommitAction::Prepare{id:refreshed.id,revision:refreshed.revision}}).await?;
-            tokio::time::timeout(Duration::from_secs(20),async {
+        if let Some(published_prefix) = published_prefix {
+            // Simulate B's published branch prefix with its base still blocked.
+            // These are only the fixture's own Intercat refs, never its main branch.
+            let pending_b=journal.integration_job(reviews[1].id).await?;
+            let publication=pending_b.publication.as_ref().ok_or("Missing dummy publication")?;
+            let branch=&publication.refs[0];let base=&publication.refs[1];
+            assert!(branch.old.is_none()&&base.old.is_none());
+            let repo_b=Repository::open(&b)?;
+            if published_prefix {
+                repo_b.compare_and_swap(&branch.name,None,branch.new.parse()?)?;
+                repo_b.compare_and_swap(&base.name,None,project.folders[1].base.parse()?)?;
+            } else {repo_b.compare_and_swap(&branch.name,None,project.folders[1].base.parse()?)?;}
+            service.recover().await?;
+            tokio::time::timeout(Duration::from_secs(10),async {
                 loop {
-                    if journal.integration_job(blocked.id).await?.status==crate::integration::Status::Checked {return Ok::<_,Box<dyn std::error::Error+Send+Sync>>(());}
+                    let current=journal.change_commit_group(crate::commit_group::Change::Reconcile(group.id)).await?.group;
+                    if current.status==crate::commit_group::Status::Partial {return Ok::<_,Box<dyn std::error::Error+Send+Sync>>(());}
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }).await??;
-            let current=journal.change_commit_group(crate::commit_group::Change::Reconcile(group.id)).await?.group;
-            let retry=crate::commit_group::Commit{op_id:Uuid::now_v7(),id:group.id,revision:current.revision,targets:targets(vec![journal.integration_job(reviews[0].id).await?,journal.integration_job(reviews[1].id).await?])?};
-            service.commit_group(retry.clone()).await?;
-            service.commit_group(retry).await?;
+            assert_eq!(journal.integration_job(reviews[0].id).await?.status,crate::integration::Status::Done);
+            let blocked=journal.integration_job(reviews[1].id).await?;
+            assert_eq!(db.query_row("SELECT count FROM integration_counts WHERE track=?1",[&tracks[0]],|row|row.get::<_,i64>(0))?,1);
+            if published_prefix {
+                assert_eq!(blocked.status,crate::integration::Status::CommitBlocked);
+                repo_b.delete_ref(&base.name,project.folders[1].base.parse()?)?;
+                db.execute_batch("CREATE TRIGGER fail_dummy_publication BEFORE INSERT ON published_lineage
+                    BEGIN SELECT RAISE(ABORT, 'Dummy publication journal failure'); END;")?;
+                service.command(CommitCommand{op_id:Uuid::now_v7(),action:CommitAction::RetryCommit{id:blocked.id,revision:blocked.revision}}).await?;
+                let failed = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let job = journal.integration_job(blocked.id).await?;
+                        if job.error.as_deref().is_some_and(|error| error.contains("Dummy publication journal failure")) {
+                            return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(job);
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await.map_err(|_| "The dummy journal failure did not appear in the Commit job.")??;
+                assert_eq!(failed.status, crate::integration::Status::CommitBlocked);
+                assert_eq!(failed.publication, blocked.publication);
+                assert_eq!(repo_b.reference_target(&branch.name)?, Some(branch.new.parse()?));
+                assert!(crate::lineage_store::read_published(&db, &failed.session_id, &failed.project.id)?.is_none());
+                db.execute_batch("DROP TRIGGER fail_dummy_publication;")?;
+                service.command(CommitCommand{op_id:Uuid::now_v7(),action:CommitAction::RetryCommit{id:failed.id,revision:failed.revision}}).await?;
+            } else {
+                assert_eq!(blocked.status,crate::integration::Status::Failed);
+                assert!(blocked.candidate.is_none()&&blocked.publication.is_none());
+                git(&b,&["update-ref","-d",&branch.name,&project.folders[1].base])?;
+                let refreshed=service.command(CommitCommand{op_id:Uuid::now_v7(),action:CommitAction::Refresh{id:blocked.id,revision:blocked.revision}}).await?;
+                service.command(CommitCommand{op_id:Uuid::now_v7(),action:CommitAction::Prepare{id:refreshed.id,revision:refreshed.revision}}).await?;
+                tokio::time::timeout(Duration::from_secs(20),async {
+                    loop {
+                        if journal.integration_job(blocked.id).await?.status==crate::integration::Status::Checked {return Ok::<_,Box<dyn std::error::Error+Send+Sync>>(());}
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await??;
+                let current=journal.change_commit_group(crate::commit_group::Change::Reconcile(group.id)).await?.group;
+                let retry=crate::commit_group::Commit{op_id:Uuid::now_v7(),id:group.id,revision:current.revision,targets:targets(vec![journal.integration_job(reviews[0].id).await?,journal.integration_job(reviews[1].id).await?])?};
+                service.commit_group(retry.clone()).await?;
+                service.commit_group(retry).await?;
+            }
+        } else {
+            service.recover().await?;
         }
         tokio::time::timeout(Duration::from_secs(20),async {
             loop {
@@ -432,7 +456,19 @@ async fn group_scenario(published_prefix: bool) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }).await??;
-        for track in &tracks {assert_eq!(db.query_row("SELECT count FROM integration_counts WHERE track=?1",[track],|row|row.get::<_,i64>(0))?,1);}
+        for ((review, path), track) in reviews.iter().zip([&a, &b]).zip(&tracks) {
+            let job = journal.integration_job(review.id).await?;
+            assert_eq!(job.status, crate::integration::Status::Done);
+            let plan = job.plan.as_ref().unwrap();
+            if published_prefix.is_none() {
+                assert_eq!(plan.target_ref, format!("refs/heads/intercat/{slug}"));
+            }
+            let saved = crate::lineage_store::read_published(&db, &job.session_id, &job.project.id)?.unwrap();
+            assert_eq!(saved.head, job.candidate.as_ref().unwrap().head.to_string());
+            assert_eq!(Repository::open(path)?.reference_target(&plan.target_ref)?, Some(saved.head.parse()?));
+            assert_eq!(saved.coverage.keys().collect::<Vec<_>>(), vec![track]);
+            assert_eq!(db.query_row("SELECT count FROM integration_counts WHERE track=?1",[track],|row|row.get::<_,i64>(0))?,1);
+        }
         service.shutdown().await;
         crate::push_multifolder_tests::verify(&journal,&project,root.path()).await?;
         for (path, (index, head)) in [&a, &b].into_iter().zip(&originals) {
@@ -446,11 +482,11 @@ async fn group_scenario(published_prefix: bool) -> Result<()> {
         assert_eq!(reopened["trackFolders"], state["trackFolders"]);
         assert_eq!(reopened["sessionFolders"], state["sessionFolders"]);
         if let Ok(output)=std::env::var("INTERCAT_FOLDER_REVIEWS_OUTPUT") {
-            let output=PathBuf::from(output).join(if published_prefix {"published-prefix"} else {"unpublished-conflict"});std::fs::create_dir_all(&output)?;
+            let output=PathBuf::from(output).join(match published_prefix {None=>"default-ref",Some(true)=>"published-prefix",Some(false)=>"unpublished-conflict"});std::fs::create_dir_all(&output)?;
             std::fs::write(output.join("verification.json"),serde_json::to_vec_pretty(&json!({"verified":true,"milestoneAccepted":false,"unit":8,"layer":"all-folder Commit and review retention","schema":crate::journal::SCHEMA_VERSION,"paidTurns":0,"modelTurns":0,"allChecksRequiredBeforeAnyIntent":true,"mixedFolderSelectionAccepted":true,"invalidSelectionsAndStaleCandidatesRejected":true,"emptyFoldersHaveNoCandidates":true,"emptyDiscardReplayIdempotent":true,"partialPublicationRecovered":true,"publishedPrefix":published_prefix,"completedFolderNotRepeated":true,"twoFolderReviews":true,"checkContinuedWhileOtherFolderOpened":true,"oneCheckFailedIndependently":true,"otherFolderDiffReadable":true,"messageRebuildKeptOtherResult":true,"journalReopenKeptBoth":true,"sourceHeadAndIndexUnchanged":true,"snapshot":reopened}))?)?;
         }
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-    }
+    })
     .await;
     preparation.shutdown().await;
     result

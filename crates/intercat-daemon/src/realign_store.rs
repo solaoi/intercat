@@ -245,18 +245,16 @@ fn context_at(db: &Connection, request: &Request, idle: bool) -> Result<Context>
             }
             let plan = job.plan.as_ref().ok_or("Missing committed plan.")?;
             let candidate = job.candidate.as_ref().ok_or("Missing committed result.")?;
-            let (target, coverage): (String, String) = db.query_row(
-                "SELECT head,coverage FROM published_lineage WHERE reference=?1",
-                [&plan.target_ref],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            if target != candidate.head && saved.is_none() {
+            let published =
+                crate::lineage_store::read_published(db, &job.session_id, &job.project.id)?
+                    .ok_or("The realignment target has no published coverage.")?;
+            if published.head != candidate.head && saved.is_none() {
                 return Err("A newer Commit is available. Review its realignment instead.".into());
             }
             (
                 plan.target_ref.clone(),
-                target,
-                Origin::Commit(serde_json::from_str(&coverage)?),
+                published.head,
+                Origin::Commit(published.coverage),
             )
         }
         crate::realign::Source::Reparent { parent, .. } => {

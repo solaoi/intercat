@@ -523,8 +523,12 @@ async fn reparenting_with_an_advanced_independent_parent_keeps_a_target_deletion
     repo.sync_ref(target)?;
     let db = rusqlite::Connection::open(f.root.path().join("events.sqlite"))?;
     db.execute(
-        "UPDATE published_lineage SET head=?2 WHERE reference=?1",
-        params![target, external.to_string()],
+        "UPDATE published_lineage SET head=?3 WHERE session=?1 AND folder=?2",
+        params![
+            published.session_id,
+            published.project.id,
+            external.to_string()
+        ],
     )?;
     fs::write(f.workspaces[3].path.join("later.txt"), "Own later C file\n")?;
     let current = f.save(3, Some(first)).await?;
@@ -622,8 +626,8 @@ async fn reparent_chain_applies_files_and_checkpoints_and_preserves_a_later_targ
     repo.sync_ref(target)?;
     let db = rusqlite::Connection::open(f.root.path().join("events.sqlite"))?;
     db.execute(
-        "UPDATE published_lineage SET head=?2 WHERE reference=?1",
-        params![target, external.to_string()],
+        "UPDATE published_lineage SET head=?3 WHERE session=?1 AND folder=?2",
+        params![bdone.session_id, bdone.project.id, external.to_string()],
     )?;
     fs::write(
         f.workspaces[2].path.join("pending.txt"),
@@ -777,15 +781,21 @@ async fn reparent_chain_applies_files_and_checkpoints_and_preserves_a_later_targ
         .change_path_retirement(crate::path_retirement::Change::Ready(entry.id))
         .await?;
     db.execute_batch("CREATE TRIGGER own_reparent_publication_fault BEFORE INSERT ON integration_cancelled BEGIN SELECT RAISE(ABORT,'Own dummy publication write failure'); END;")?;
+    let blocked = crate::publication::publish(
+        committing.clone(),
+        f.journal.clone(),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    assert_eq!(blocked.status, Status::CommitBlocked);
     assert!(
-        crate::publication::publish(
-            committing.clone(),
-            f.journal.clone(),
-            tokio::sync::watch::channel(false).1
-        )
-        .await
-        .is_err()
+        blocked
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Own dummy publication write failure")
     );
+    assert_eq!(blocked.publication, committing.publication);
     let candidate = checked.candidate.as_ref().unwrap();
     assert_eq!(
         repo.reference_target(target)?,
@@ -800,11 +810,21 @@ async fn reparent_chain_applies_files_and_checkpoints_and_preserves_a_later_targ
     );
     assert_eq!(
         f.journal.integration_job(checked.id).await?.status,
-        Status::Committing
+        Status::CommitBlocked
     );
     db.execute_batch("DROP TRIGGER own_reparent_publication_fault;")?;
+    let retry = f
+        .journal
+        .integration_command(ReviewCommand {
+            op_id: Uuid::now_v7(),
+            action: Action::RetryCommit {
+                id: blocked.id,
+                revision: blocked.revision,
+            },
+        })
+        .await?;
     let done = crate::publication::publish(
-        f.journal.integration_job(checked.id).await?,
+        retry,
         f.journal.clone(),
         tokio::sync::watch::channel(false).1,
     )

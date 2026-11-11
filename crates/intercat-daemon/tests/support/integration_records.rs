@@ -1025,15 +1025,21 @@ async fn undo_prefix_is_checked_and_published_once_with_atomic_cancellation_rece
         .await?;
     assert_eq!(committing.status, Status::Committing);
     db.execute_batch("CREATE TRIGGER fail_undo_cancellation BEFORE INSERT ON integration_cancelled BEGIN SELECT RAISE(ABORT,'dummy storage full'); END;")?;
+    let blocked = intercat_daemon::publication::publish(
+        committing.clone(),
+        f.journal.clone(),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await?;
+    assert_eq!(blocked.status, Status::CommitBlocked);
     assert!(
-        intercat_daemon::publication::publish(
-            committing.clone(),
-            f.journal.clone(),
-            tokio::sync::watch::channel(false).1
-        )
-        .await
-        .is_err()
+        blocked
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("dummy storage full")
     );
+    assert_eq!(blocked.publication, committing.publication);
     // Git's branch has moved, while the whole journal transaction rolled back.
     // Recovery finishes that exact publication; it never repeats the inverse.
     assert_eq!(
@@ -1049,10 +1055,19 @@ async fn undo_prefix_is_checked_and_published_once_with_atomic_cancellation_rece
     assert_eq!(records(&f)?.len(), rows.len());
     assert_eq!(
         f.journal.integration_job(committing.id).await?.status,
-        Status::Committing
+        Status::CommitBlocked
     );
     db.execute_batch("DROP TRIGGER fail_undo_cancellation;")?;
-    let recovered = f.journal.integration_job(committing.id).await?;
+    let recovered = f
+        .journal
+        .integration_command(IntegrationCommand {
+            op_id: Uuid::now_v7(),
+            action: Action::RetryCommit {
+                id: blocked.id,
+                revision: blocked.revision,
+            },
+        })
+        .await?;
     let saved = intercat_daemon::publication::publish(
         recovered,
         f.journal.clone(),

@@ -40,14 +40,9 @@ pub(crate) fn context(db: &Connection, request: &Request) -> Result<Context> {
             |row| row.get(0),
         )?;
         let reference = format!("refs/heads/intercat/{slug}");
-        let head: Option<String> = db
-            .query_row(
-                "SELECT head FROM published_lineage WHERE reference=?1",
-                [&reference],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let head = head.ok_or("Commit this folder's saved work before opening Push.")?;
+        let head = crate::lineage_store::read_published(db, &session_id, &folder.id)?
+            .ok_or("Commit this folder's saved work before opening Push.")?
+            .head;
         if let Some(sha) = &choice.through {
             let owned = owned_commit(db, &session_id, &folder.id, sha)?;
             if !owned {

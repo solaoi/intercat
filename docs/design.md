@@ -1625,7 +1625,7 @@ Push と Open PR は、フォルダごとに同時に行う。PR は、フォル
 
 チャット経由でも同じだ。Push の確認シートを開くところまでで、確定はシートのボタンだ。シートには、宛先（remote と、解いた後の送り先の全部）・ブランチ・送るコミットの一覧を出す。Glimmer の読み違いが、そのまま外へ送られないようにするためだ（「9.3 分類（発話 → 編集操作）」の command）。PR も同じで、シートで確認してから作る。
 
-PR の説明文は、Editor が台本と仮定から書く。シートで確認してから、PR を作る。
+PR の説明文は、ローカルの Editor が、固定した依頼・コミット・Check の記録・仮定から書く。シートで確認してから、PR を作る。
 
 Open PRの接続先はGitHub.comとする。確認したGitのURLからownerとrepositoryを選ぶ。
 認証には、端末のGitHub CLIで選ばれたログインを使う。
@@ -1960,7 +1960,6 @@ Editor は一つのモデルではない。速さの違う二つの判断を内�
 - 大きな依頼の分解（トラック数、順序、依存）
 - 計画を置くときの衝突の検知（`conflicts[]`）
 - commit のメッセージ
-- PR の説明文
 
 Planner セッションは、`muse serve` の読み取り専用セッションだ。書き込みと shell は無効にしてある。
 
@@ -2593,7 +2592,7 @@ Commit で Keep した仮定は、commit message に書かれる。
   - 基点を後続の L にすると、A と後続の base の差が、A の変更として流れ込んだ。後続の base で消してあった x.txt が戻った（一時のリポジトリで確かめた）。
   - 次の実行の前に、ターンの境目で行う。後続が待っている間でも、投入の前に済ませる。計画の検証も、初回の継承で通す。
 - 継いだ後の更新：後続が走っていれば、後続の次のターンの終わりに、依存元の差分を後続の木に当てる。当て方の仕組み（写し・照らし直し・操作ログ・衝突の扱い）は、合わせ直し（「13.3 Commit の手順」の手順 16）の 1〜4 と 6 と同じだ。マージの入力だけを分ける（2026-11-03 のレビュー）。
-  - 入力は、基点・現在側・更新側の三つだ。基点は、後続がその依存元から継いだ点（Track.inheritedCheckpoints の、その依存元の要素）だ。現在側は後続の写しで、更新側は依存元の新しいチェックポイントだ。
+  - 入力は、基点・現在側・更新側の三つだ。基点は、後続がその依存元から継いだ点（`lineage::Basis` の `parents` にある、その依存元の要素）だ。現在側は後続の写しで、更新側は依存元の新しいチェックポイントだ。
   - 前は、合わせ直しと同じく、基点の木 L から写しまでの差分を当てた。A と B を継いだ C で、A と B を統合した後に A を更新すると、L にある B の分が新しい A に無い。B のファイルが、衝突なしに消えた（レビューで再現された）。
   - その後続への次の投入を止める。
   - 生きたプロセスの走査（「11.4 ワーカーが完了したとき」）で確かめる。残っていれば、カード「Worker C still has running processes · Keep (A’s changes wait) / Stop it」を出す。
@@ -2907,7 +2906,7 @@ Branch from here は、点を選んで ⌘B を押すと始まる。「A をこ�
    session/fork が分けられるのはターンの切れ目だけだ（cutPoint.lastTurnId。検証項目 ⑧）。だから分岐点もチェックポイントも、ターンの終わりを単位にする。選んだ点と合わせた位置がずれるときは、合わせた位置に印を出す。チェックポイントは、会話の位置（turnId）と worktree の SHA を一組で保存する。新しい worktree がその SHA と一致すること（再結合）は、第五回の A3 で確かめた（手順 3）。
 
    分岐のモード（過去の点を選んだ状態）では、分けられる点（ターンの終わり）を、レーンに小さな印で並べる（2026-11-03 のレビュー）。確定の操作には、実際の分岐元を出す（「Branch from 14:02 · end of A’s turn 3」）。分けられる点が無いとき（最初のターンの途中など）は、Branch from here を灰にし、「no checkpoint yet」と出す。前はバーが一歩の単位で、分けるのはターンの単位なので、長いターンでどこまで戻るかを取り違え得た。
-2. 新しい worktree を、チェックポイントの隠し ref が指すコミットから作る。あわせて、`base/A2` に、分岐元のチェックポイントに記録した基点（Checkpoint.baseAt）を写す。A′ の baseInherits には、同じチェックポイントの baseInheritsAt を写す。どちらも A の今の値ではない（2026-11-03 のレビュー）。合わせ直しで A の base が進んだ後に古い点から分かれると、基点にあるファイル（x.txt）が A′ の木に無く、置き換えで消えた（一時のリポジトリで再現した）。baseInherits を写さなければ、A が B を継いでいたときに、A′ の L で B の基点を誤る。`integrated/A2` は空で始める。A′ の未統合の変更には、A から引き継いだ分も含まれるからだ（「13.3 Commit の手順」の手順 2 の基点）。
+2. 新しい worktree を、チェックポイントの隠し ref が指すコミットから作る。あわせて、`base/A2` に、分岐元のチェックポイントに記録した基点（`lineage::Point` の `baseAt`）を写す。A′ の baseInherits には、同じチェックポイントの baseInheritsAt を写す。どちらも A の今の値ではない（2026-11-03 のレビュー）。合わせ直しで A の base が進んだ後に古い点から分かれると、基点にあるファイル（x.txt）が A′ の木に無く、置き換えで消えた（一時のリポジトリで再現した）。baseInherits を写さなければ、A が B を継いでいたときに、A′ の L で B の基点を誤る。`integrated/A2` は空で始める。A′ の未統合の変更には、A から引き継いだ分も含まれるからだ（「13.3 Commit の手順」の手順 2 の基点）。
 
    指示の版を選ぶ（2026-11-03 のレビュー）。worktree をチェックポイントから作ると、その時点の古い指示ファイルも戻る。AGENTS.md を直して過去から分かれても、A′ は古い指示で走った（一時のリポジトリで再現された）。
 
@@ -2920,6 +2919,8 @@ Branch from here は、点を選んで ⌘B を押すと始まる。「A をこ�
      選んだ版の指示の写しを開始操作に保存し、最初のターンにも明示して渡す。
      指示が無い場合も明示し、過去の指示の集合を置き換える。各階層の適用範囲と優先順は保つ。
      未信頼モードとforkの履歴は維持する。信頼済みに変えてプロジェクトのhookを動かす方法は採らない。
+   - 通常のターンでは、送信前にその worktree から指示を取り直す。分岐後の初回は、選んで保存した版を使う。
+     M4 の収集は Git の ignore を適用しないため、依存ディレクトリ内の指示も収集範囲に入る。
 
    document / page のセッションでは、A′ 用に共有 worktree をもう一つ作る。残す道が決まるまで、二つを並べておく（「19. worktree」）。Image トラックは分岐しない（「6. 成果物の種類」）。
 3. session/fork で A′ を立てる。A′ は、そのターンまでの文脈を引き継ぐ。session/fork に workspaceRoot を渡しても無視され、Muse の記録上の作業場所は元のパスのままだった（第五回の A3）。だから A′ の worktree は、毎回の turn/start の `workspaceRoots` で渡す。worktree のパスは、Intercat の Track が持つ（Muse の記録上の workspaceRoot は使わない）。この形で、会話とファイルは同じ時点に揃った。新しい worktree の木は ref と一致した。分けた会話は一ターン目までを持っていた。ホストを立て直した後も、新しい worktree を読んだ。許可は引き継がない（一回限りの許可も、トラック限定の Always allow も。「17. Editor ハーネスの内部」のポリシー核）。
@@ -2982,9 +2983,9 @@ Branch from here は、点を選んで ⌘B を押すと始まる。「A をこ�
 
 チェックポイントを取るのは、work の Run だけだ。fix と merge の Run は一時の worktree で走り、結果は統合の一時 ref に入るので、トラックの系統（A@n）に入れない。
 
-チェックポイントには、取ったときの実効的な基点を記録する（Checkpoint.baseAt。2026-11-03 のレビュー）。その基点が祖先ごとに何番まで含むかも記録する（baseInheritsAt）。合わせ直しで A の base が進んでも、前のチェックポイントの二つは変わらない。分岐も依存の後続も、元のチェックポイントの二つから始める（「12.2 Branch from here の手順」、「10.1 固定ルール」）。
+チェックポイントには、取ったときの実効的な基点を記録する（`lineage::Point` の `baseAt`。2026-11-03 のレビュー）。その基点が祖先ごとに何番まで含むかも記録する（baseInheritsAt）。合わせ直しで A の base が進んでも、前のチェックポイントの二つは変わらない。分岐も依存の後続も、元のチェックポイントの二つから始める（「12.2 Branch from here の手順」、「10.1 固定ルール」）。
 
-直接の依存元の番号（parents）も、トラックの現在の状態と各チェックポイントに保存する。
+直接の依存元の番号（parents）は、トラックの基点情報（`lineage::Basis`）と保存点の系統情報（`lineage::Point`）に保存する。
 祖先全体を含む範囲（inherits）とは分ける。依存元を一つ替えても、別に指定した親は残す。
 分岐では、選んだ親のチェックポイント一つを直接の依存元とする。
 その祖先は、引き継ぐ範囲にも含める。
@@ -3063,7 +3064,7 @@ A′ を残して A を退避するとき、A の分岐点より後を継いだ�
 - 見分けは番号で行う。後続の inheritedCheckpoint の番号が、A′ の分岐点の番号より大きければ、A の後半を継いでいる。
 - 連鎖ごと示す。B から継いだ C も対象だ。
 - シートの行は「B inherits A’s later changes · Realign B onto A′ / Leave B out of this commit」だ。選ぶまで、Commit は灰だ。
-- Realign B onto A′ は、合わせ直しの手順で、B の土台を A′ に替える（「13.3 Commit の手順」の手順 16）。B の依存元も、A から A′ に替える（Track.inheritedCheckpoints）。
+- Realign B onto A′ は、合わせ直しの手順で、B の土台を A′ に替える（「13.3 Commit の手順」の手順 16）。B の依存元も、A から A′ に替える（`lineage::Basis` の `parents`）。
   - 運ぶのは、B 自身の変更だけだ。
     差分の基点を `base/B` ではなく、B の inheritedCheckpoint（A@3）にする。
     そこから B の今の写しまでの差分を、新しい親の木に当てる。
@@ -3182,7 +3183,7 @@ Restore を押すと、道は通常の高さに戻り、生きた道として復
    指示に指定したeffortは、待機中・実行中・完了済みを区別して示す。
    セッションの既定値は別に示し、その指示のために変えたとは表示しない。
    送信済み・完了済みの値は、その会話の送信記録を使う。別の会話の既定値で補わない。
-3. 両方が終わったら、仕上げ（Commit / Export）のシートで、二つの道の Check の結果を並べる。Check は、走っている worktree では走らせない（2026-11-03 のレビュー）。道ごとに、固定したチェックポイントから隔離した作業場所（統合と同じ浅い clone）を作って走らせ、結果をその木に結び付ける。同じ木と設定の結果は、使い回す。ただし、Git の履歴を使う Check は毎回個別に実行する。HEAD が違えば同じ木でも結果が変わり、タグも後から変わるためだ（2026-11-10）。前は worktree で走らせたので、その後のターンや残ったプロセスがファイルを変えると、比べた差分と結果がずれた。
+3. 両方が終わったら、仕上げ（Commit / Export）のシートで、二つの道の Check の結果を並べる。Check は、走っている worktree では走らせない（2026-11-03 のレビュー）。道ごとに、固定したチェックポイントから隔離した作業場所（統合と同じ浅い clone）を作って走らせ、結果をその木に結び付ける。同じフォルダ・木・設定ハッシュの比較結果は使い回す。ただし、Git の履歴を使う Check は毎回個別に実行する。HEAD が違えば同じ木でも結果が変わり、タグも後から変わるためだ（2026-11-10）。前は worktree で走らせたので、その後のターンや残ったプロセスがファイルを変えると、比べた差分と結果がずれた。
    比較のCheckは、開始直後や片側の完了後にも止められる（2026-11-10）。
    停止は一回の実行に結び付ける。再試行には別の番号を付け、古い停止要求で後の実行を止めない。
    Start freshは同じ道の継続であり、別案として並べない（2026-11-11）。
@@ -3290,7 +3291,7 @@ Commit では、各トラックの変更を、統合 worktree ではなく統合
      - L は、B の base（合わせ直しで進んだ先頭を含む）と、継承の線の祖先ごとのチェックポイントを合わせた木だ。
      - 祖先ごとに採るのは、その祖先の統合した番号と、B が継いだ番号の、小さい方のチェックポイントだ。一度も統合していない祖先は、入れない。
      - B の寄与は、L → B のチェックポイントの差分だ。これを、統合先に 3-way で当てる。B 自身の変更は L に入っていないので、この差分に入る。
-     - 継承の線は、チェックポイントの inherits に持つ（「16. データモデル」の Checkpoint.inherits）。直近の依存元だけでなく、経由した祖先の全部だ。B が A を継ぎ、C が B を継げば、C の inherits には A の番号も B 経由で写る。
+     - 継承の線は、チェックポイントの inherits に持つ（「16. データモデル」の `lineage::Point`）。直近の依存元だけでなく、経由した祖先の全部だ。B が A を継ぎ、C が B を継げば、C の inherits には A の番号も B 経由で写る。
      - 同じ祖先を二つの道で継いだとき（分岐の後に合流する依存）は、大きい番号を採る。二度は当てない。
      - L を作る合成で衝突したら、手順 6 の merge クリップに回す。
      - 新しく継いだものが無ければ、L は B の base と同じ木になる。統合の後に base をそのまま基点にしていた前の形は、L の特別な場合だ。
@@ -3301,7 +3302,7 @@ Commit では、各トラックの変更を、統合 worktree ではなく統合
      - B の base が X を k0 まで含むときは、X@k0 が基点だ。採る番号が k0 以下なら、X は合わせない（もう入っている）。
      - そうでなく、X が別のトラックから継いでいるときは、X が継いだチェックポイントが基点だ。X の依存元が二つ以上なら、それらを合わせた木だ（X を作ったときと同じ合わせ方）。
      - どちらでもなければ、採る X のチェックポイントの baseAt（X 自身の base）が基点だ。
-     - B の base が祖先を何番まで含むかは、Track.baseInherits に記録する。base が動くたびに書き換え、操作ログに old / new を書く。
+     - B の base が祖先を何番まで含むかは、`lineage::Basis` の `baseInherits` に記録する。base が動くたびに書き換え、操作ログに old / new を書く。
        - 作ったとき：作った元のチェックポイントの baseInheritsAt を写す（2026-11-03 のレビュー）。中身は、そのときの元のトラックの baseInherits に、元のトラック自身の統合した番号を足したものだ。base も同じチェックポイントの baseAt を写すので、一組になる。
        - Commit：base を進めたチェックポイントの inherits と、自分自身のその番号を写す（手順 14）。
        - 合わせ直し：その時点の統合した番号を、自分自身の分も含めて写す（手順 16）。
@@ -3316,9 +3317,10 @@ Commit では、各トラックの変更を、統合 worktree ではなく統合
      この形は、2026-11-09のM4のダミーで再現し、明示した番号で防いだ。
 
      合わせ直し先が含む番号は、その先頭のSHAと一組で保存する。
-     保存の範囲は、セッションとフォルダごとのブランチrefだ。
+     セッションIDとフォルダIDを組にして保存する。別リポジトリではブランチrefの名前が一致し得る。
      別のフォルダの統合済みの番号を、合わせ直し先が含むものとして扱わない。
      Commitの前に保存した先頭を照らし、公開後は番号の保存も同じDBの処理で確定する。
+     Undoで減り得るのは現在の先頭が含む番号だ。過去に統合した番号の記録とは分けて扱う。
 
      - 前の形には、どれも穴があった（一時のリポジトリで再現した）。
        - 依存元が一つのときの二択（inheritedCheckpoint か base/B か）は、依存元を一部だけ Commit すると、統合済みの部分まで当て直した（f.txt が戻った）。
@@ -3377,7 +3379,7 @@ Commit では、各トラックの変更を、統合 worktree ではなく統合
 
    シートの上には、理由と Review の帯を出す（「Changed in another window · Review」「Worker A’s fix is in · Review」）。Review は、reviewedRev から今の版までの差分を開く。開くと、reviewedRev が今の版に進む。reviewedRev はデーモンに持たず、Commit のときに送るだけだ。
 
-   統合の仕事は、自分の状態（IntegrationJob.status）を持つ。トラックの状態（Track.status）とは別だ。統合が失敗しても、担当のワーカーは走り続けてよい。失敗の担当は、仕事からトラックへの参照（assignedTrackId）で示す。カードも仕事に属する。担当のレーンには、仕事の側から「integration failed · needs you」の印を出す。シートを閉じているときのカードは、文が失敗の中身で、補足が「Integration failed · B keeps working」の形だ（板 6e）。
+   統合の仕事は、自分の状態（IntegrationJob.status）を持つ。トラックの状態（Track.status）とは別だ。統合が失敗しても、担当のワーカーは走り続けてよい。修正を依頼すると、修正 Run が担当トラックと統合の仕事を記録する。カードも仕事に属する。担当のレーンには、仕事の側から「integration failed · needs you」の印を出す。シートを閉じているときのカードは、文が失敗の中身で、補足が「Integration failed · B keeps working」の形だ（板 6e）。
 
    シートは、舞台だけを覆う。机（カード・帯・入力欄・状態の行）は、生きたままだ。シートを開いたまま、ほかのトラックの承認にカードで答えられる。トラックを 1–9 で選んで、⌘. で止めることもできる。
 
@@ -3547,9 +3549,12 @@ Commit では、各トラックの変更を、統合 worktree ではなく統合
    - include them：差分を担当のコミットに入れて、Check をやり直す。担当は、差分でそのファイルを触ったトラックだ。無いか複数なら、人が行で選ぶ。
    - ignore の対象（テストの出力など）は add に入らないので、比べる対象にならない。
 
-   Check の結果は、検査した木（tree の SHA）に結び付ける。載せ直し・hook・直しで木が変われば、結果は無効になる。そのときは Check をやり直す。
+   統合の Check の結果は、検査した木の SHA と固定した設定のハッシュに結び付ける。木が変われば Check をやり直す。
 
-   検査の設定も、統合の仕事を開くときにハッシュで固定する（2026-11-03 のレビュー）。設定は、Checks・Check environment・Check network・Outbound hosts の四つだ。結果は、木と設定のハッシュの組に結び付ける。設定を変えても、今の仕事には当てず、次の仕事から当てる。今のシートには「checked with previous settings · Re-check」を出す。Re-check は、今の木を保ったまま最新の設定を採り、仕事の rev を進めて検査し直す（2026-11-03 のレビュー）。前の結果は無効にし、新しい結果が揃うまで、Commit は灰にする。前は木だけに結び付けたので、成功の後にテストコマンドを変えても、緑のままだった。
+   統合の仕事を開くときに、Checks、履歴を使うかどうか、Check environment、ツールと実行環境、検査規則などを固定する。
+   Check network や Outbound hosts を設定に加える際は、その適用値もハッシュに含める。
+   設定が変わると、シートには「checked with previous settings · Re-check」を出す。
+   Re-check は木を保ったまま設定を取り直して検査し、新しい結果が揃うまで Commit を無効にする。
 9. 今回作る各コミットを、その親との差分で秘密の検査にかける（「17. Editor ハーネスの内部」の核に見えないもの）。検査は、コミットを作った時点で走らせ、Check の結果を待たない（2026-11-03 のレビュー）。テストコマンドが無く、「Commit without check」で進めるときも走る。検査は、パスの型と中身の両方で行う。これが最後の止めだ。Continue を選んだ追跡済みのファイルは、パスの型の当たりにしない。
 
    - 当たらず、Check が緑か未設定なら、シートの Commit ボタンが押せるようになる。当たれば、カード「Secret found in the diff · Remove / Keep」に答えるまで押せない。
@@ -3591,9 +3596,11 @@ Commit では、各トラックの変更を、統合 worktree ではなく統合
     - 進める前に、今回の各コミットのポインタが指す LFS の実体を、clone の置き場所から元の実効の置き場所へ写す（2026-11-03 のレビュー）。写した実体は、中身の SHA-256 と大きさをポインタと照らし、同期する（「17. Editor ハーネスの内部」の永続化の順の ①）。
     - 実体の無いポインタがあれば、ref を進めない。シートの行は「LFS object missing · assets/logo.png · can’t commit」だ。環境ではなく、コミットの中身の問題だからだ。
     - セッションのブランチ（`intercat/<slug>`）を、一時 ref の先頭に進める。期待値は、統合先の元の SHA だ。
-    - 各トラックの `refs/intercat/<slug>/integrated/A` と `base/A` を、今回のチェックポイントに進める。次の Commit の基点は、ここになる。baseInherits は、そのチェックポイントの inherits にする（手順 2）。
+    - 今回の Commit に含めたトラックの `refs/intercat/<slug>/integrated/A` と `base/A` を、選んだチェックポイントに進める。次の Commit の基点は、ここになる。baseInherits は、そのチェックポイントの inherits にする（手順 2）。
     - 各トラックの今回のコミットを、`refs/intercat/<slug>/integration/A/<n>` に記録する。コミットを作らなかったトラック（変更が無い）は、記録しない。n は、そのトラックの Commit の通し番号だ。置き換えの取り消しに使う（「12.6 残す道と退避」）。操作ログの refs にも入れる。
-    - 後続の差分が祖先の未統合の分を含んだとき（統合した番号が、継いだ番号より小さい祖先があったとき）は、その祖先の integrated と base も、継いだ番号のチェックポイントに進める。進めるのは、番号が今より大きいときだけだ。ただし、そのチェックポイントの後に依存元を合わせ直していれば、base は進めない。合わせ直しの後の木とは、元の木が違うからだ。そのときの依存元の次の Commit では、不要な衝突が出得る。手順 6 の merge クリップが解く。依存元を後で統合するとき、同じ変更を二度当てないためだ。進めないと、依存元の続きを統合するときに衝突した（2026-11-01 に一時のリポジトリで確かめた）。
+    - 後続の差分が祖先の未統合の分を含むと、その祖先の統合済みの番号を継いだ番号まで進める。
+      後続だけを統合した場合、祖先の作業中の基点と Git ref はそのままだ。
+      後で祖先を統合する際は、記録した番号から既に入った差分を判定する。
 
     ブランチが先で、トラックの二つの記録（integrated と base）が後だ。逆だと、記録だけが進んでブランチに無い状態が起き得る。そのときは次の Commit の差分から変更が抜け、変更が消える側の失敗になる。今の順なら、途中で落ちても、次の Commit で同じ変更を当て直して衝突が出るだけで、復旧できる。
 
@@ -3613,7 +3620,7 @@ Commit では、各トラックの変更を、統合 worktree ではなく統合
     Discard は一時 ref を捨てるだけで、ブランチは動かない。
 
     複数フォルダなら、手順 4〜14 をフォルダごとに行う。操作もフォルダごとに一つだ。片方だけ成功したら、シートにそのまま出し、失敗した側だけに Retry を出す。
-15. Push と PR は、その後の操作だ。Push は、確認シートが固定した SHA を送る（「5. プロジェクト・セッション・git」の言葉での操作と既定）。必要なら、Planner のホスト（既定は Wonder）に PR 文を書かせる。
+15. Push と PR は、その後の操作だ。Push は、確認シートが固定した SHA を送る（「5. プロジェクト・セッション・git」の言葉での操作と既定）。PR 文の下書きにはローカルの Editor を使う。
 16. Commit の後、ワーカーの worktree は自動では動かさない。base を次の基点にするので、同じ変更は二度載らない。ワーカーの worktree を新しいブランチの先頭に合わせるのは、人が頼んだときだけだ。手順 6 の衝突は、ワーカーの worktree ではなく、merge worktree で解く。合わせ方は次のとおりで、マイルストーン 4 で実装した。
 
     合わせ直しも、統合の仕事として持つ（kind は realign）。ワーカーのターンの合間に行い、その間は、そのトラックに新しいターンを送らない（言葉は Editor が持つ）。
@@ -3948,7 +3955,7 @@ Planner が N 本に分けたとき、Editor は cap から、今走れる本数
 
 Planner には、セッションのブランチの先頭を一時の worktree で見せる。依頼に添付があれば、その写しも同じ worktree に置く（「17. Editor ハーネスの内部」の Planner の入力）。走っているトラックそれぞれの最後のチェックポイントも、読み取り専用の root として足す（turn/start の `workspaceRoots` は複数を渡せる）。staging は Discard で捨てられるので、土台にしない。main チェックアウトは読まない。セッションで変えた API を知らずに分けるのを防ぐためだ（2026-11-02 のレビュー）。使った SHA の組は、Plan.basedOn に残す。
 
-Planner セッションは、Editor の熟慮に使う。熟慮の中身は、分解（計画を置くときの衝突の検知を含む）・commit のメッセージ・PR 文だ。muse serve の読み取り専用セッションで、モデルは Wonder（熟慮に上位のモデルを使う）。トラックには出ない。
+Planner セッションは、Editor の熟慮に使う。熟慮の中身は、分解（計画を置くときの衝突の検知を含む）と commit のメッセージだ。muse serve の読み取り専用セッションで、モデルは Wonder（熟慮に上位のモデルを使う）。トラックには出ない。
 
 ### 描画
 
@@ -4079,7 +4086,7 @@ UI は相対に描くだけだ。
 | Folder | id, path, git, commonDir?, subpath?, defaultBranch | アプリ |
 | Session | id, name, slug, summary, projectId?, folderIds\[\], deliverable, startedAt, tracks\[\], museSessionIds{}, outputLanguage?, applyPending? | アプリ |
 | Run | id, trackId, purpose (work / fix / merge), integrationOwner? (kind / id / rev), hostId, museSessionId, worktree, status, viewCursor? | デーモン |
-| Track | id, kind, engine, folderId?, label, title?, museSessionId?, modelOverride?, parentTrackId?, branchedFrom?, inheritedCheckpoints\[\]?, createdFrom?, baseInherits{}?, groupId?, status, queuePosition?, stopReason?, endReason?, clips\[\] | ログから導出 |
+| Track | id, kind, engine, folderId?, label, title?, museSessionId?, modelOverride?, parentTrackId?, branchedFrom?, groupId?, status, queuePosition?, stopReason?, endReason?, clips\[\] | ログから導出 |
 | TrackGroup | id, sessionId, title, trackIds\[\], createdBy (planner) | Editor（Planner の分解から） |
 | Clip | id, trackId, runId, seq, kind, status, start, end?, title, summary, items\[\], planItemId?, diff?, assumptionIds\[\], sourceUtteranceId?, museTaskId?, imageRef?, setAside?, shell?, skillMarks\[\]? | ログから導出 |
 | Utterance | id, text, at, source, state, version, planItemId?, executeAllowed (bool), readings\[\]（Decision の id の配列）, targetTrackId?, targetRef?, commandId?, attachment?, lineRef?, twoWays?, fromHome?, newTrack?, editHold? | Editor |
@@ -4090,11 +4097,16 @@ UI は相対に描くだけだ。
 | QuestionGroup | id, userInputId, questionIds\[\], answers{}, deadlineAt? | デーモン |
 | Assumption | id, source, questionId?, trackId?, clipId?, text, keptAt? / changedAt? | Editor |
 | ReviewNote | id, clipId（Reviewer のクリップ）, kind, blocking (bool), target（クリップの住所・ファイル・行）, targetSha, text | Editor（Reviewer の返答から） |
-| IntegrationJob | id, sessionId, folderId, kind (commit / realign), status, rev, integratedUpTo{}（仕事の中の写し）, fixed{}（トラックごとの基点と今回のチェックポイント、統合先の元）, assignedTrackId?, failure? | デーモン |
+| IntegrationJob | id, sessionId, project（対象フォルダ）, status, revision, tracks\[\], lineage, plan?, candidate?, publication?, error? | デーモン |
+| CommitGroup | id, sessionId, projectId, revision, status, members\[\]（フォルダと仕事の対応）, tracks?, lastCommit? | デーモン |
+| Continuation | operation, source, successor, sourceSession, sessionId, boardSession, folderId, checkpoint, origin, opened, ready | デーモン |
+| Start fresh の仕事 | request, revision, phase, successorTrack, successorSession, workspace, boundary?, files?, summary?, error? | デーモン |
+| 比較の仕事 | id, session, folder, revision, attempt, base, settingsHash, phase, sides\[2\] | デーモン |
 | Event | gen, seq, ts, mono, kind, payload | デーモン |
 | Deliverable | kind, primaryAction, preview, versionNoun | Editor（最初の発話から） |
 | ImageVersion | id, path, hash, checkpoint | デーモン（画像の生成が終わったとき） |
-| Checkpoint | trackId, number, sha, turnId?, baseAt, baseInheritsAt{}, inherits{}, unmergedPaths\[\]? | デーモン（ターンの終わりと、合わせ直しの後） |
+| Checkpoint | turnId, sha, reference, unmergedPaths\[\], liveProcesses | デーモン（ターンの終わりと、合わせ直しの後） |
+| 系統情報 | `lineage::Basis` は base・baseInherits・inherits・parents、`lineage::Point` は保存点の番号・SHAとその時点の基点・祖先・直接の依存元 | デーモン |
 | Mark | kind (commit / version / pushed), at, ref (sha / tag) | ログ（Commit・Export・Push を押したときに書く） |
 | Effect | id, trackId, clipId, kind, target, ruleId, outcome, at | ポリシー核（核を通ったツール呼び出しから） |
 | SecretFingerprint | name, hmac, length, museSessionIds\[\] | デーモン（secret の入力と、ホストに値を渡したとき） |
@@ -4117,14 +4129,21 @@ UI は相対に描くだけだ。
 - Track.groupId?：Planner が一度に分けたトラックの群（TrackGroup）。群レーンに畳むときに使う（「3.4 タイムラインの描き方」の群レーン）。
 - Track.endReason?：done になったときの終わり方。completed / stopped-by-you / after-connection-loss / cut。表示を分けるために持つ（「11.4 ワーカーが完了したとき」）。
 - Track.stopReason?：approval / question / review-conflict / image-cap / unknown-outcome / os-permission。stopped のときだけ持つ。意味は「11. トラックの状態」に書く。統合の失敗は、ここに入れない（下の IntegrationJob）。
-- Track.createdFrom?：依存元が二つ以上のとき、worktree を作ったコミット（依存元を合わせたもの）。
 - Folder.commonDir? と subpath?：そのフォルダが属するリポジトリの共通の Git ディレクトリと、根からのパスだ。同じ commonDir のフォルダは、一つのプロジェクトに一つだけだ（「5. プロジェクト・セッション・git」のプロジェクトとフォルダ）。
-- Track.inheritedCheckpoints\[\]?：依存で引き継いだ、依存元ごとのチェックポイント（SHA と番号）。統合済みかは、番号で比べる。planned の後続を作ったときと、走っている後続に依存元の差分を当てたときに書く。`inherit: false` の依存では持たない。統合の基点の決め方は、「13.3 Commit の手順」の手順 2 にある。inheritedCheckpoints は直近の依存元だけを持ち、祖先の全部は Checkpoint.inherits が持つ。
-- Track.baseInherits?：そのトラックの base が、祖先ごとに何番まで含むかだ（`{A: 1, B: 2}`）。統合の基点の木 L で、祖先ごとの 3-way の基点を決めるのに使う。作ったとき・Commit・合わせ直しで、base と一緒に書き換える（「13.3 Commit の手順」の手順 2）。
+- `lineage::Basis` の `parents` は、直接の依存元ごとに引き継いだ保存点の SHA と番号を持つ。
+  後続を作るときや、走っている後続に依存元の差分を当てたときに書く。`inherit: false` の依存はこの記録の対象外だ。
+  経由した祖先を含む範囲は `inherits` に持つ（「13.3 Commit の手順」の手順 2）。
+- `lineage::Basis` の `baseInherits` は、そのトラックの base が、祖先ごとに何番まで含むかを示す（`{A: 1, B: 2}`）。統合の基点の木 L で、祖先ごとの 3-way の基点を決めるのに使う。作ったとき・Commit・合わせ直しで、base と一緒に書き換える（「13.3 Commit の手順」の手順 2）。
 - IntegrationJob.rev：仕事の版。固定し直すたび（Refresh・載せ直し・直しの取り込み・Leave B out）に進む。Commit は、窓が確認した版（reviewedRev）と対象の木の SHA の組を持って送り、違えば確定しない（「13.3 Commit の手順」の手順 3 と 13）。reviewedRev は窓の状態で、デーモンには持たない。
-- IntegrationJob.status：値は九つだ。open・applying・merging・checking・ready・committing・failed・done・discarded だ。committing は、Commit を受理してから ref の更新が終わるまでだ（「13.3 Commit の手順」の手順 13）。kind = commit の仕事は、セッション×フォルダに一つで、各窓のシートが購読する。同じフォルダの仕事（commit・realign・依存元の差分の適用）は、手順を交互に走らせない（2026-11-03 のレビュー）。シートが開いているだけでは、合わせ直しを待たせない。discarded は、Discard で一時 ref を捨てたときだ。シートを閉じただけでは、この状態にならない。Track.status とは別に持つ（「13.3 Commit の手順」）。
-- IntegrationJob.assignedTrackId?：失敗の担当のトラック。failed のときだけ持つ。Check が赤で候補が複数なら、人が選ぶまで持たない。担当のレーンには「integration failed · needs you」の印を出し、トラックの状態は変えない。
-- IntegrationJob.failure?：merge-conflict / merge-unresolved / check-failed / env-failed / check-mutated / history-required / realign-conflict / hook-rejected / hooks-outside。merge-conflict は、載せる途中で衝突し、解かずに止めたことだ（マイルストーン 3 の形。「13.3 Commit の手順」の手順 6）。check-mutated は、Check が追跡ファイルを変えたことだ（「13.3 Commit の手順」の手順 8）。env-failed は、依存の準備の失敗で、テストの失敗とは分ける（「13.3 Commit の手順」の手順 5）。hook-rejected は、hook が commit を拒んだことで、Check が赤のときと同じに扱う。hooks-outside は、hook が木と `.git` の外にあって写せないことだ（どちらも「13.3 Commit の手順」の手順 5）。
+- IntegrationJob.status は preparing・choosing・ordering・open・merge-conflict・failed・discarded・building・staging・checked・committing・commit-blocked・done の13種だ。
+  Commit の仕事はセッションとフォルダの組ごとに持ち、各窓のシートが購読する。合わせ直しには別の記録を持つ。
+  committing は Commit を受理してから ref と記録を確定するまでだ。ref を更新した後の障害は commit-blocked とし、理由を示して同じ操作を再試行できるようにする。
+  同じフォルダで Commit・合わせ直し・依存元の差分適用の手順が交互に走らないようにする。
+  シートを開いている間も合わせ直しは進められる。discarded は Discard で一時 ref を捨てたときだ。Track.status とは別に持つ。
+- IntegrationJob.error には仕事を止めた理由を記録する。候補の状態は Candidate.state に記録する。
+  `env-failed` は環境準備の失敗、`check-failed` は Check の失敗、`check-mutated` は Check による追跡ファイルの変更だ。
+  `hook-rejected` は hook による拒否、`hooks-outside` は hook が木と `.git` の外にあって写せない場合だ。
+- 修正 Run は担当トラックと、所有元の ID・版を持つ。所有元は Commit・合わせ直し・Undo・共有部分の統合・Restore の五つだ。
 - dispatchHold：新しいターンの投入を止める理由の集合（plan-limit / auth / stopping / log / editor / reconciling）。editor は、Editor（Glimmer）が使えない間だ。止めるのはターンの開始（言葉と点線）だけで、質問への返答と画面のボタンは通す（「9.3 分類（発話 → 編集操作）」）。stopping は、Stop everything の間と、Stop all turns か Stop all turns and processes… から Resume までだ。新しいターンに加えて、計画の開始・Check・Export の変換・依存の導入も止める（「18. 失敗と上限」の全体の停止とホストの終了）。log は、イベントログに書けない間だ。止めるものは stopping と同じで、Allow once と Run it under Intercat も止める（「18. 失敗と上限」のログに書けないとき）。Track のフィールドではない。アカウント単位なので、セッションではなくアプリの行として持つ。トラックの status は変えない。この集合が空でない間、帯に理由ごとの一行を出す（「18. 失敗と上限」の新しい仕事の保留の見せ方）。見出しには重ねない。
 - QuestionGroup：MSP の一つの入力の要求（userInput）の、1〜3 問の組だ。各問の答えを送るまで持ち、全問が範囲に収まったら一度に送る（「3.2 領域ごとの役割」のカード）。
 - Question.blocking：そのトラックを止める質問なら true。origin が approval か input のときと、assumed の無い worker-question のときだ。止まったトラックの stopReason は、origin が approval なら approval、input と worker-question なら question だ。仮定が付いた worker-question と editor-ask は、トラックを止めない（editor-ask では言葉が asked になる）。
@@ -4204,9 +4223,9 @@ UI は相対に描くだけだ。
 - Session.applyPending?：セッションだけの保留。Move to project の間に使う（「5. プロジェクト・セッション・git」の Move to project の手順）。形は Project.applyPending と同じだ。
 - ImageVersion：生成一回の確定した版。checkpoint は、最後のチェックポイントの木に、その画像の blob だけを足したものだ。最後のチェックポイントは、確定するときに系統の列で読み直す（「6. 成果物の種類」の Image トラック）。Clip.imageRef は、この id を指す。
 - ImageRequest：画像の生成の要求だ（2026-11-03 のレビュー）。status は queued・running・done・cancelled で、全体の停止の対象だ（「6. 成果物の種類」の Image トラック）。
-- Checkpoint.baseAt：そのチェックポイントを取ったときの、トラックの実効的な基点だ。分岐と依存の後続の基点に使う（「12.2 Branch from here の手順」、「10.1 固定ルール」）。number は「A@7」の番号だ。
-- Checkpoint.baseInheritsAt：取ったときに、baseAt が祖先ごとに何番まで含むかだ（`{A: 1, B: 2}`。2026-11-03 のレビュー）。取ったときの Track.baseInherits に、そのトラック自身の統合した番号を足したものだ。分岐と依存の後続は、baseAt と一組で写す。
-- Checkpoint.inherits：そのチェックポイントが継いだ祖先ごとの番号だ（`{A: A@n, B: B@m}`）。直近の依存元だけでなく、経由した祖先の全部を持つ。同じ祖先を二つの道で継げば、大きい番号を採る。依存元の更新を当てたときも、同じ規則で併合する（「10.1 固定ルール」）。統合の基点の木 L に使う（「13.3 Commit の手順」の手順 2）。
+- `lineage::Point` の `baseAt`：そのチェックポイントを取ったときの、トラックの実効的な基点だ。分岐と依存の後続の基点に使う（「12.2 Branch from here の手順」、「10.1 固定ルール」）。number は「A@7」の番号だ。
+- `lineage::Point` の `baseInheritsAt`：取ったときに、baseAt が祖先ごとに何番まで含むかだ（`{A: 1, B: 2}`。2026-11-03 のレビュー）。保存時の `lineage::Basis` の `baseInherits` を写す。分岐と依存の後続は、baseAt と一組で写す。
+- `lineage::Point` の `inherits`：そのチェックポイントが継いだ祖先ごとの番号だ（`{A: A@n, B: B@m}`）。直近の依存元だけでなく、経由した祖先の全部を持つ。同じ祖先を二つの道で継げば、大きい番号を採る。依存元の更新を当てたときも、同じ規則で併合する（「10.1 固定ルール」）。統合の基点の木 L に使う（「13.3 Commit の手順」の手順 2）。
 - SecretFingerprint：伏せるための指紋。値は持たない。museSessionIds は、値を渡したホストの Muse のセッションと、そこから分岐した子のセッションだ。その全部を消すまで残す（「10.1 固定ルール」の secret の入力）。
 - Plan.rev：計画全体の版。同じ計画の項目は、同じ値を持つ。実行の中身・対象・順序を変える全部の変更で進む（2026-11-03 のレビュー）。作り直し・cut・移動・依存の変更・Hold・Deleted plans からの Restore・Undo だ。Start plan は、押したときに見えていた版を送る（「9.8 自律の段階」）。
 - ViewState は、レンダラーが持つ画面の状態だ（「3.2 領域ごとの役割」の時刻・選択・フォーカス）。selection? は clipId か、過去の一点の時刻。focus は stage / log / sheet / band / composer / card / sidebar。following は追従しているか。再生ヘッドの時刻は持たない。デーモンの壁時計がそれだ。
@@ -4885,7 +4904,10 @@ sandbox-exec のプロファイルは用途ごとに分ける。
 - clone の転送プロファイル：固定 SHA の `file://` 転送だけに使う。git・固定した upload-pack に加え、その起動に Git が使う `/bin/sh` と、この macOS での実体 `/bin/bash` だけを許す。`uploadpack.packObjectsHook` は空で上書きし、source の hook を動かさない。元の Git store は読むだけで、書けるのは新しい clone と専用 tmp だけ。転送後は元の URL を削除し、元の checkout と Git store の読みを禁止した別のプロファイルへ切り替える（2026-11-04、隔離実行の実装検証）。
 - チェックポイントのプロファイル：プロセスの起動は許す（filter のため）。読めるのは、`.git` の設定・HEAD・ref・`sharedindex.*` と worktree だけで、元のオブジェクトとパックは読めない。書けるのは、一時のオブジェクトの置き場と一時 index だけだ（「12.4 チェックポイント」。2026-11-03 のレビュー）。
 - 起動を許すプロファイル：プロセスの起動は許し、読み・書き・通信で縛る（下の Check と hook の範囲）。使うのは、checkout（`read-tree -u`・checkout-index）、merge-tree（merge driver）、commit（hook）、add（filter）だ。Check と依存の導入も、これで走らせる。
-- Push のプロファイル：`git push` に使う（2026-11-03 のレビュー）。起動を許すのは、git 本体・git-lfs・credential helper・ssh（`git-lfs-authenticate` を含む）だけだ。通信は、確認した送り先だけに許す。SSH agent のソケットと、credential helper の Keychain には届く。pre-push の hook は、ここでは走らせない（`--no-verify`）。
+- Push のプロファイルは、固定した Git・Git LFS と認証用の処理だけを起動する。
+  Git の通信は確認した送り先に固定する。pre-push は別の隔離環境で先に実行する。
+  LFS は、確認したサービスが返す保管先も許可に含む（「5. プロジェクト・セッション・git」）。
+  M4 の LFS の通信処理は接続先をサービスの応答と照合していない。照合を強制する方法は M5 の着手前に決める。
 - シェルのプロファイル：Run it under Intercat に使う（上の見えない仕事を作るコマンド）。読みは起動を許すプロファイルと同じで、秘密の型は読めない。書き込みは、そのワーカーの worktree と、その仕事の一時ディレクトリだけだ。ネットワークは、localhost の listen と接続だけを許し、外への接続は切る。この経路は、ポリシー核に見えないからだ。検証項目 ⑱ の開発サーバーは、Muse の既定のサンドボックスで listen が `EPERM` になり、サンドボックスの外で走らせる要求として来た。このプロファイルなら、外に出さずに listen できる。
 
 Intercat が作るコミットは、署名しない。git の commit には `-c commit.gpgsign=false` を付け、gix のコミットも署名なしで作る。読みを絞ったプロファイルの中では、署名器（gpg や ssh-agent）に届かないからだ。署名は、人がマージのときに行う。限界として、すべてのコミットに署名を求める保護ブランチでは、push が拒まれる。Intercat 自身の鍵で署名する形は、後の候補だ（付録 A の最後）。

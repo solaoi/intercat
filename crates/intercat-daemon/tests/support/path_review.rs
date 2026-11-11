@@ -323,8 +323,8 @@ async fn an_undo_conflict_is_frozen_before_building_and_never_stops_the_original
     repo.sync_ref(target)?;
     let db = rusqlite::Connection::open(f._root.path().join("events.sqlite"))?;
     db.execute(
-        "UPDATE published_lineage SET head=?2 WHERE reference=?1",
-        rusqlite::params![target, external.to_string()],
+        "UPDATE published_lineage SET head=?3 WHERE session=?1 AND folder=?2",
+        rusqlite::params![prior.session_id, prior.project.id, external.to_string()],
     )?;
     fork(&mut f, &fork_point)?;
     fs::write(f.workspaces[1].path.join("file.txt"), "Own fork context\n")?;

@@ -178,8 +178,8 @@ impl Fixture {
                 rusqlite::params![session, member.folder.id, member.slug],
             )?;
             db.execute(
-                "INSERT INTO published_lineage VALUES(?1,?2,'{}')",
-                rusqlite::params![member.target.source_ref, member.target.sha],
+                "INSERT INTO published_lineage VALUES(?1,?2,?3,'{}')",
+                rusqlite::params![session, member.folder.id, member.target.sha],
             )?;
         }
         crate::pull_store::save(&db, &mut job.clone())?;

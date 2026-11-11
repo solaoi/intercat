@@ -7,7 +7,7 @@ use crate::{
     path_retirement::{Entry, Kind, Phase},
 };
 use intercat_git::Repository;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -86,16 +86,11 @@ pub(crate) fn capture(db: &Connection, id: Uuid) -> Result<Context> {
         .plan
         .as_ref()
         .ok_or("Missing replacement publication plan.")?;
-    let published: Option<(String, String)> = db
-        .query_row(
-            "SELECT head,coverage FROM published_lineage WHERE reference=?1",
-            [&plan.target_ref],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
     // An Aside always follows a successful publication. Missing coverage is
     // not an initial-branch shortcut here.
-    let (target, coverage) = published.ok_or("The Restore target has no published coverage.")?;
+    let published = crate::lineage_store::read_published(db, &job.session_id, &job.project.id)?
+        .ok_or("The Restore target has no published coverage.")?;
+    let target = published.head;
     let prefix = job
         .path_review
         .families
@@ -104,7 +99,7 @@ pub(crate) fn capture(db: &Connection, id: Uuid) -> Result<Context> {
         .ok_or("The restored path has no saved family.")?
         .prefix(&entry.track)?;
     let cancelled = crate::replacement_undo_store::restore_records(db, &entry, &job, &prefix)?;
-    let coverage: Ancestors = serde_json::from_str(&coverage)?;
+    let coverage = published.coverage;
     let tracks = coverage
         .keys()
         .chain(prefix.keys())

@@ -327,7 +327,18 @@ pub async fn publish(
         }
     })
     .await?;
-    journal
+    let refs_applied = matches!(outcome, Outcome::Complete);
+    match journal
         .integration_published(job.id, job.revision, outcome)
         .await
+    {
+        Err(error) if refs_applied => {
+            // A failed journal transaction did not undo the Git writes. Keep
+            // the same intent available for recovery and expose the reason.
+            journal
+                .integration_published(job.id, job.revision, Outcome::Blocked(error.to_string()))
+                .await
+        }
+        result => result,
+    }
 }

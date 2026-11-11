@@ -31,7 +31,7 @@ pub(crate) fn candidates(db: &Connection) -> Result<Vec<Value>> {
     for folder in &project.folders {
         let saved:Option<(String,i64)>=db.query_row("SELECT json_extract(e.payload,'$.candidate.head'),e.ts FROM events e
             JOIN session_folders s ON s.session=e.session_id AND s.folder=json_extract(e.payload,'$.project.id')
-            JOIN published_lineage p ON p.reference='refs/heads/intercat/'||s.slug AND p.head=json_extract(e.payload,'$.candidate.head')
+            JOIN published_lineage p ON p.session=s.session AND p.folder=s.folder AND p.head=json_extract(e.payload,'$.candidate.head')
             WHERE e.kind='integration.published' AND json_extract(e.payload,'$.status')='done'
             AND e.session_id=?1 AND json_extract(e.payload,'$.project.id')=?2 ORDER BY e.seq DESC LIMIT 1",params![session_id,folder.id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
         if let Some((sha, at)) = saved {

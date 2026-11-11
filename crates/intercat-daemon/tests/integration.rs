@@ -413,9 +413,10 @@ fn record_simulated_integration(f: &Fixture, job: &Job, head: ObjectId) -> Resul
         )?;
     }
     db.execute(
-        "INSERT INTO published_lineage VALUES(?1,?2,?3)",
+        "INSERT INTO published_lineage VALUES(?1,?2,?3,?4)",
         rusqlite::params![
-            job.plan.as_ref().unwrap().target_ref,
+            job.session_id,
+            job.project.id,
             head.to_string(),
             serde_json::to_string(&coverage)?
         ],
@@ -1961,8 +1962,8 @@ async fn publishes_reviewed_commits_and_advances_only_the_integrated_tracks() ->
     let target = &built.plan.as_ref().unwrap().target_ref;
     let published = || -> Result<(String, intercat_daemon::lineage::Ancestors)> {
         let (head, raw): (String, String) = db.query_row(
-            "SELECT head,coverage FROM published_lineage WHERE reference=?1",
-            [target],
+            "SELECT head,coverage FROM published_lineage WHERE session=?1 AND folder=?2",
+            rusqlite::params![built.session_id, built.project.id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok((head, serde_json::from_str(&raw)?))
@@ -1973,8 +1974,8 @@ async fn publishes_reviewed_commits_and_advances_only_the_integrated_tracks() ->
     assert_eq!(coverage[&built.tracks[0].id].sha, a.sha);
     assert_eq!(coverage[&built.tracks[1].id].sha, b.sha);
     db.execute(
-        "INSERT INTO published_lineage VALUES('refs/heads/intercat/another-folder',?1,'{}')",
-        [&f.head],
+        "INSERT INTO published_lineage VALUES(?1,'another-folder',?2,'{}')",
+        rusqlite::params![built.session_id, f.head],
     )?;
     let repo = Repository::open(&f.source)?;
     assert_eq!(
@@ -2025,8 +2026,8 @@ async fn publishes_reviewed_commits_and_advances_only_the_integrated_tracks() ->
     // A mismatched metadata head is detected before creating a publication
     // intent or changing the real session branch.
     db.execute(
-        "UPDATE published_lineage SET head=?2 WHERE reference=?1",
-        rusqlite::params![target, f.head],
+        "UPDATE published_lineage SET head=?3 WHERE session=?1 AND folder=?2",
+        rusqlite::params![built.session_id, built.project.id, f.head],
     )?;
     let publications: i64 = db.query_row(
         "SELECT count(*) FROM operations WHERE kind='integration.publish'",
@@ -2047,8 +2048,8 @@ async fn publishes_reviewed_commits_and_advances_only_the_integrated_tracks() ->
         publications
     );
     db.execute(
-        "UPDATE published_lineage SET head=?2 WHERE reference=?1",
-        rusqlite::params![target, candidate.head],
+        "UPDATE published_lineage SET head=?3 WHERE session=?1 AND folder=?2",
+        rusqlite::params![built.session_id, built.project.id, candidate.head],
     )?;
     f.action(commit_action(&next)).await?;
     assert_eq!(finished(&f.journal).await?.status, Status::Done);
@@ -2057,7 +2058,14 @@ async fn publishes_reviewed_commits_and_advances_only_the_integrated_tracks() ->
     assert_eq!(coverage.len(), 2);
     assert_eq!(coverage[&built.tracks[0].id].number, 2);
     assert_eq!(coverage[&built.tracks[1].id].sha, b.sha);
-    assert_eq!(db.query_row("SELECT head FROM published_lineage WHERE reference='refs/heads/intercat/another-folder'", [], |row| row.get::<_,String>(0))?, f.head);
+    assert_eq!(
+        db.query_row(
+            "SELECT head FROM published_lineage WHERE session=?1 AND folder='another-folder'",
+            [&built.session_id],
+            |row| row.get::<_, String>(0)
+        )?,
+        f.head
+    );
     assert!(
         repo.reference_target(&format!("refs/intercat/{}/integration/A/2", built.slug))?
             .is_some()

@@ -9,7 +9,7 @@ pub(crate) fn install(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS track_lineage(track TEXT PRIMARY KEY REFERENCES tracks(id),record TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS checkpoint_lineage(operation TEXT PRIMARY KEY,track TEXT NOT NULL REFERENCES tracks(id),number INTEGER NOT NULL,sha TEXT NOT NULL,record TEXT NOT NULL,complete INTEGER NOT NULL CHECK(complete IN (0,1)),UNIQUE(track,number),UNIQUE(track,sha));
         CREATE TABLE IF NOT EXISTS integrated_lineage(track TEXT PRIMARY KEY REFERENCES tracks(id),record TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS published_lineage(reference TEXT PRIMARY KEY,head TEXT NOT NULL,coverage TEXT NOT NULL);")?;
+        CREATE TABLE IF NOT EXISTS published_lineage(session TEXT NOT NULL,folder TEXT NOT NULL,head TEXT NOT NULL,coverage TEXT NOT NULL,PRIMARY KEY(session,folder));")?;
     Ok(())
 }
 pub(crate) fn initialize(db: &Connection, track: &str, basis: &Basis) -> Result<()> {
@@ -135,23 +135,42 @@ pub(crate) fn published(db: &Connection, frozen: &Frozen, included: &[(&str, &st
 /// Coverage belongs to the exact published head of one session and folder.
 /// The global integrated map alone cannot identify what a realignment target
 /// contains, particularly after publishing only some tracks or folders.
+pub(crate) struct Published {
+    pub head: String,
+    pub coverage: Ancestors,
+}
+
+pub(crate) fn read_published(
+    db: &Connection,
+    session: &str,
+    folder: &str,
+) -> Result<Option<Published>> {
+    let row: Option<(String, String)> = db
+        .query_row(
+            "SELECT head,coverage FROM published_lineage WHERE session=?1 AND folder=?2",
+            params![session, folder],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(head, coverage)| {
+        Ok(Published {
+            head,
+            coverage: serde_json::from_str(&coverage)?,
+        })
+    })
+    .transpose()
+}
+
 pub(crate) fn capture_coverage(
     db: &Connection,
     job: &crate::integration::Job,
 ) -> Result<Ancestors> {
     let plan = job.plan.as_ref().ok_or("Missing publication plan.")?;
-    let old: Option<(String, String)> = db
-        .query_row(
-            "SELECT head,coverage FROM published_lineage WHERE reference=?1",
-            [&plan.target_ref],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if let Some((head, coverage)) = old {
-        if head != plan.target_head {
+    if let Some(saved) = read_published(db, &job.session_id, &job.project.id)? {
+        if saved.head != plan.target_head {
             return Err("The session branch does not match its saved checkpoint coverage.".into());
         }
-        Ok(serde_json::from_str(&coverage)?)
+        Ok(saved.coverage)
     } else if plan.target_head == job.project.base {
         Ok(Ancestors::new())
     } else {
@@ -174,7 +193,6 @@ pub(crate) fn publish_head(
     job: &crate::integration::Job,
     included: &[(&str, &str)],
 ) -> Result<()> {
-    let plan = job.plan.as_ref().ok_or("Missing publication plan.")?;
     let candidate = job
         .candidate
         .as_ref()
@@ -188,8 +206,8 @@ pub(crate) fn publish_head(
             .incorporate(&mut coverage, job.lineage.by_sha(track, sha)?)?;
     }
     db.execute(
-        "INSERT INTO published_lineage VALUES(?1,?2,?3) ON CONFLICT(reference) DO UPDATE SET head=excluded.head,coverage=excluded.coverage",
-        params![plan.target_ref, candidate.head, serde_json::to_string(&coverage)?],
+        "INSERT INTO published_lineage VALUES(?1,?2,?3,?4) ON CONFLICT(session,folder) DO UPDATE SET head=excluded.head,coverage=excluded.coverage",
+        params![job.session_id, job.project.id, candidate.head, serde_json::to_string(&coverage)?],
     )?;
     Ok(())
 }

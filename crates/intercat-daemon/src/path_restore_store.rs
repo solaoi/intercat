@@ -491,11 +491,10 @@ pub(crate) fn change(db: &mut Connection, change: Change) -> Result<Job> {
                 if serde_json::to_value(&entry)? != serde_json::to_value(&app.source.entry)? {
                     return Err("The retired path changed during Restore.".into());
                 }
-                let target: String = tx.query_row(
-                    "SELECT head FROM published_lineage WHERE reference=?1",
-                    [&app.source.target_ref],
-                    |row| row.get(0),
-                )?;
+                let target =
+                    crate::lineage_store::read_published(&tx, &job.session_id, &job.folder_id)?
+                        .ok_or("The Restore target has no published coverage.")?
+                        .head;
                 if target != app.source.target {
                     return Err("The published target changed during Restore.".into());
                 }

@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-pub const SCHEMA_VERSION: i64 = 146;
+pub const SCHEMA_VERSION: i64 = 147;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
